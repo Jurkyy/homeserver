@@ -1,0 +1,60 @@
+version: "3.8"
+
+services:
+  openclaw:
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: openclaw
+    ports:
+      - "18789:18789"
+    volumes:
+      - ./services/openclaw/config:/config
+      - ./services/openclaw/workspace:/workspace
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
+      - DISCORD_CLIENT_ID=${DISCORD_CLIENT_ID}
+    restart: unless-stopped
+
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: homeassistant
+    ports:
+      - "8123:8123"
+    volumes:
+      - ./services/homeassistant/config:/config
+      - /etc/localtime:/etc/localtime:ro
+    privileged: true
+    restart: unless-stopped
+
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    ports:
+      - "8096:8096"
+      - "8920:8920"
+    volumes:
+      - ./services/jellyfin/config:/config
+      - ./services/jellyfin/cache:/cache
+      - /mnt/media:/media:ro
+    environment:
+      - JELLYFIN_PublishedServerUrl=${JELLYFIN_URL:-http://localhost:8096}
+    restart: unless-stopped
+
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: tailscale
+    hostname: homeserver
+    volumes:
+      - /dev/net/tun:/dev/net/tun
+      - tailscale-state:/var/lib/tailscale
+    environment:
+      - TS_AUTHKEY=${TAILSCALE_AUTHKEY}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_EXTRA_ARGS=--advertise-exit-node
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    restart: unless-stopped
+
+volumes:
+  tailscale-state:

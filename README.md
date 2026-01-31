@@ -1,0 +1,80 @@
+# Homeserver
+
+A self-hosted home server stack featuring OpenClaw (AI Discord bot), Home Assistant (home automation), Jellyfin (media streaming), and Tailscale (secure networking).
+
+## Prerequisites
+
+- Linux box (Debian/Ubuntu or Arch-based)
+- External drive mounted at `/mnt/media` (for Jellyfin media library)
+- Tailscale account for secure remote access
+- Discord bot token (from Discord Developer Portal)
+- Anthropic API key (from console.anthropic.com)
+
+## Quick Start
+
+1. **Clone the repository**
+   ```bash
+   git clone <repository-url>
+   cd homeserver
+   ```
+
+2. **Run the bootstrap script** (installs Docker, Tailscale, etc.)
+   ```bash
+   sudo ./bootstrap.sh
+   ```
+
+3. **Configure environment variables**
+   ```bash
+   cp .env.example .env
+   # Edit .env with your API keys and configuration
+   ```
+
+4. **Start the services**
+   ```bash
+   docker compose up -d
+   ```
+
+## Service URLs
+
+| Service        | Port  | URL                          | Description                    |
+|----------------|-------|------------------------------|--------------------------------|
+| OpenClaw       | 18789 | http://localhost:18789       | AI bot control UI              |
+| Home Assistant | 8123  | http://localhost:8123        | Home automation dashboard      |
+| Jellyfin       | 8096  | http://localhost:8096        | Media streaming interface      |
+
+## Project Structure
+
+```
+homeserver/
+├── bootstrap.sh        # Fresh box setup script
+├── docker-compose.yml  # All services defined
+├── .env.example        # Template for secrets
+├── docs/
+│   └── SETUP.md        # Detailed setup notes
+├── scripts/
+│   ├── backup.sh       # Backup all configs
+│   └── update.sh       # Update services
+└── services/
+    ├── homeassistant/
+    │   └── config/     # HA configuration
+    ├── jellyfin/
+    │   ├── config/     # Jellyfin configuration
+    │   └── cache/      # Transcoding cache
+    └── openclaw/
+        └── config/     # OpenClaw configuration
+```
+
+## Helper Scripts
+
+- **Backup configs**: `./scripts/backup.sh`
+- **Update services**: `./scripts/update.sh` (use `--force` to force recreate)
+
+## Remote Access
+
+Once Tailscale is connected, access services via your Tailscale IP:
+- `http://100.x.x.x:8123` - Home Assistant
+- `http://100.x.x.x:8096` - Jellyfin
+
+## Documentation
+
+For detailed setup instructions, troubleshooting, and configuration guides, see [docs/SETUP.md](docs/SETUP.md).
