@@ -12,27 +12,29 @@ A self-hosted home server stack featuring OpenClaw (AI Discord bot), Home Assist
 
 ## Quick Start
 
-1. **Clone the repository**
-   ```bash
-   git clone <repository-url>
-   cd homeserver
-   ```
+**On a fresh Arch install**, just run:
 
-2. **Run the bootstrap script** (installs Docker, Tailscale, etc.)
-   ```bash
-   sudo ./bootstrap.sh
-   ```
+```bash
+# Install git first (if not installed)
+sudo pacman -Sy git
 
-3. **Configure environment variables**
-   ```bash
-   cp .env.example .env
-   # Edit .env with your API keys and configuration
-   ```
+# Clone and run
+git clone <repository-url> ~/homeserver
+cd ~/homeserver
+sudo ./bootstrap.sh
+```
 
-4. **Start the services**
-   ```bash
-   docker compose up -d
-   ```
+The bootstrap script will:
+- Update system packages
+- Install tools (neovim, eza, bat, ripgrep, fzf, zoxide, etc.)
+- Install and enable SSH server
+- Install Docker and Docker Compose
+- Install and connect Tailscale
+- Configure shell aliases
+- Prompt for API keys
+- Start all services
+
+That's it. One script does everything.
 
 ## Service URLs
 
@@ -50,6 +52,8 @@ homeserver/
 ├── docker-compose.yml  # All services defined
 ├── .env.example        # Template for secrets
 ├── SETUP.md            # Detailed setup notes
+├── dotfiles/
+│   └── aliases         # Shell aliases (installed to ~/.aliases)
 ├── scripts/
 │   ├── backup.sh       # Backup all configs
 │   └── update.sh       # Update services

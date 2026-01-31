@@ -1,0 +1,43 @@
+# Eza (modern ls)
+alias ls='eza --icons'
+alias l='eza -lah --icons'
+alias ll='eza -lah --icons --git'
+alias tree='eza --tree --icons'
+
+# General
+alias n="nvim"
+alias rgi="rg -i"
+alias cls="clear"
+alias ea="nvim ~/.aliases"
+alias reload="source ~/.zshrc 2>/dev/null || source ~/.bashrc"
+
+# Git
+alias gs="git status"
+alias gd="git diff ."
+alias gds="git diff --staged"
+alias gb="git checkout -b"
+alias pd="git checkout main && git pull"
+alias ac="git add . && git commit -m"
+alias am="git add . && git commit --amend --no-edit"
+alias gl="git log --oneline -20"
+
+# Docker
+alias dc="docker compose"
+alias dcu="docker compose up -d"
+alias dcd="docker compose down"
+alias dcl="docker compose logs -f"
+alias dcp="docker compose ps"
+alias dcr="docker compose restart"
+alias dce="docker compose exec"
+
+# Homeserver
+alias hs="cd ~/homeserver"
+alias hsl="dc logs -f"
+alias hsr="dc restart"
+alias hsu="./scripts/update.sh"
+alias hsb="./scripts/backup.sh"
+
+# System
+alias ports="ss -tulpn"
+alias disk="df -h"
+alias mem="free -h"
