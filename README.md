@@ -49,8 +49,7 @@ homeserver/
 ├── bootstrap.sh        # Fresh box setup script
 ├── docker-compose.yml  # All services defined
 ├── .env.example        # Template for secrets
-├── docs/
-│   └── SETUP.md        # Detailed setup notes
+├── SETUP.md            # Detailed setup notes
 ├── scripts/
 │   ├── backup.sh       # Backup all configs
 │   └── update.sh       # Update services
@@ -77,4 +76,4 @@ Once Tailscale is connected, access services via your Tailscale IP:
 
 ## Documentation
 
-For detailed setup instructions, troubleshooting, and configuration guides, see [docs/SETUP.md](docs/SETUP.md).
+For detailed setup instructions, troubleshooting, and configuration guides, see [SETUP.md](SETUP.md).
