@@ -83,17 +83,58 @@ install_packages() {
     fi
 }
 
-# Install basic tools
-install_basic_tools() {
-    info "Installing basic tools (git, curl, htop, vim)..."
+# Install SSH server
+install_ssh() {
+    info "Installing and enabling SSH server..."
 
-    if command -v git &> /dev/null && command -v curl &> /dev/null && \
-       command -v htop &> /dev/null && command -v vim &> /dev/null; then
-        success "Basic tools already installed"
-        return
+    if [[ $DISTRO_FAMILY == "debian" ]]; then
+        install_packages openssh-server
+    elif [[ $DISTRO_FAMILY == "arch" ]]; then
+        install_packages openssh
     fi
 
-    install_packages git curl htop vim
+    systemctl enable sshd
+    systemctl start sshd
+    success "SSH server installed and running"
+}
+
+# Install basic tools
+install_basic_tools() {
+    info "Installing basic tools..."
+
+    if [[ $DISTRO_FAMILY == "debian" ]]; then
+        install_packages \
+            git curl wget \
+            htop btop \
+            neovim \
+            bat fd-find ripgrep fzf \
+            tmux \
+            unzip jq tree
+
+        # Create symlinks for tools with different names on Debian
+        ln -sf /usr/bin/batcat /usr/local/bin/bat 2>/dev/null || true
+        ln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true
+
+        # lsd and eza may need manual install on Debian
+        if ! command -v lsd &> /dev/null; then
+            info "Installing lsd from GitHub..."
+            LSD_VERSION=$(curl -s https://api.github.com/repos/lsd-rs/lsd/releases/latest | jq -r .tag_name | tr -d 'v')
+            curl -sLO "https://github.com/lsd-rs/lsd/releases/download/v${LSD_VERSION}/lsd_${LSD_VERSION}_amd64.deb"
+            dpkg -i "lsd_${LSD_VERSION}_amd64.deb" || true
+            rm -f "lsd_${LSD_VERSION}_amd64.deb"
+        fi
+
+    elif [[ $DISTRO_FAMILY == "arch" ]]; then
+        install_packages \
+            git curl wget \
+            htop btop \
+            neovim \
+            bat lsd eza fd ripgrep fzf \
+            tmux \
+            unzip jq tree \
+            zoxide
+    fi
+
     success "Basic tools installed"
 }
 
@@ -285,6 +326,7 @@ main() {
     echo ""
 
     install_basic_tools
+    install_ssh
     install_docker
     install_tailscale
 
