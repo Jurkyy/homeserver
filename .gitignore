@@ -1,0 +1,19 @@
+# Secrets
+.env
+
+# Service configs (keep directories, ignore contents)
+services/*/config/*
+!services/*/config/.gitkeep
+
+# Jellyfin cache
+services/jellyfin/cache/*
+!services/jellyfin/cache/.gitkeep
+
+# Media mount references
+/mnt/media
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
