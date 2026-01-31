@@ -19,7 +19,7 @@ A self-hosted home server stack featuring OpenClaw (AI Discord bot), Home Assist
 sudo pacman -Sy git
 
 # Clone and run
-git clone <repository-url> ~/homeserver
+git clone https://github.com/Jurkyy/homeserver.git ~/homeserver
 cd ~/homeserver
 sudo ./bootstrap.sh
 ```
