@@ -115,21 +115,12 @@ install_basic_tools() {
         ln -sf /usr/bin/batcat /usr/local/bin/bat 2>/dev/null || true
         ln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true
 
-        # lsd and eza may need manual install on Debian
-        if ! command -v lsd &> /dev/null; then
-            info "Installing lsd from GitHub..."
-            LSD_VERSION=$(curl -s https://api.github.com/repos/lsd-rs/lsd/releases/latest | jq -r .tag_name | tr -d 'v')
-            curl -sLO "https://github.com/lsd-rs/lsd/releases/download/v${LSD_VERSION}/lsd_${LSD_VERSION}_amd64.deb"
-            dpkg -i "lsd_${LSD_VERSION}_amd64.deb" || true
-            rm -f "lsd_${LSD_VERSION}_amd64.deb"
-        fi
-
     elif [[ $DISTRO_FAMILY == "arch" ]]; then
         install_packages \
             git curl wget \
             htop btop \
             neovim \
-            bat lsd eza fd ripgrep fzf \
+            bat eza fd ripgrep fzf \
             tmux \
             unzip jq tree \
             zoxide
