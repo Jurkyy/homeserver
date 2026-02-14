@@ -4,8 +4,8 @@ A self-hosted home server stack featuring OpenClaw (AI Discord bot), Home Assist
 
 ## Prerequisites
 
-- Linux box (Debian/Ubuntu or Arch-based)
-- External drive mounted at `/mnt/media` (for Jellyfin media library)
+- Linux box (Debian/Ubuntu or Arch-based) with SSD for OS
+- Secondary HDD for bulk storage (media, data, backups) — auto-detected by bootstrap
 - Tailscale account for secure remote access
 - Discord bot token (from Discord Developer Portal)
 - Anthropic API key (from console.anthropic.com)
@@ -25,14 +25,12 @@ sudo ./bootstrap.sh
 ```
 
 The bootstrap script will:
-- Update system packages
-- Install tools (neovim, eza, bat, ripgrep, fzf, zoxide, etc.)
-- Install and enable SSH server
-- Install Docker and Docker Compose
-- Install and connect Tailscale
-- Configure shell aliases
-- Prompt for API keys
-- Start all services
+- Update system and install dev tools (neovim, eza, bat, ripgrep, fzf, etc.)
+- Install mise, Python 3.12, uv (for running Python projects)
+- Install SSH, Docker, Tailscale
+- **Detect and mount your secondary HDD** at `/mnt/storage`
+- Set up storage dirs (media, backups, docker, projects)
+- Configure shell aliases, prompt for API keys, start all services
 
 That's it. One script does everything.
 

@@ -88,39 +88,44 @@ Then continue with the rest of this guide below.
 
 - **CPU**: Any modern x86_64 processor (Intel/AMD)
 - **RAM**: 4GB minimum, 8GB+ recommended
-- **Storage**:
-  - 32GB+ for OS and configs
-  - External drive for media (mounted at `/mnt/media`)
+- **Storage (two-disk setup)**:
+  - **SSD** (primary): OS + configs — the boot drive, shared with Windows if dual-booting
+  - **HDD** (secondary): bulk storage — media, project data, backups, Docker data
 - **Network**: Ethernet recommended for reliability
+
+## Disk Layout
+
+The bootstrap script will detect your secondary HDD and set it up automatically. The expected layout:
+
+```
+SSD (primary, /dev/sda or /dev/nvme0n1)
+├── Windows partition (~100GB)
+└── Linux root (/)                    ← OS, configs, ~/homeserver, ~/projects
+
+HDD (secondary, /dev/sdb)
+└── /mnt/storage/                     ← mounted automatically
+    ├── media/                        ← Jellyfin (movies/, tv/, music/)
+    ├── backups/                      ← config backups
+    ├── docker/                       ← Docker images and volumes
+    └── projects/                     ← project data (databases, logs)
+```
+
+A symlink `/mnt/media -> /mnt/storage/media` is created for compatibility.
+
+**Identifying your disks**: The SSD is typically `sda` or `nvme0n1` (smaller, faster). The HDD is typically `sdb` (larger, spinning). Use `lsblk` to check sizes and partitions — the bootstrap script will show you the options and ask which to use.
 
 ## Pre-Setup Checklist
 
-- [ ] Fresh Linux installation (Ubuntu 22.04+ or Arch Linux)
+- [ ] Fresh Linux installation (Ubuntu 22.04+ or Arch Linux) on the SSD
+- [ ] Secondary HDD physically installed
 - [ ] Network connectivity
-- [ ] External drive ready for media storage
 - [ ] Anthropic API key from [console.anthropic.com](https://console.anthropic.com)
 - [ ] Discord bot created at [Discord Developer Portal](https://discord.com/developers/applications)
 - [ ] Tailscale account at [tailscale.com](https://tailscale.com)
 
 ## Step-by-Step Setup
 
-### 1. Mount External Drive
-
-```bash
-# Find your drive
-lsblk
-
-# Create mount point
-sudo mkdir -p /mnt/media
-
-# Mount the drive (replace /dev/sdX1 with your partition)
-sudo mount /dev/sdX1 /mnt/media
-
-# Add to /etc/fstab for automatic mounting
-echo "/dev/sdX1 /mnt/media ext4 defaults 0 2" | sudo tee -a /etc/fstab
-```
-
-### 2. Run Bootstrap Script
+### 1. Run Bootstrap Script
 
 ```bash
 cd homeserver
@@ -128,13 +133,24 @@ sudo ./bootstrap.sh
 ```
 
 This will:
-- Install Docker and Docker Compose
-- Install Tailscale
-- Install basic tools (git, curl, htop, vim)
-- Create `.env` from template
-- Prompt for API keys
+- Install Docker, Tailscale, mise, Python, dev tools
+- **Detect your secondary HDD** and offer to format/mount it at `/mnt/storage`
+- Create storage directories (media, backups, docker, projects)
+- Add the mount to `/etc/fstab` so it persists across reboots
+- Create `.env` from template and prompt for API keys
+- Start all services
 
-### 3. Configure Services
+If the HDD isn't detected (not plugged in yet), you can re-run just the storage setup later:
+```bash
+# Manual mount if you add the HDD later
+lsblk                              # find the disk (e.g. sdb)
+sudo mkfs.ext4 /dev/sdb1           # format if needed
+sudo mkdir -p /mnt/storage
+sudo mount /dev/sdb1 /mnt/storage
+echo "UUID=$(blkid -s UUID -o value /dev/sdb1) /mnt/storage ext4 defaults,nofail 0 2" | sudo tee -a /etc/fstab
+```
+
+### 2. Configure Services
 
 Edit `.env` with your actual credentials:
 
@@ -142,7 +158,7 @@ Edit `.env` with your actual credentials:
 nano .env
 ```
 
-### 4. Start Services
+### 3. Start Services
 
 ```bash
 docker compose up -d
@@ -184,7 +200,7 @@ docker compose up -d
    - Create admin account
    - Add media libraries (point to `/media` which maps to `/mnt/media`)
 
-2. **Add Libraries**:
+2. **Add Libraries** (these map to `/mnt/storage/media/` on the HDD):
    - Movies: `/media/movies`
    - TV Shows: `/media/tv`
    - Music: `/media/music`
@@ -238,17 +254,23 @@ ss -tulpn | grep -E '8123|8096|18789'
 tailscale status
 ```
 
-### External Drive Not Mounted
+### Storage HDD Not Mounted
 
 ```bash
 # Check if mounted
-mountpoint /mnt/media
+mountpoint /mnt/storage
+
+# List disks to find the HDD
+lsblk
 
 # Manual mount
-sudo mount /dev/sdX1 /mnt/media
+sudo mount /dev/sdb1 /mnt/storage
 
 # Check fstab entry
-cat /etc/fstab | grep media
+grep storage /etc/fstab
+
+# Verify media symlink
+ls -la /mnt/media  # should point to /mnt/storage/media
 ```
 
 ## Backup and Restore

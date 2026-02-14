@@ -12,8 +12,12 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
-# Configuration
-BACKUP_DIR="backups"
+# Configuration — use HDD storage if available, fallback to local
+if [ -d "/mnt/storage/backups" ]; then
+    BACKUP_DIR="/mnt/storage/backups"
+else
+    BACKUP_DIR="backups"
+fi
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 BACKUP_NAME="config_backup_${TIMESTAMP}.tar.gz"
 KEEP_BACKUPS=7

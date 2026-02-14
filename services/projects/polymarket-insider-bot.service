@@ -12,11 +12,14 @@ ExecStart=/home/wolf/.local/bin/mise run daemon
 Restart=on-failure
 RestartSec=30
 Environment=HOME=/home/wolf
+# Store databases/data on HDD to avoid filling the SSD
+Environment=DATABASE_URL=sqlite+aiosqlite:///mnt/storage/projects/polymarket-insider-bot/polyinsider.db
 
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/home/wolf/projects/polymarket-insider-bot
+ReadWritePaths=/mnt/storage/projects
 
 [Install]
 WantedBy=multi-user.target

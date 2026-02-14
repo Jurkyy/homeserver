@@ -35,7 +35,7 @@ services:
     volumes:
       - ./services/jellyfin/config:/config
       - ./services/jellyfin/cache:/cache
-      - /mnt/media:/media:ro
+      - ${MEDIA_PATH:-/mnt/storage/media}:/media:ro
     environment:
       - JELLYFIN_PublishedServerUrl=${JELLYFIN_URL:-http://localhost:8096}
     restart: unless-stopped

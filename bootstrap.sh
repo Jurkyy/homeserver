@@ -295,16 +295,181 @@ setup_server_hostname() {
     success "Tailscale hostname set to 'homeserver'"
 }
 
-# Check external drive mount
-check_media_mount() {
-    info "Checking external drive mount at /mnt/media..."
+# Discover and mount secondary HDD
+setup_storage_hdd() {
+    info "Looking for secondary storage disk..."
 
-    if mountpoint -q /mnt/media 2>/dev/null; then
-        success "External drive is mounted at /mnt/media"
-    else
-        warn "External drive is NOT mounted at /mnt/media"
-        warn "Jellyfin won't work until you mount your media drive"
+    # Find the boot disk so we can exclude it
+    local boot_disk
+    boot_disk=$(lsblk -ndo PKNAME "$(findmnt -no SOURCE /)" 2>/dev/null || echo "")
+
+    # Find non-boot, non-removable disks (HDDs/SSDs) that aren't mounted
+    local candidates=()
+    while IFS= read -r disk; do
+        local name=$(echo "$disk" | awk '{print $1}')
+        local size=$(echo "$disk" | awk '{print $2}')
+        local type=$(echo "$disk" | awk '{print $3}')
+        local rm_flag=$(echo "$disk" | awk '{print $4}')
+
+        # Skip boot disk, removable, loop, rom devices
+        [[ "$name" == "$boot_disk" ]] && continue
+        [[ "$rm_flag" == "1" ]] && continue
+        [[ "$type" != "disk" ]] && continue
+
+        candidates+=("$name|$size")
+    done < <(lsblk -ndo NAME,SIZE,TYPE,RM 2>/dev/null)
+
+    if [ ${#candidates[@]} -eq 0 ]; then
+        warn "No secondary storage disk found"
+        warn "Skipping HDD setup — you can run this later or mount manually"
+        echo ""
+        info "To mount manually later:"
+        echo "  lsblk                              # find the disk (e.g. sdb)"
+        echo "  sudo mkfs.ext4 /dev/sdb1           # format (if needed)"
+        echo "  sudo mkdir -p /mnt/storage"
+        echo "  sudo mount /dev/sdb1 /mnt/storage"
+        echo "  # Add to /etc/fstab for persistence"
+        return
     fi
+
+    echo ""
+    info "Found secondary disk(s):"
+    for c in "${candidates[@]}"; do
+        local name="${c%%|*}"
+        local size="${c##*|}"
+        echo "  /dev/$name  ($size)"
+        # Show partitions
+        lsblk -n "/dev/$name" 2>/dev/null | while read -r line; do
+            echo "    $line"
+        done
+    done
+
+    # If already mounted at /mnt/storage, we're good
+    if mountpoint -q /mnt/storage 2>/dev/null; then
+        success "Storage disk already mounted at /mnt/storage"
+        _setup_storage_dirs
+        return
+    fi
+
+    echo ""
+    read -p "Which disk to use for storage? (e.g. sdb, or 'skip'): " chosen_disk
+    if [[ "$chosen_disk" == "skip" || -z "$chosen_disk" ]]; then
+        warn "Skipping HDD setup"
+        return
+    fi
+
+    local disk_path="/dev/${chosen_disk}"
+    if [ ! -b "$disk_path" ]; then
+        error "Disk $disk_path not found"
+        return
+    fi
+
+    # Check if the disk has partitions
+    local part_count
+    part_count=$(lsblk -nro NAME "$disk_path" | wc -l)
+
+    local target_part=""
+    if [ "$part_count" -le 1 ]; then
+        # No partitions — offer to partition + format
+        echo ""
+        warn "Disk $disk_path has no partitions"
+        read -p "Create a single ext4 partition on $disk_path? (This will ERASE the disk) [y/N]: " do_format
+        if [[ "$do_format" == "y" || "$do_format" == "Y" ]]; then
+            info "Partitioning $disk_path..."
+            # Create single partition using entire disk
+            echo -e "g\nn\n\n\n\nw" | fdisk "$disk_path"
+            sleep 1
+
+            # Find the new partition
+            target_part="${disk_path}1"
+            if [ ! -b "$target_part" ]; then
+                # NVMe-style naming
+                target_part="${disk_path}p1"
+            fi
+
+            info "Formatting $target_part as ext4..."
+            mkfs.ext4 -F "$target_part"
+            success "Formatted $target_part"
+        else
+            warn "Skipping disk setup"
+            return
+        fi
+    else
+        # Has partitions — use the first/largest one
+        target_part=$(lsblk -nrbo NAME,SIZE "$disk_path" | grep -v "^${chosen_disk} " | sort -k2 -rn | head -1 | awk '{print $1}')
+        target_part="/dev/$target_part"
+
+        # Check if it has a filesystem
+        local fstype
+        fstype=$(blkid -s TYPE -o value "$target_part" 2>/dev/null || echo "")
+        if [ -z "$fstype" ]; then
+            read -p "Partition $target_part has no filesystem. Format as ext4? [y/N]: " do_format
+            if [[ "$do_format" == "y" || "$do_format" == "Y" ]]; then
+                info "Formatting $target_part as ext4..."
+                mkfs.ext4 -F "$target_part"
+                success "Formatted"
+            else
+                warn "Skipping — no filesystem"
+                return
+            fi
+        else
+            info "Using existing $fstype filesystem on $target_part"
+        fi
+    fi
+
+    # Mount at /mnt/storage
+    info "Mounting $target_part at /mnt/storage..."
+    mkdir -p /mnt/storage
+    mount "$target_part" /mnt/storage
+    success "Mounted at /mnt/storage"
+
+    # Add to fstab if not already there
+    local uuid
+    uuid=$(blkid -s UUID -o value "$target_part" 2>/dev/null || echo "")
+    if [ -n "$uuid" ] && ! grep -q "$uuid" /etc/fstab 2>/dev/null; then
+        echo "UUID=$uuid /mnt/storage ext4 defaults,nofail 0 2" >> /etc/fstab
+        success "Added to /etc/fstab (persistent across reboots)"
+    fi
+
+    _setup_storage_dirs
+}
+
+# Create standard directory structure on storage disk
+_setup_storage_dirs() {
+    info "Setting up storage directories..."
+
+    local dirs=(
+        "/mnt/storage/media"          # Jellyfin media library
+        "/mnt/storage/media/movies"
+        "/mnt/storage/media/tv"
+        "/mnt/storage/media/music"
+        "/mnt/storage/backups"        # Service config backups
+        "/mnt/storage/docker"         # Docker data (images, volumes)
+        "/mnt/storage/projects"       # Project data (databases, logs)
+    )
+
+    for dir in "${dirs[@]}"; do
+        mkdir -p "$dir"
+    done
+
+    # Own the dirs by the user
+    if [ -n "$SUDO_USER" ]; then
+        chown -R "$SUDO_USER:$SUDO_USER" /mnt/storage/media
+        chown -R "$SUDO_USER:$SUDO_USER" /mnt/storage/backups
+        chown -R "$SUDO_USER:$SUDO_USER" /mnt/storage/projects
+    fi
+
+    # Symlink /mnt/media -> /mnt/storage/media for backward compat
+    if [ ! -e /mnt/media ]; then
+        ln -s /mnt/storage/media /mnt/media
+        success "Symlinked /mnt/media -> /mnt/storage/media"
+    fi
+
+    success "Storage directories created:"
+    echo "  /mnt/storage/media/     — Jellyfin media (movies, tv, music)"
+    echo "  /mnt/storage/backups/   — Config backups"
+    echo "  /mnt/storage/docker/    — Docker data"
+    echo "  /mnt/storage/projects/  — Project data (databases, logs)"
 }
 
 # Setup environment file
@@ -491,7 +656,7 @@ main() {
     setup_server_hostname
 
     echo ""
-    check_media_mount
+    setup_storage_hdd
 
     echo ""
     setup_env_file
@@ -514,6 +679,10 @@ main() {
     echo "  - OpenClaw:       http://localhost:18789"
     echo "  - Home Assistant: http://localhost:8123"
     echo "  - Jellyfin:       http://localhost:8096"
+    echo ""
+    if mountpoint -q /mnt/storage 2>/dev/null; then
+        info "Storage: /mnt/storage ($(df -h /mnt/storage | tail -1 | awk '{print $2}') total, $(df -h /mnt/storage | tail -1 | awk '{print $4}') free)"
+    fi
     echo ""
 
     if [ -n "$SUDO_USER" ]; then
