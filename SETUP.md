@@ -1,5 +1,89 @@
 # Detailed Setup Guide
 
+## Dual-Boot Setup (Windows + Linux)
+
+If you have a fresh Windows install and want to run the homeserver on Arch Linux alongside it, follow these steps to shrink Windows and install Arch on the freed space.
+
+### 1. Prepare Windows
+
+Do all of this **before** booting the USB.
+
+**Shrink the Windows partition:**
+
+1. Press `Win+X` > **Disk Management**
+2. Right-click the main partition (usually `C:`) > **Shrink Volume**
+3. Shrink it down to ~100GB (102400 MB). The remaining space becomes unallocated — that's where Arch goes.
+
+**Disable Fast Startup** (prevents Windows from locking the disk):
+
+1. Control Panel > Power Options > **Choose what the power buttons do**
+2. Click **Change settings that are currently unavailable**
+3. Uncheck **Turn on fast startup**
+4. Save changes
+
+**Disable Secure Boot:**
+
+1. Reboot into BIOS/UEFI (usually `Del`, `F2`, or `F12` at POST)
+2. Find Secure Boot under Security or Boot settings and **disable** it
+3. Save and exit
+
+### 2. Create Bootable USB
+
+1. Download the Arch ISO from [archlinux.org/download](https://archlinux.org/download/)
+2. Flash it to a USB drive using [Ventoy](https://ventoy.net/) (recommended — lets you put multiple ISOs on one drive) or [Rufus](https://rufus.ie/)
+3. Boot from the USB (mash `F12`, `F2`, or `Del` at POST to get the boot menu)
+
+### 3. Install Arch
+
+Use `archinstall` for a guided install — no need to do it the hard way for a server.
+
+```bash
+archinstall
+```
+
+Key selections:
+
+| Setting | Value |
+|---|---|
+| **Disk** | Select the free/unallocated space. **Do NOT touch the Windows partitions.** |
+| **Filesystem** | ext4 |
+| **Bootloader** | GRUB (it will detect Windows automatically) |
+| **Profile** | minimal (no desktop environment — this is a server) |
+| **Network** | Enable NetworkManager or systemd-networkd |
+| **User** | Create a user account with sudo access |
+
+### 4. Post-Install: Verify Dual Boot
+
+GRUB should auto-detect Windows and add it to the boot menu. If Windows doesn't show up:
+
+```bash
+sudo grub-mkconfig -o /boot/grub/grub.cfg
+```
+
+Set Linux as the default and give yourself time to pick Windows if needed:
+
+```bash
+sudo sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=0/' /etc/default/grub
+sudo sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=5/' /etc/default/grub
+sudo grub-mkconfig -o /boot/grub/grub.cfg
+```
+
+Reboot and verify both OSes boot correctly.
+
+### 5. Continue With Bootstrap
+
+Once Arch is running, clone the repo and run the bootstrap script:
+
+```bash
+git clone <your-repo-url> homeserver
+cd homeserver
+sudo ./bootstrap.sh
+```
+
+Then continue with the rest of this guide below.
+
+---
+
 ## Hardware Recommendations
 
 - **CPU**: Any modern x86_64 processor (Intel/AMD)

@@ -145,6 +145,76 @@ install_basic_tools() {
     success "Basic tools installed"
 }
 
+# Install mise (version manager)
+install_mise() {
+    info "Installing mise..."
+
+    local user_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+
+    if [ -f "$user_home/.local/bin/mise" ]; then
+        success "mise already installed"
+    else
+        # Install mise as the regular user
+        if [ -n "$SUDO_USER" ]; then
+            sudo -u "$SUDO_USER" bash -c 'curl https://mise.run | sh'
+        else
+            curl https://mise.run | sh
+        fi
+        success "mise installed"
+    fi
+
+    # Add mise activation to shell RC
+    local user_shell=$(getent passwd "$SUDO_USER" | cut -d: -f7)
+    local shell_rc=""
+
+    if [[ "$user_shell" == *"zsh"* ]]; then
+        shell_rc="$user_home/.zshrc"
+    else
+        shell_rc="$user_home/.bashrc"
+    fi
+
+    if [ -f "$shell_rc" ] && ! grep -q "mise activate" "$shell_rc" 2>/dev/null; then
+        echo '' >> "$shell_rc"
+        echo '# mise (version manager)' >> "$shell_rc"
+        if [[ "$shell_rc" == *".zshrc"* ]]; then
+            echo 'eval "$($HOME/.local/bin/mise activate zsh)"' >> "$shell_rc"
+        else
+            echo 'eval "$($HOME/.local/bin/mise activate bash)"' >> "$shell_rc"
+        fi
+        chown "$SUDO_USER:$SUDO_USER" "$shell_rc"
+        success "Added mise activation to $shell_rc"
+    fi
+
+    # Install Python and uv via mise
+    info "Installing Python 3.12 and uv via mise..."
+    if [ -n "$SUDO_USER" ]; then
+        sudo -u "$SUDO_USER" bash -c '$HOME/.local/bin/mise use -g python@3.12 uv@latest'
+    else
+        "$user_home/.local/bin/mise" use -g python@3.12 uv@latest
+    fi
+    success "Python 3.12 and uv installed via mise"
+}
+
+# Setup projects directory
+setup_projects_dir() {
+    if [ -z "$SUDO_USER" ]; then
+        return
+    fi
+
+    local user_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    local projects_dir="$user_home/projects"
+
+    info "Setting up projects directory..."
+
+    if [ ! -d "$projects_dir" ]; then
+        mkdir -p "$projects_dir"
+        chown "$SUDO_USER:$SUDO_USER" "$projects_dir"
+        success "Created $projects_dir"
+    else
+        success "Projects directory already exists at $projects_dir"
+    fi
+}
+
 # Install Docker
 install_docker() {
     info "Installing Docker..."
@@ -216,6 +286,13 @@ install_tailscale() {
     systemctl enable tailscaled
     systemctl start tailscaled
     success "Tailscale service enabled and started"
+}
+
+# Set Tailscale hostname
+setup_server_hostname() {
+    info "Setting Tailscale hostname to 'homeserver'..."
+    tailscale set --hostname=homeserver
+    success "Tailscale hostname set to 'homeserver'"
 }
 
 # Check external drive mount
@@ -407,9 +484,11 @@ main() {
 
     update_system
     install_basic_tools
+    install_mise
     install_ssh
     install_docker
     install_tailscale
+    setup_server_hostname
 
     echo ""
     check_media_mount
@@ -420,6 +499,7 @@ main() {
 
     echo ""
     setup_shell_config
+    setup_projects_dir
 
     connect_tailscale
     start_services

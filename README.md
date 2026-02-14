@@ -56,6 +56,7 @@ homeserver/
 │   └── aliases         # Shell aliases (installed to ~/.aliases)
 ├── scripts/
 │   ├── backup.sh       # Backup all configs
+│   ├── deploy.sh       # Deploy projects to server
 │   └── update.sh       # Update services
 └── services/
     ├── homeassistant/
@@ -63,8 +64,10 @@ homeserver/
     ├── jellyfin/
     │   ├── config/     # Jellyfin configuration
     │   └── cache/      # Transcoding cache
-    └── openclaw/
-        └── config/     # OpenClaw configuration
+    ├── openclaw/
+    │   └── config/     # OpenClaw configuration
+    └── projects/
+        └── polymarket-insider-bot.service
 ```
 
 ## Helper Scripts
@@ -77,6 +80,35 @@ homeserver/
 Once Tailscale is connected, access services via your Tailscale IP:
 - `http://100.x.x.x:8123` - Home Assistant
 - `http://100.x.x.x:8096` - Jellyfin
+
+## Project Deployment
+
+Deploy git repos (Python bots, etc.) from your dev machine to the server and run them as systemd services.
+
+```bash
+# Deploy a project
+./scripts/deploy.sh ~/dev/polymarket-insider-bot
+
+# Deploy and install as a systemd service
+./scripts/deploy.sh ~/dev/polymarket-insider-bot --service
+
+# Deploy to a different host
+./scripts/deploy.sh ~/dev/my-project --host myserver
+```
+
+Projects are synced to `~/projects/<name>/` on the server. The deploy script runs `mise install` and `mise run setup` (or `uv sync`) automatically.
+
+**Example: Polymarket Insider Bot**
+
+```bash
+./scripts/deploy.sh ~/dev/polymarket-insider-bot --service
+
+# Check status
+ssh homeserver 'systemctl status polymarket-insider-bot'
+
+# View logs
+ssh homeserver 'journalctl -u polymarket-insider-bot -f'
+```
 
 ## Documentation
 

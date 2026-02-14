@@ -37,6 +37,10 @@ alias hsr="dc restart"
 alias hsu="./scripts/update.sh"
 alias hsb="./scripts/backup.sh"
 
+# Remote (run from dev machine)
+alias hss="ssh homeserver"
+alias hssync="rsync -avz --exclude '.git' --exclude '__pycache__' --exclude '.venv' --exclude 'node_modules'"
+
 # System
 alias ports="ss -tulpn"
 alias disk="df -h"

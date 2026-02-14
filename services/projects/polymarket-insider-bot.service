@@ -1,0 +1,22 @@
+[Unit]
+Description=Polymarket Insider Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wolf
+Group=wolf
+WorkingDirectory=/home/wolf/projects/polymarket-insider-bot
+ExecStart=/home/wolf/.local/bin/mise run daemon
+Restart=on-failure
+RestartSec=30
+Environment=HOME=/home/wolf
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/wolf/projects/polymarket-insider-bot
+
+[Install]
+WantedBy=multi-user.target
