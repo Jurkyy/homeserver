@@ -15,6 +15,18 @@ services:
       - DISCORD_CLIENT_ID=${DISCORD_CLIENT_ID}
     restart: unless-stopped
 
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: mosquitto
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./services/mosquitto/config:/mosquitto/config
+      - ./services/mosquitto/data:/mosquitto/data
+      - ./services/mosquitto/log:/mosquitto/log
+    restart: unless-stopped
+
   homeassistant:
     image: ghcr.io/home-assistant/home-assistant:stable
     container_name: homeassistant
@@ -23,7 +35,24 @@ services:
     volumes:
       - ./services/homeassistant/config:/config
       - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      - mosquitto
     privileged: true
+    restart: unless-stopped
+
+  navidrome:
+    image: deluan/navidrome:latest
+    container_name: navidrome
+    ports:
+      - "4533:4533"
+    volumes:
+      - ./services/navidrome/data:/data
+      - ${MEDIA_PATH:-/mnt/storage/media}/music:/music:ro
+    environment:
+      - ND_SCANSCHEDULE=1h
+      - ND_LOGLEVEL=info
+      - ND_SESSIONTIMEOUT=24h
+      - ND_BASEURL=
     restart: unless-stopped
 
   jellyfin:
