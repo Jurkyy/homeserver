@@ -1,0 +1,193 @@
+# =============================================================================
+# Home Assistant - Main Configuration
+# Jungle Flat Smart Home
+# =============================================================================
+# This is the primary configuration file for Home Assistant.
+# Split configs are included from separate YAML files for maintainability.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Core Settings
+# -----------------------------------------------------------------------------
+homeassistant:
+  name: "Jungle Flat"
+  unit_system: metric
+  time_zone: Europe/Amsterdam
+  currency: EUR
+  country: NL
+  # External and internal URLs - update these to match your setup
+  # external_url: "https://ha.yourdomain.com"
+  # internal_url: "http://homeassistant.local:8123"
+  customize: !include customize.yaml
+
+# -----------------------------------------------------------------------------
+# Default Integrations
+# -----------------------------------------------------------------------------
+# These load the standard HA frontend, automation engine, etc.
+default_config:
+
+# -----------------------------------------------------------------------------
+# Split Configuration Includes
+# -----------------------------------------------------------------------------
+# Each domain is managed in its own file for cleaner organization.
+automation: !include automations.yaml
+scene: !include scenes.yaml
+script: !include scripts.yaml
+group: !include groups.yaml
+
+# -----------------------------------------------------------------------------
+# MQTT Broker Configuration
+# -----------------------------------------------------------------------------
+# Connects to the Mosquitto MQTT broker running as a sibling container.
+# Used for Zigbee2MQTT, sensor data, and inter-service messaging.
+mqtt:
+  broker: mosquitto
+  port: 1883
+  # Uncomment and set credentials if your broker requires authentication:
+  # username: "homeassistant"
+  # password: !secret mqtt_password
+  discovery: true
+  discovery_prefix: homeassistant
+
+# -----------------------------------------------------------------------------
+# Logger Configuration
+# -----------------------------------------------------------------------------
+# Control log verbosity per component. Default is warning to reduce noise.
+logger:
+  default: warning
+  logs:
+    homeassistant.components.mqtt: info
+    homeassistant.components.automation: info
+    homeassistant.components.script: info
+    homeassistant.components.light: info
+    homeassistant.components.media_player: warning
+    homeassistant.components.rest_command: info
+    custom_components: debug
+
+# -----------------------------------------------------------------------------
+# Recorder Configuration
+# -----------------------------------------------------------------------------
+# Controls what gets stored in the database and for how long.
+# 7-day retention keeps the DB size manageable on limited storage.
+recorder:
+  purge_keep_days: 7
+  commit_interval: 5
+  # Exclude noisy entities to save DB space
+  exclude:
+    domains:
+      - updater
+    entity_globs:
+      - sensor.date_*
+      - sensor.time_*
+    event_types:
+      - call_service
+
+# -----------------------------------------------------------------------------
+# History & Logbook
+# -----------------------------------------------------------------------------
+history:
+logbook:
+
+# -----------------------------------------------------------------------------
+# REST Commands - OpenClaw Integration
+# -----------------------------------------------------------------------------
+# These commands allow HA to communicate with the OpenClaw AI agent.
+# Update the URL to match your OpenClaw deployment.
+rest_command:
+  # Send a notification/message to OpenClaw
+  openclaw_notify:
+    url: "http://openclaw:8080/api/notify"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+      # Authorization: "Bearer {{ states('input_text.openclaw_api_key') }}"
+    payload: >-
+      {"message": "{{ message }}", "source": "homeassistant", "priority": "{{ priority | default('normal') }}"}
+    timeout: 10
+
+  # Request OpenClaw to perform an action
+  openclaw_action:
+    url: "http://openclaw:8080/api/action"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+    payload: >-
+      {"action": "{{ action }}", "parameters": {{ parameters | default('{}') }}}
+    timeout: 15
+
+  # Query OpenClaw for a status or recommendation
+  openclaw_query:
+    url: "http://openclaw:8080/api/query"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+    payload: >-
+      {"query": "{{ query }}"}
+    timeout: 10
+
+# -----------------------------------------------------------------------------
+# Media Player Platform Configs
+# -----------------------------------------------------------------------------
+# Uncomment and configure the platforms that match your hardware.
+# media_player:
+#   # For a Chromecast / Google Cast device
+#   - platform: cast
+#
+#   # For a Kodi media center
+#   - platform: kodi
+#     host: 192.168.1.x
+#     port: 8080
+#
+#   # For MPD (Music Player Daemon)
+#   - platform: mpd
+#     host: 192.168.1.x
+#     port: 6600
+
+# -----------------------------------------------------------------------------
+# Input Boolean Helpers - Mode Toggles
+# -----------------------------------------------------------------------------
+# These serve as virtual switches that automations and the UI can use
+# to track and trigger different "modes" for the flat.
+input_boolean:
+  movie_mode:
+    name: "Movie Mode"
+    icon: mdi:movie-open
+    # When toggled on, dims lights and activates projector
+
+  focus_mode:
+    name: "Focus Mode"
+    icon: mdi:head-lightbulb
+    # When toggled on, sets office lighting and mutes distractions
+
+  jungle_ambience:
+    name: "Jungle Ambience"
+    icon: mdi:tree
+    # When toggled on, activates green accent LEDs and nature sounds
+
+  away_mode:
+    name: "Away Mode"
+    icon: mdi:home-export-outline
+    # Automatically set when no one is home for 30 minutes
+
+  do_not_disturb:
+    name: "Do Not Disturb"
+    icon: mdi:bell-off
+    # Suppresses non-critical notifications and sounds
+
+# -----------------------------------------------------------------------------
+# Input Select Helpers - Scene Selector
+# -----------------------------------------------------------------------------
+# A dropdown that the UI (or voice assistants) can use to pick a mood.
+# Automations watch this and activate the matching scene.
+input_select:
+  house_mood:
+    name: "House Mood"
+    icon: mdi:palette
+    options:
+      - Energize
+      - Focus
+      - Relax
+      - Movie
+      - Party
+      - Sleep
+    initial: Relax

@@ -1,0 +1,308 @@
+# =============================================================================
+# Home Assistant - Scenes
+# Jungle Flat Smart Home
+# =============================================================================
+# Scenes capture a snapshot of desired entity states. They can be activated
+# by automations, scripts, voice commands, or the HA dashboard.
+# =============================================================================
+
+# =============================================================================
+# 1. Jungle Day
+# =============================================================================
+# Bright natural lighting with green accents. Perfect for daytime.
+- id: jungle_day
+  name: "Jungle Day"
+  icon: mdi:weather-sunny
+  entities:
+    # Main lights: bright daylight
+    light.living_room_main:
+      state: "on"
+      brightness_pct: 80
+      kelvin: 4000
+    light.bedroom_main:
+      state: "on"
+      brightness_pct: 80
+      kelvin: 4000
+    light.kitchen_main:
+      state: "on"
+      brightness_pct: 80
+      kelvin: 4000
+    light.office_main:
+      state: "on"
+      brightness_pct: 80
+      kelvin: 4000
+    # Accent LEDs: subtle green glow like sunlight through leaves
+    light.living_room_led_strip:
+      state: "on"
+      brightness_pct: 30
+      rgb_color: [0, 200, 60]
+    light.bedroom_led_strip:
+      state: "on"
+      brightness_pct: 30
+      rgb_color: [0, 200, 60]
+
+# =============================================================================
+# 2. Jungle Evening
+# =============================================================================
+# Warm cozy lighting with amber accents and string lights.
+- id: jungle_evening
+  name: "Jungle Evening"
+  icon: mdi:weather-sunset
+  entities:
+    # Main lights: warm and dimmed
+    light.living_room_main:
+      state: "on"
+      brightness_pct: 40
+      kelvin: 2700
+    light.bedroom_main:
+      state: "on"
+      brightness_pct: 40
+      kelvin: 2700
+    light.kitchen_main:
+      state: "on"
+      brightness_pct: 30
+      kelvin: 2700
+    light.office_main:
+      state: "on"
+      brightness_pct: 20
+      kelvin: 2700
+    # Accent LEDs: warm amber glow
+    light.living_room_led_strip:
+      state: "on"
+      brightness_pct: 40
+      rgb_color: [255, 191, 0]
+    light.bedroom_led_strip:
+      state: "on"
+      brightness_pct: 30
+      rgb_color: [255, 170, 0]
+    # String lights on for ambiance
+    light.string_lights:
+      state: "on"
+      brightness_pct: 60
+
+# =============================================================================
+# 3. Movie Night
+# =============================================================================
+# Everything dark except soft bias lighting behind the projector screen.
+- id: movie_night
+  name: "Movie Night"
+  icon: mdi:movie-open
+  entities:
+    # All main lights off
+    light.living_room_main:
+      state: "off"
+    light.bedroom_main:
+      state: "off"
+    light.kitchen_main:
+      state: "off"
+    light.office_main:
+      state: "off"
+    light.string_lights:
+      state: "off"
+    # Bias lighting behind projector: soft warm white at 10%
+    light.living_room_led_strip:
+      state: "on"
+      brightness_pct: 10
+      rgb_color: [255, 244, 229]
+    # Other accent LEDs off
+    light.bedroom_led_strip:
+      state: "off"
+
+# =============================================================================
+# 4. Cozy Reading
+# =============================================================================
+# A single warm lamp for reading, everything else off.
+- id: cozy_reading
+  name: "Cozy Reading"
+  icon: mdi:book-open-variant
+  entities:
+    # Reading lamp on at comfortable brightness
+    light.reading_lamp:
+      state: "on"
+      brightness_pct: 60
+      kelvin: 2700
+    # Everything else off
+    light.living_room_main:
+      state: "off"
+    light.bedroom_main:
+      state: "off"
+    light.kitchen_main:
+      state: "off"
+    light.office_main:
+      state: "off"
+    light.living_room_led_strip:
+      state: "off"
+    light.bedroom_led_strip:
+      state: "off"
+    light.string_lights:
+      state: "off"
+
+# =============================================================================
+# 5. Party Mode
+# =============================================================================
+# Colorful cycling lights and music ready to go.
+- id: party_mode
+  name: "Party Mode"
+  icon: mdi:party-popper
+  entities:
+    # Main lights: colorful and bright
+    light.living_room_main:
+      state: "on"
+      brightness_pct: 100
+      rgb_color: [255, 0, 150]
+    light.bedroom_main:
+      state: "on"
+      brightness_pct: 80
+      rgb_color: [0, 100, 255]
+    light.kitchen_main:
+      state: "on"
+      brightness_pct: 80
+      rgb_color: [255, 100, 0]
+    # LED strips: vivid cycling colors
+    light.living_room_led_strip:
+      state: "on"
+      brightness_pct: 100
+      rgb_color: [150, 0, 255]
+      effect: "colorloop"
+    light.bedroom_led_strip:
+      state: "on"
+      brightness_pct: 100
+      rgb_color: [0, 255, 150]
+      effect: "colorloop"
+    # String lights fully on
+    light.string_lights:
+      state: "on"
+      brightness_pct: 100
+
+# =============================================================================
+# 6. Deep Focus
+# =============================================================================
+# Cool white office light at full power, everything else minimal.
+- id: deep_focus
+  name: "Deep Focus"
+  icon: mdi:head-lightbulb
+  entities:
+    # Office: maximum brightness, cool white for alertness
+    light.office_main:
+      state: "on"
+      brightness_pct: 100
+      kelvin: 5000
+    # Everything else dimmed or off to reduce distraction
+    light.living_room_main:
+      state: "on"
+      brightness_pct: 10
+      kelvin: 4000
+    light.bedroom_main:
+      state: "off"
+    light.kitchen_main:
+      state: "on"
+      brightness_pct: 20
+      kelvin: 4000
+    light.living_room_led_strip:
+      state: "off"
+    light.bedroom_led_strip:
+      state: "off"
+    light.string_lights:
+      state: "off"
+
+# =============================================================================
+# 7. Romantic
+# =============================================================================
+# Very warm, very dim, with candle-flicker effect on accent lights.
+- id: romantic
+  name: "Romantic"
+  icon: mdi:heart
+  entities:
+    # Main lights: extremely warm and dim
+    light.living_room_main:
+      state: "on"
+      brightness_pct: 20
+      kelvin: 2200
+    light.bedroom_main:
+      state: "on"
+      brightness_pct: 20
+      kelvin: 2200
+    light.kitchen_main:
+      state: "off"
+    light.office_main:
+      state: "off"
+    # Accent LEDs: candle flicker effect
+    light.living_room_led_strip:
+      state: "on"
+      brightness_pct: 25
+      rgb_color: [255, 147, 41]
+      effect: "candle"
+    light.bedroom_led_strip:
+      state: "on"
+      brightness_pct: 20
+      rgb_color: [255, 147, 41]
+      effect: "candle"
+    # String lights for extra warmth
+    light.string_lights:
+      state: "on"
+      brightness_pct: 30
+
+# =============================================================================
+# 8. Morning Energize
+# =============================================================================
+# Bright cool light to kickstart the day. Optionally pairs with upbeat music.
+- id: morning_energize
+  name: "Morning Energize"
+  icon: mdi:coffee
+  entities:
+    # All main lights: bright and cool
+    light.living_room_main:
+      state: "on"
+      brightness_pct: 90
+      kelvin: 5000
+    light.bedroom_main:
+      state: "on"
+      brightness_pct: 90
+      kelvin: 5000
+    light.kitchen_main:
+      state: "on"
+      brightness_pct: 90
+      kelvin: 5000
+    light.office_main:
+      state: "on"
+      brightness_pct: 90
+      kelvin: 5000
+    # Accent LEDs: bright white
+    light.living_room_led_strip:
+      state: "on"
+      brightness_pct: 50
+      rgb_color: [255, 255, 255]
+    light.bedroom_led_strip:
+      state: "on"
+      brightness_pct: 50
+      rgb_color: [255, 255, 255]
+
+# =============================================================================
+# 9. Meditation
+# =============================================================================
+# Very dim warm lights for meditation, ideally paired with nature sounds.
+- id: meditation
+  name: "Meditation"
+  icon: mdi:meditation
+  entities:
+    # Almost all lights off or extremely dim
+    light.living_room_main:
+      state: "on"
+      brightness_pct: 10
+      kelvin: 2200
+    light.bedroom_main:
+      state: "off"
+    light.kitchen_main:
+      state: "off"
+    light.office_main:
+      state: "off"
+    # Accent LEDs: very subtle warm glow
+    light.living_room_led_strip:
+      state: "on"
+      brightness_pct: 5
+      rgb_color: [255, 180, 80]
+    light.bedroom_led_strip:
+      state: "off"
+    light.string_lights:
+      state: "on"
+      brightness_pct: 10

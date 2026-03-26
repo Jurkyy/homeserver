@@ -13,6 +13,10 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
       - DISCORD_CLIENT_ID=${DISCORD_CLIENT_ID}
+      - HA_URL=${HA_URL:-http://homeassistant:8123}
+      - HA_LONG_LIVED_TOKEN=${HA_LONG_LIVED_TOKEN}
+    depends_on:
+      - homeassistant
     restart: unless-stopped
 
   mosquitto:

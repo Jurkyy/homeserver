@@ -5,6 +5,14 @@
 services/*/config/*
 !services/*/config/.gitkeep
 
+# Home Assistant config is tracked (production-ready YAML configs)
+!services/homeassistant/config/*.yaml
+
+# OpenClaw config is tracked (agent config, tools, system prompt)
+!services/openclaw/config/openclaw.json
+!services/openclaw/config/tools.json
+!services/openclaw/config/system_prompt.md
+
 # Jellyfin cache
 services/jellyfin/cache/*
 !services/jellyfin/cache/.gitkeep

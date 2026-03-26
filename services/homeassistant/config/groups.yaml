@@ -1,0 +1,107 @@
+# =============================================================================
+# Home Assistant - Groups
+# Jungle Flat Smart Home
+# =============================================================================
+# Logical groupings of light entities by room and function.
+# These groups are used throughout automations, scenes, and scripts
+# to control sets of lights together.
+#
+# NOTE: Update entity IDs below to match your actual devices once
+# they are discovered/added to Home Assistant.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Room-Based Light Groups
+# -----------------------------------------------------------------------------
+
+# Living room lights - main ceiling, floor lamp, reading corner
+living_room_lights:
+  name: "Living Room Lights"
+  icon: mdi:sofa
+  entities:
+    - light.living_room_main
+    - light.living_room_floor_lamp
+    - light.reading_lamp
+
+# Bedroom lights - main ceiling, bedside lamps, nightlight
+bedroom_lights:
+  name: "Bedroom Lights"
+  icon: mdi:bed
+  entities:
+    - light.bedroom_main
+    - light.bedside_lamp_left
+    - light.bedside_lamp_right
+    - light.bedroom_nightlight
+
+# Kitchen lights - main ceiling, under-cabinet strip
+kitchen_lights:
+  name: "Kitchen Lights"
+  icon: mdi:countertop
+  entities:
+    - light.kitchen_main
+    - light.kitchen_counter_strip
+
+# Bathroom lights - main ceiling, mirror light
+bathroom_lights:
+  name: "Bathroom Lights"
+  icon: mdi:shower
+  entities:
+    - light.bathroom_main
+    - light.bathroom_mirror
+
+# Office lights - main desk lamp, overhead
+office_lights:
+  name: "Office Lights"
+  icon: mdi:desk-lamp
+  entities:
+    - light.office_main
+    - light.office_desk_lamp
+
+# -----------------------------------------------------------------------------
+# Function-Based Light Groups
+# -----------------------------------------------------------------------------
+
+# Accent lights - LED strips, string lights, decorative lighting
+# These are the "jungle" lights that add character to the flat
+accent_lights:
+  name: "Accent Lights"
+  icon: mdi:led-strip-variant
+  entities:
+    - light.living_room_led_strip
+    - light.bedroom_led_strip
+    - light.kitchen_counter_strip
+    - light.string_lights
+
+# -----------------------------------------------------------------------------
+# Master Group - All Lights
+# -----------------------------------------------------------------------------
+
+# Every light in the flat - used for global operations
+all_lights:
+  name: "All Lights"
+  icon: mdi:lightbulb-group
+  entities:
+    # Living room
+    - light.living_room_main
+    - light.living_room_floor_lamp
+    - light.reading_lamp
+    # Bedroom
+    - light.bedroom_main
+    - light.bedside_lamp_left
+    - light.bedside_lamp_right
+    - light.bedroom_nightlight
+    # Kitchen
+    - light.kitchen_main
+    - light.kitchen_counter_strip
+    # Bathroom
+    - light.bathroom_main
+    - light.bathroom_mirror
+    # Office
+    - light.office_main
+    - light.office_desk_lamp
+    # Hallway
+    - light.hallway
+    # Accent / decorative
+    - light.living_room_led_strip
+    - light.bedroom_led_strip
+    - light.string_lights

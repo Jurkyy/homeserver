@@ -1,0 +1,654 @@
+# =============================================================================
+# Home Assistant - Automations
+# Jungle Flat Smart Home
+# =============================================================================
+# All automations for the jungle flat. Each automation includes:
+#   - A unique ID for the automation registry
+#   - A descriptive alias
+#   - Trigger(s), condition(s), and action(s)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# YAML Anchors - Reusable Transition Defaults
+# -----------------------------------------------------------------------------
+# Define common transition durations and color temps here so they can be
+# reused across automations without repetition.
+
+x_anchors:
+  - &slow_transition 300       # 5 minutes in seconds
+  - &medium_transition 60      # 1 minute in seconds
+  - &fast_transition 5         # 5 seconds
+  - &warm_color_temp 2200      # Very warm / candlelight
+  - &cozy_color_temp 2700      # Cozy evening warmth
+  - &neutral_color_temp 4000   # Daylight / natural
+  - &cool_color_temp 5000      # Cool white / energizing
+
+# =============================================================================
+# 1. Sunrise Wake-Up
+# =============================================================================
+# 30 minutes before the alarm, gradually ramp bedroom lights from 1% warm
+# (2200K) to 80% daylight (4000K), simulating a natural sunrise.
+- id: sunrise_wakeup
+  alias: "Sunrise Wake-Up"
+  description: >
+    Gradual sunrise simulation in the bedroom. Starts 30 minutes before
+    the alarm time (set via input_datetime.alarm_time or default 07:00).
+    Ramps brightness from 1% to 80% and color temp from warm to daylight.
+  trigger:
+    # Fires 30 minutes before the next alarm
+    - platform: time
+      at: "06:30:00"
+      # TODO: Replace with input_datetime.alarm_time offset when configured
+  condition:
+    # Only run on weekdays (Mon-Fri) unless manually overridden
+    - condition: time
+      weekday:
+        - mon
+        - tue
+        - wed
+        - thu
+        - fri
+    # Don't run if already awake (lights already on)
+    - condition: state
+      entity_id: group.bedroom_lights
+      state: "off"
+  action:
+    # Phase 1: Very dim warm light (minutes 0-10)
+    - service: light.turn_on
+      target:
+        entity_id: group.bedroom_lights
+      data:
+        brightness_pct: 1
+        kelvin: 2200
+    - delay: "00:10:00"
+    # Phase 2: Increasing warmth (minutes 10-20)
+    - service: light.turn_on
+      target:
+        entity_id: group.bedroom_lights
+      data:
+        brightness_pct: 30
+        kelvin: 2700
+        transition: *slow_transition
+    - delay: "00:10:00"
+    # Phase 3: Near full daylight (minutes 20-30)
+    - service: light.turn_on
+      target:
+        entity_id: group.bedroom_lights
+      data:
+        brightness_pct: 80
+        kelvin: 4000
+        transition: *slow_transition
+  mode: single
+
+# =============================================================================
+# 2. Evening Wind-Down
+# =============================================================================
+# At sunset, transition all lights to a warm dim setting and turn on accent LEDs.
+- id: evening_wind_down
+  alias: "Evening Wind-Down"
+  description: >
+    Automatically shifts the flat to evening mode at sunset.
+    Main lights go to warm dim (2700K, 40%) and accent LEDs turn on.
+  trigger:
+    - platform: sun
+      event: sunset
+      # Start 15 minutes before actual sunset for a smooth transition
+      offset: "-00:15:00"
+  condition:
+    # Only if someone is home
+    - condition: state
+      entity_id: input_boolean.away_mode
+      state: "off"
+  action:
+    # Transition main lights to warm evening setting
+    - service: light.turn_on
+      target:
+        entity_id: group.all_lights
+      data:
+        kelvin: 2700
+        brightness_pct: 40
+        transition: *slow_transition
+    # Turn on accent LEDs with amber tones
+    - service: light.turn_on
+      target:
+        entity_id: group.accent_lights
+      data:
+        brightness_pct: 50
+        rgb_color: [255, 191, 0]
+        transition: *medium_transition
+  mode: single
+
+# =============================================================================
+# 3. Movie Mode
+# =============================================================================
+# When movie_mode is toggled on, dim everything, fire up the projector,
+# and set LED strips to soft bias lighting.
+- id: movie_mode_on
+  alias: "Movie Mode - Activate"
+  description: >
+    Dims all lights to 5%, turns on the projector via IR, and sets
+    LED strips behind the projector to soft bias lighting.
+  trigger:
+    - platform: state
+      entity_id: input_boolean.movie_mode
+      to: "on"
+  action:
+    # Set the house mood selector to match
+    - service: input_select.select_option
+      target:
+        entity_id: input_select.house_mood
+      data:
+        option: Movie
+    # Dim all lights way down
+    - service: light.turn_on
+      target:
+        entity_id: group.all_lights
+      data:
+        brightness_pct: 5
+        transition: *medium_transition
+    # Set LED strips to soft bias lighting behind projector
+    - service: light.turn_on
+      target:
+        entity_id: group.accent_lights
+      data:
+        brightness_pct: 10
+        rgb_color: [255, 244, 229]
+        transition: *fast_transition
+    # Start the projector sequence
+    - service: script.activate_projector
+  mode: single
+
+# Movie Mode - Deactivate (restore normal lighting when toggled off)
+- id: movie_mode_off
+  alias: "Movie Mode - Deactivate"
+  description: "Restores normal lighting when movie mode is turned off."
+  trigger:
+    - platform: state
+      entity_id: input_boolean.movie_mode
+      to: "off"
+  action:
+    - service: light.turn_on
+      target:
+        entity_id: group.all_lights
+      data:
+        brightness_pct: 60
+        kelvin: 3000
+        transition: *medium_transition
+    # Turn off projector (send IR off command)
+    # - service: remote.send_command
+    #   target:
+    #     entity_id: remote.living_room_ir
+    #   data:
+    #     command: "power_off"
+    #     device: "projector"
+  mode: single
+
+# =============================================================================
+# 4. Focus Mode
+# =============================================================================
+# Sets the office up for deep work: bright cool light, mute distractions.
+- id: focus_mode_on
+  alias: "Focus Mode - Activate"
+  description: >
+    Office lights to 4000K at 80%, mutes music, turns off accent lights.
+    Designed for deep work sessions.
+  trigger:
+    - platform: state
+      entity_id: input_boolean.focus_mode
+      to: "on"
+  action:
+    # Set the house mood selector
+    - service: input_select.select_option
+      target:
+        entity_id: input_select.house_mood
+      data:
+        option: Focus
+    # Office lights: bright and cool for alertness
+    - service: light.turn_on
+      target:
+        entity_id: group.office_lights
+      data:
+        kelvin: 4000
+        brightness_pct: 80
+        transition: *fast_transition
+    # Turn off distracting accent lights
+    - service: light.turn_off
+      target:
+        entity_id: group.accent_lights
+      data:
+        transition: *fast_transition
+    # Mute media player to eliminate audio distractions
+    - service: media_player.volume_mute
+      target:
+        entity_id: media_player.living_room_speaker
+      data:
+        is_volume_muted: true
+  mode: single
+
+# Focus Mode - Deactivate
+- id: focus_mode_off
+  alias: "Focus Mode - Deactivate"
+  description: "Restores normal settings when focus mode is turned off."
+  trigger:
+    - platform: state
+      entity_id: input_boolean.focus_mode
+      to: "off"
+  action:
+    - service: media_player.volume_mute
+      target:
+        entity_id: media_player.living_room_speaker
+      data:
+        is_volume_muted: false
+    - service: light.turn_on
+      target:
+        entity_id: group.accent_lights
+      data:
+        brightness_pct: 30
+        transition: *medium_transition
+  mode: single
+
+# =============================================================================
+# 5. Jungle Ambience
+# =============================================================================
+# The signature mode: green accent LEDs, nature sounds, warm dim main lights.
+- id: jungle_ambience_on
+  alias: "Jungle Ambience - Activate"
+  description: >
+    Transforms the flat into a tropical jungle. Green-tinted accent LEDs,
+    ambient nature sounds playing, main lights set to warm dim.
+  trigger:
+    - platform: state
+      entity_id: input_boolean.jungle_ambience
+      to: "on"
+  action:
+    # Set the house mood to Relax
+    - service: input_select.select_option
+      target:
+        entity_id: input_select.house_mood
+      data:
+        option: Relax
+    # Green jungle accent LEDs
+    - service: light.turn_on
+      target:
+        entity_id: group.accent_lights
+      data:
+        rgb_color: [0, 180, 60]
+        brightness_pct: 40
+        transition: *medium_transition
+    # Main lights to warm dim, like filtered sunlight through canopy
+    - service: light.turn_on
+      target:
+        entity_id:
+          - group.living_room_lights
+          - group.bedroom_lights
+      data:
+        kelvin: 2700
+        brightness_pct: 35
+        transition: *medium_transition
+    # Play ambient nature sounds
+    - service: script.play_ambient_sounds
+  mode: single
+
+# Jungle Ambience - Deactivate
+- id: jungle_ambience_off
+  alias: "Jungle Ambience - Deactivate"
+  description: "Stops jungle ambience and restores normal lighting."
+  trigger:
+    - platform: state
+      entity_id: input_boolean.jungle_ambience
+      to: "off"
+  action:
+    - service: light.turn_on
+      target:
+        entity_id: group.accent_lights
+      data:
+        brightness_pct: 30
+        rgb_color: [255, 191, 0]
+        transition: *medium_transition
+    - service: media_player.media_stop
+      target:
+        entity_id: media_player.living_room_speaker
+  mode: single
+
+# =============================================================================
+# 6. Welcome Home
+# =============================================================================
+# When the door opens (or presence is detected), light up the hallway
+# and activate a welcoming scene.
+- id: welcome_home
+  alias: "Welcome Home"
+  description: >
+    Triggered by door sensor or presence detection. Turns on hallway lights
+    and starts the welcome scene. Only fires if arriving from away mode.
+  trigger:
+    # Door sensor opens
+    - platform: state
+      entity_id: binary_sensor.front_door
+      to: "on"
+    # Or phone connects to home WiFi (presence detection)
+    - platform: state
+      entity_id: person.resident
+      to: "home"
+  condition:
+    # Only trigger when transitioning from away
+    - condition: state
+      entity_id: input_boolean.away_mode
+      state: "on"
+  action:
+    # Disable away mode
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.away_mode
+    # Light up the hallway immediately
+    - service: light.turn_on
+      target:
+        entity_id: light.hallway
+      data:
+        brightness_pct: 80
+        kelvin: 3000
+        transition: *fast_transition
+    # Activate welcoming scene based on time of day
+    - choose:
+        # Daytime: bright and energizing
+        - conditions:
+            - condition: sun
+              after: sunrise
+              before: sunset
+          sequence:
+            - service: scene.turn_on
+              target:
+                entity_id: scene.jungle_day
+        # Evening/night: warm and cozy
+        - conditions:
+            - condition: sun
+              after: sunset
+          sequence:
+            - service: scene.turn_on
+              target:
+                entity_id: scene.jungle_evening
+    # Notify OpenClaw about arrival
+    - service: rest_command.openclaw_notify
+      data:
+        message: "Welcome home! Lights are on and ready."
+        priority: "low"
+  mode: single
+
+# =============================================================================
+# 7. Goodnight
+# =============================================================================
+# Turns everything off except a dim bedroom nightlight. Stops all media.
+- id: goodnight
+  alias: "Goodnight"
+  description: >
+    End-of-day automation. Turns off all lights except bedroom nightlight
+    at 2%, stops all media players, and sets house mood to Sleep.
+  trigger:
+    # Can be triggered via voice, button, or the mood selector
+    - platform: state
+      entity_id: input_select.house_mood
+      to: "Sleep"
+  action:
+    # Turn off all mode toggles
+    - service: input_boolean.turn_off
+      target:
+        entity_id:
+          - input_boolean.movie_mode
+          - input_boolean.focus_mode
+          - input_boolean.jungle_ambience
+    # Enable do not disturb
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.do_not_disturb
+    # Stop all media players
+    - service: media_player.media_stop
+      target:
+        entity_id: all
+    # Turn off all lights
+    - service: light.turn_off
+      target:
+        entity_id: group.all_lights
+      data:
+        transition: *slow_transition
+    # Wait for the transition to finish, then set nightlight
+    - delay: "00:05:30"
+    # Turn on bedroom nightlight at minimal brightness
+    - service: light.turn_on
+      target:
+        entity_id: light.bedroom_nightlight
+      data:
+        brightness_pct: 2
+        kelvin: 2200
+  mode: single
+
+# =============================================================================
+# 8. Away Mode
+# =============================================================================
+# When no one has been home for 30 minutes, activate away mode.
+- id: away_mode_activate
+  alias: "Away Mode - Activate"
+  description: >
+    Detects when no one is home for 30 minutes and activates away mode.
+    Turns off non-essential lights and pauses media.
+  trigger:
+    - platform: state
+      entity_id: person.resident
+      to: "not_home"
+      for: "00:30:00"
+  condition:
+    - condition: state
+      entity_id: input_boolean.away_mode
+      state: "off"
+  action:
+    # Enable away mode flag
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.away_mode
+    # Turn off all non-essential lights (keep security lights if any)
+    - service: light.turn_off
+      target:
+        entity_id:
+          - group.living_room_lights
+          - group.bedroom_lights
+          - group.kitchen_lights
+          - group.office_lights
+          - group.accent_lights
+    # Pause any playing media
+    - service: media_player.media_pause
+      target:
+        entity_id: all
+    # Notify via OpenClaw
+    - service: rest_command.openclaw_notify
+      data:
+        message: "Away mode activated. Non-essential systems powered down."
+        priority: "low"
+  mode: single
+
+# =============================================================================
+# 9. Plant Care Reminder
+# =============================================================================
+# Daily notification at 9 AM with rotating plant care tips.
+- id: plant_care_reminder
+  alias: "Plant Care Reminder"
+  description: >
+    Sends a daily notification at 9 AM reminding to check the plants.
+    Includes rotating care tips for the jungle flat's greenery.
+  trigger:
+    - platform: time
+      at: "09:00:00"
+  condition:
+    # Only when someone is home and not in DND mode
+    - condition: state
+      entity_id: input_boolean.away_mode
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.do_not_disturb
+      state: "off"
+  action:
+    # Pick a rotating tip based on day of week
+    - variables:
+        tips:
+          0: "Check soil moisture - stick your finger 2cm deep. Water only if dry."
+          1: "Mist tropical plants (ferns, calathea) for humidity."
+          2: "Rotate plants a quarter turn for even light exposure."
+          3: "Check for yellowing leaves - could be overwatering."
+          4: "Wipe large leaves with a damp cloth to remove dust."
+          5: "Check for pests under leaves (spider mites, mealybugs)."
+          6: "Fertilize if it's been 2+ weeks (growing season only)."
+        today_tip: "{{ tips[now().weekday()] }}"
+    - service: persistent_notification.create
+      data:
+        title: "Plant Care Reminder"
+        message: "Time to check on your jungle! Today's tip: {{ today_tip }}"
+        notification_id: plant_care_daily
+    # Also notify OpenClaw if configured
+    - service: rest_command.openclaw_notify
+      data:
+        message: "Plant care reminder: {{ today_tip }}"
+        priority: "low"
+  mode: single
+
+# =============================================================================
+# 10. Circadian Lighting
+# =============================================================================
+# Throughout the day, automatically adjusts light color temperature:
+#   Morning  (06:00 - 10:00): Warm to neutral (2700K -> 4000K)
+#   Midday   (10:00 - 16:00): Cool daylight (4000K - 5000K)
+#   Afternoon(16:00 - 20:00): Neutral to warm (4000K -> 2700K)
+#   Evening  (20:00 - 23:00): Warm and dim (2700K -> 2200K)
+- id: circadian_lighting
+  alias: "Circadian Lighting"
+  description: >
+    Continuously adjusts light color temperature throughout the day
+    to follow the natural circadian rhythm. Runs every 30 minutes.
+    Skipped when a specific mode (movie, focus, jungle) is active.
+  trigger:
+    - platform: time_pattern
+      minutes: "/30"
+  condition:
+    # Don't override when specific modes are active
+    - condition: state
+      entity_id: input_boolean.movie_mode
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.focus_mode
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.jungle_ambience
+      state: "off"
+    # Don't run in away mode
+    - condition: state
+      entity_id: input_boolean.away_mode
+      state: "off"
+    # Only when lights are actually on
+    - condition: state
+      entity_id: group.all_lights
+      state: "on"
+  action:
+    - variables:
+        # Calculate color temp based on time of day
+        hour: "{{ now().hour + now().minute / 60 }}"
+        # Piecewise linear color temperature curve
+        kelvin: >-
+          {% if hour < 6 %}
+            2200
+          {% elif hour < 10 %}
+            {{ (2700 + (hour - 6) * 325) | int }}
+          {% elif hour < 16 %}
+            {{ (4000 + (hour - 10) * 166) | int }}
+          {% elif hour < 20 %}
+            {{ (5000 - (hour - 16) * 575) | int }}
+          {% elif hour < 23 %}
+            {{ (2700 - (hour - 20) * 166) | int }}
+          {% else %}
+            2200
+          {% endif %}
+        # Brightness also follows the curve
+        brightness: >-
+          {% if hour < 6 %}
+            20
+          {% elif hour < 10 %}
+            {{ (40 + (hour - 6) * 15) | int }}
+          {% elif hour < 16 %}
+            100
+          {% elif hour < 20 %}
+            {{ (100 - (hour - 16) * 15) | int }}
+          {% elif hour < 23 %}
+            {{ (40 - (hour - 20) * 6) | int }}
+          {% else %}
+            20
+          {% endif %}
+    - service: light.turn_on
+      target:
+        entity_id: group.all_lights
+      data:
+        kelvin: "{{ kelvin }}"
+        brightness_pct: "{{ brightness }}"
+        transition: *slow_transition
+  mode: single
+
+# =============================================================================
+# House Mood Selector Automation
+# =============================================================================
+# Responds to changes in the input_select.house_mood dropdown and
+# activates the corresponding scene. Sleep is handled by the Goodnight
+# automation above.
+- id: house_mood_changed
+  alias: "House Mood Changed"
+  description: >
+    Watches the house mood selector and activates the corresponding scene.
+    Also ensures mode toggles are consistent with the selected mood.
+  trigger:
+    - platform: state
+      entity_id: input_select.house_mood
+  action:
+    # First, turn off all mode booleans to reset state
+    - service: input_boolean.turn_off
+      target:
+        entity_id:
+          - input_boolean.movie_mode
+          - input_boolean.focus_mode
+          - input_boolean.jungle_ambience
+    # Then activate the matching scene/mode
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_select.house_mood
+              state: "Energize"
+          sequence:
+            - service: scene.turn_on
+              target:
+                entity_id: scene.morning_energize
+        - conditions:
+            - condition: state
+              entity_id: input_select.house_mood
+              state: "Focus"
+          sequence:
+            - service: input_boolean.turn_on
+              target:
+                entity_id: input_boolean.focus_mode
+        - conditions:
+            - condition: state
+              entity_id: input_select.house_mood
+              state: "Relax"
+          sequence:
+            - service: scene.turn_on
+              target:
+                entity_id: scene.jungle_evening
+        - conditions:
+            - condition: state
+              entity_id: input_select.house_mood
+              state: "Movie"
+          sequence:
+            - service: input_boolean.turn_on
+              target:
+                entity_id: input_boolean.movie_mode
+        - conditions:
+            - condition: state
+              entity_id: input_select.house_mood
+              state: "Party"
+          sequence:
+            - service: scene.turn_on
+              target:
+                entity_id: scene.party_mode
+        # Sleep is handled by the Goodnight automation
+  mode: single

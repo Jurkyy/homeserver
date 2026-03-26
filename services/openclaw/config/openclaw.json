@@ -1,0 +1,54 @@
+{
+  // OpenClaw Configuration — Jungle Flat Smart Home Agent
+  // JSON5 format: comments and trailing commas are allowed
+
+  "agents": {
+    "defaults": {
+      "model": "anthropic/claude-sonnet-4-20250514",
+      "maxTokens": 4096,
+      "workspace": "/workspace",
+      "bootstrapMaxChars": 20000,
+      "bootstrapTotalMaxChars": 150000,
+      "pinned_instructions": true,
+    },
+  },
+
+  "channels": {
+    "discord": {
+      "enabled": true,
+      "botToken": "${DISCORD_BOT_TOKEN}",
+      "applicationId": "${DISCORD_CLIENT_ID}",
+    },
+  },
+
+  "gateway": {
+    "mode": "single",
+    "bind": "0.0.0.0",
+    "port": 18789,
+  },
+
+  // Home Assistant MCP server for smart home control
+  "mcpServers": {
+    "homeassistant": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@homeassistant/mcp-server",
+        "--url", "${HA_URL}",
+        "--token", "${HA_LONG_LIVED_TOKEN}",
+      ],
+    },
+  },
+
+  "tools": {
+    "enabled": true,
+    "permissions": {
+      // Allow the agent to make HTTP requests to Home Assistant
+      "network": ["http://homeassistant:8123/*"],
+    },
+  },
+
+  "logging": {
+    "level": "info",
+  },
+}

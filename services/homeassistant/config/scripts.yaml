@@ -1,0 +1,226 @@
+# =============================================================================
+# Home Assistant - Scripts
+# Jungle Flat Smart Home
+# =============================================================================
+# Reusable script sequences that can be called by automations, the UI,
+# or voice assistants. Each script has parameters where appropriate.
+# =============================================================================
+
+# =============================================================================
+# 1. Activate Projector
+# =============================================================================
+# Sends an IR command sequence to power on the projector, switch to the
+# correct HDMI input, and dim the lights for viewing.
+activate_projector:
+  alias: "Activate Projector"
+  description: >
+    IR command sequence to turn on the projector, select the correct
+    HDMI input, and dim lights. Requires an IR blaster entity
+    (e.g., Broadlink RM4) configured as remote.living_room_ir.
+  icon: mdi:projector
+  sequence:
+    # Step 1: Send power-on IR command to the projector
+    - service: remote.send_command
+      target:
+        entity_id: remote.living_room_ir
+      data:
+        command: "power_on"
+        device: "projector"
+    # Step 2: Wait for the projector to boot (they're notoriously slow)
+    - delay: "00:00:15"
+    # Step 3: Switch to HDMI 1 input
+    - service: remote.send_command
+      target:
+        entity_id: remote.living_room_ir
+      data:
+        command: "hdmi_1"
+        device: "projector"
+    # Step 4: Dim the lights for the best viewing experience
+    - service: light.turn_on
+      target:
+        entity_id: group.living_room_lights
+      data:
+        brightness_pct: 5
+        transition: 10
+    # Step 5: Set bias lighting behind the projector
+    - service: light.turn_on
+      target:
+        entity_id: light.living_room_led_strip
+      data:
+        brightness_pct: 10
+        rgb_color: [255, 244, 229]
+        transition: 5
+  mode: single
+
+# =============================================================================
+# 2. Play Ambient Sounds
+# =============================================================================
+# Starts playing a nature/ambient playlist on the main media player.
+# Great for jungle ambience, meditation, or background white noise.
+play_ambient_sounds:
+  alias: "Play Ambient Sounds"
+  description: >
+    Starts a nature/ambient sounds playlist on the living room speaker.
+    Volume is set to a comfortable background level.
+  icon: mdi:music-note
+  sequence:
+    # Set a comfortable background volume (not too loud, not too quiet)
+    - service: media_player.volume_set
+      target:
+        entity_id: media_player.living_room_speaker
+      data:
+        volume_level: 0.25
+    # Play the ambient sounds playlist
+    # Update this URL/source to match your actual media setup
+    - service: media_player.play_media
+      target:
+        entity_id: media_player.living_room_speaker
+      data:
+        media_content_type: "playlist"
+        media_content_id: "library/playlists/ambient-nature-sounds"
+        # For Spotify, use: spotify:playlist:xxxxx
+        # For local media: /media/playlists/nature-sounds
+  mode: single
+
+# =============================================================================
+# 3. Notify OpenClaw
+# =============================================================================
+# Sends a message to the OpenClaw AI agent via the REST API.
+# Wraps the REST command with sensible defaults and error handling.
+notify_openclaw:
+  alias: "Notify OpenClaw"
+  description: >
+    Sends a notification to the OpenClaw agent. Accepts a message
+    and an optional priority level (low, normal, high, urgent).
+  icon: mdi:robot
+  fields:
+    message:
+      description: "The message to send to OpenClaw"
+      required: true
+      example: "Motion detected in the hallway"
+      selector:
+        text:
+    priority:
+      description: "Priority level for the notification"
+      required: false
+      default: "normal"
+      example: "high"
+      selector:
+        select:
+          options:
+            - "low"
+            - "normal"
+            - "high"
+            - "urgent"
+  sequence:
+    - service: rest_command.openclaw_notify
+      data:
+        message: "{{ message }}"
+        priority: "{{ priority | default('normal') }}"
+  mode: queued
+  max: 10
+
+# =============================================================================
+# 4. Gradual Brightness Transition
+# =============================================================================
+# Smoothly transitions a light (or group) from current brightness to a
+# target brightness over a specified number of minutes. Useful for
+# wake-up routines, wind-down sequences, etc.
+gradual_brightness:
+  alias: "Gradual Brightness Transition"
+  description: >
+    Gradually transitions a target light or group from its current state
+    to a target brightness and color temperature over a specified duration.
+  icon: mdi:brightness-auto
+  fields:
+    target_entity:
+      description: "Light entity or group to transition"
+      required: true
+      example: "group.bedroom_lights"
+      selector:
+        entity:
+          domain:
+            - light
+            - group
+    target_brightness:
+      description: "Target brightness percentage (0-100)"
+      required: true
+      example: 80
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+    target_kelvin:
+      description: "Target color temperature in Kelvin"
+      required: false
+      default: 3000
+      example: 4000
+      selector:
+        number:
+          min: 2000
+          max: 6500
+          step: 100
+          unit_of_measurement: "K"
+    duration_minutes:
+      description: "Duration of the transition in minutes"
+      required: true
+      example: 15
+      selector:
+        number:
+          min: 1
+          max: 120
+          step: 1
+          unit_of_measurement: "min"
+  sequence:
+    # Calculate the transition time in seconds
+    - variables:
+        transition_seconds: "{{ (duration_minutes | float * 60) | int }}"
+    # Apply the transition in one smooth command
+    # HA handles the gradual change internally when transition is set
+    - service: light.turn_on
+      target:
+        entity_id: "{{ target_entity }}"
+      data:
+        brightness_pct: "{{ target_brightness | int }}"
+        kelvin: "{{ target_kelvin | default(3000) | int }}"
+        transition: "{{ transition_seconds }}"
+  mode: parallel
+  max: 5
+
+# =============================================================================
+# 5. All Lights Off
+# =============================================================================
+# Turns off every light group in the flat. Used by goodnight routine,
+# away mode, and as a quick "panic" button.
+all_lights_off:
+  alias: "All Lights Off"
+  description: >
+    Turns off every light in the flat with a smooth transition.
+    Useful as a quick kill-switch or for end-of-day routines.
+  icon: mdi:lightbulb-off
+  sequence:
+    - service: light.turn_off
+      target:
+        entity_id: group.all_lights
+      data:
+        transition: 5
+  mode: single
+
+# =============================================================================
+# 6. Toggle Music
+# =============================================================================
+# Play/pause toggle for the main media player. Simple convenience script
+# that can be bound to a button, voice command, or dashboard widget.
+toggle_music:
+  alias: "Toggle Music"
+  description: >
+    Toggles play/pause on the main living room media player.
+    If nothing is playing, does nothing (won't error).
+  icon: mdi:music
+  sequence:
+    - service: media_player.media_play_pause
+      target:
+        entity_id: media_player.living_room_speaker
+  mode: single

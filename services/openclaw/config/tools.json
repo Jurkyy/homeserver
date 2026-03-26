@@ -1,0 +1,250 @@
+{
+  "tools": [
+    {
+      "name": "ha_control_lights",
+      "description": "Control lights in the jungle flat. Turn on/off, set brightness and color temperature.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "entity_id": {
+            "type": "string",
+            "description": "The light entity ID (e.g., light.living_room, light.bedroom, light.kitchen, light.bathroom, light.office, light.accents)"
+          },
+          "action": {
+            "type": "string",
+            "enum": ["turn_on", "turn_off", "toggle"],
+            "description": "The action to perform on the light"
+          },
+          "brightness": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255,
+            "description": "Brightness level (0-255). Only used with turn_on."
+          },
+          "color_temp_kelvin": {
+            "type": "integer",
+            "minimum": 2000,
+            "maximum": 6500,
+            "description": "Color temperature in Kelvin (2000=warm, 6500=cool). Only used with turn_on."
+          }
+        },
+        "required": ["entity_id", "action"]
+      },
+      "execution": {
+        "method": "POST",
+        "url": "http://homeassistant:8123/api/services/light/${action}",
+        "headers": {
+          "Authorization": "Bearer ${HA_LONG_LIVED_TOKEN}",
+          "Content-Type": "application/json"
+        },
+        "body_template": {
+          "entity_id": "${entity_id}",
+          "brightness": "${brightness}",
+          "color_temp_kelvin": "${color_temp_kelvin}"
+        }
+      }
+    },
+    {
+      "name": "ha_activate_scene",
+      "description": "Activate a predefined scene in the jungle flat. Available scenes: jungle_day, jungle_evening, movie_night, cozy_reading, party_mode, deep_focus, romantic, morning_energize, meditation.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "scene_id": {
+            "type": "string",
+            "description": "The scene entity ID (e.g., scene.jungle_day, scene.movie_night, scene.deep_focus)"
+          }
+        },
+        "required": ["scene_id"]
+      },
+      "execution": {
+        "method": "POST",
+        "url": "http://homeassistant:8123/api/services/scene/turn_on",
+        "headers": {
+          "Authorization": "Bearer ${HA_LONG_LIVED_TOKEN}",
+          "Content-Type": "application/json"
+        },
+        "body_template": {
+          "entity_id": "${scene_id}"
+        }
+      }
+    },
+    {
+      "name": "ha_set_house_mood",
+      "description": "Set the overall house mood. Options: Energize, Focus, Relax, Movie, Party, Sleep.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "mood": {
+            "type": "string",
+            "enum": ["Energize", "Focus", "Relax", "Movie", "Party", "Sleep"],
+            "description": "The mood to set for the house"
+          }
+        },
+        "required": ["mood"]
+      },
+      "execution": {
+        "method": "POST",
+        "url": "http://homeassistant:8123/api/services/input_select/select_option",
+        "headers": {
+          "Authorization": "Bearer ${HA_LONG_LIVED_TOKEN}",
+          "Content-Type": "application/json"
+        },
+        "body_template": {
+          "entity_id": "input_select.house_mood",
+          "option": "${mood}"
+        }
+      }
+    },
+    {
+      "name": "ha_toggle_mode",
+      "description": "Toggle a home mode on or off. Available modes: movie_mode, focus_mode, jungle_ambience, away_mode, do_not_disturb.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": ["movie_mode", "focus_mode", "jungle_ambience", "away_mode", "do_not_disturb"],
+            "description": "The mode to toggle"
+          },
+          "state": {
+            "type": "string",
+            "enum": ["on", "off", "toggle"],
+            "description": "Turn the mode on, off, or toggle it"
+          }
+        },
+        "required": ["mode", "state"]
+      },
+      "execution": {
+        "method": "POST",
+        "url": "http://homeassistant:8123/api/services/input_boolean/turn_${state}",
+        "headers": {
+          "Authorization": "Bearer ${HA_LONG_LIVED_TOKEN}",
+          "Content-Type": "application/json"
+        },
+        "body_template": {
+          "entity_id": "input_boolean.${mode}"
+        }
+      }
+    },
+    {
+      "name": "ha_control_media",
+      "description": "Control media playback on Navidrome or Jellyfin. Play, pause, skip, or adjust volume.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "entity_id": {
+            "type": "string",
+            "description": "The media player entity ID (e.g., media_player.navidrome, media_player.jellyfin)"
+          },
+          "action": {
+            "type": "string",
+            "enum": ["media_play", "media_pause", "media_stop", "media_next_track", "media_previous_track", "volume_set"],
+            "description": "The media action to perform"
+          },
+          "volume_level": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "description": "Volume level from 0.0 to 1.0. Only used with volume_set."
+          }
+        },
+        "required": ["entity_id", "action"]
+      },
+      "execution": {
+        "method": "POST",
+        "url": "http://homeassistant:8123/api/services/media_player/${action}",
+        "headers": {
+          "Authorization": "Bearer ${HA_LONG_LIVED_TOKEN}",
+          "Content-Type": "application/json"
+        },
+        "body_template": {
+          "entity_id": "${entity_id}",
+          "volume_level": "${volume_level}"
+        }
+      }
+    },
+    {
+      "name": "ha_control_projector",
+      "description": "Turn the projector on or off.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["turn_on", "turn_off", "toggle"],
+            "description": "The action to perform on the projector"
+          }
+        },
+        "required": ["action"]
+      },
+      "execution": {
+        "method": "POST",
+        "url": "http://homeassistant:8123/api/services/switch/${action}",
+        "headers": {
+          "Authorization": "Bearer ${HA_LONG_LIVED_TOKEN}",
+          "Content-Type": "application/json"
+        },
+        "body_template": {
+          "entity_id": "switch.projector"
+        }
+      }
+    },
+    {
+      "name": "ha_get_home_state",
+      "description": "Get the current state of home entities. Use this to check what lights are on, current modes, media playing, sensor readings, etc.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "entity_id": {
+            "type": "string",
+            "description": "Optional: specific entity ID to query. If omitted, returns all entity states."
+          },
+          "domain": {
+            "type": "string",
+            "enum": ["light", "switch", "input_boolean", "input_select", "media_player", "sensor", "scene"],
+            "description": "Optional: filter by domain to get all entities of a type."
+          }
+        }
+      },
+      "execution": {
+        "method": "GET",
+        "url": "http://homeassistant:8123/api/states/${entity_id}",
+        "headers": {
+          "Authorization": "Bearer ${HA_LONG_LIVED_TOKEN}",
+          "Content-Type": "application/json"
+        }
+      }
+    },
+    {
+      "name": "ha_send_notification",
+      "description": "Send a push notification to the Home Assistant mobile app.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "The notification message to send"
+          },
+          "title": {
+            "type": "string",
+            "description": "Optional title for the notification"
+          }
+        },
+        "required": ["message"]
+      },
+      "execution": {
+        "method": "POST",
+        "url": "http://homeassistant:8123/api/services/notify/mobile_app",
+        "headers": {
+          "Authorization": "Bearer ${HA_LONG_LIVED_TOKEN}",
+          "Content-Type": "application/json"
+        },
+        "body_template": {
+          "message": "${message}",
+          "title": "${title}"
+        }
+      }
+    }
+  ]
+}
