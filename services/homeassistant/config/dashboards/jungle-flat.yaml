@@ -1,0 +1,1688 @@
+# =============================================================================
+# Jungle Flat - Lovelace Dashboard Configuration
+# =============================================================================
+#
+# A comprehensive smart home dashboard for a jungle-themed flat.
+# Uses Mushroom cards, custom:button-card, and standard HA cards.
+#
+# Required HACS integrations:
+#   - mushroom (lovelace-mushroom)
+#   - custom:button-card
+#   - custom:layout-card (optional, for grid layouts)
+#   - custom:mini-media-player (optional, enhanced media controls)
+#
+# Required HA helpers (create under Settings > Devices > Helpers):
+#   - input_select.house_mood
+#   - input_boolean.movie_mode
+#   - input_boolean.focus_mode
+#   - input_boolean.jungle_ambience
+#   - input_boolean.away_mode
+#   - input_boolean.do_not_disturb
+#
+# Theme: Uses the custom "Jungle" theme (see themes/jungle.yaml)
+#
+# =============================================================================
+
+title: "Jungle Flat"
+views:
+
+  # ===========================================================================
+  # VIEW 1: HOME (Overview)
+  # ===========================================================================
+  # The main landing page with weather, quick scenes, mode toggles,
+  # media status, and quick action buttons.
+  # ===========================================================================
+  - title: "Home"
+    path: "home"
+    icon: "mdi:leaf"
+    theme: "Jungle"
+    type: "sections"
+    badges: []
+    cards:
+
+      # -----------------------------------------------------------------------
+      # Header: Welcome message with current time and weather
+      # -----------------------------------------------------------------------
+      - type: "vertical-stack"
+        cards:
+          # Welcome banner using custom:button-card for rich styling
+          - type: "custom:button-card"
+            entity: "sensor.time"
+            name: "Welcome to the Jungle"
+            show_state: true
+            show_icon: false
+            styles:
+              card:
+                - background: "linear-gradient(135deg, #2d5016 0%, #1a2b14 50%, #0d1a0a 100%)"
+                - border: "1px solid #3a4a34"
+                - border-radius: "16px"
+                - padding: "24px"
+                - box-shadow: "0 4px 12px rgba(0, 0, 0, 0.5)"
+              name:
+                - font-size: "28px"
+                - font-weight: "bold"
+                - color: "#8fbc5a"
+                - text-shadow: "0 2px 4px rgba(0,0,0,0.3)"
+              state:
+                - font-size: "48px"
+                - font-weight: "300"
+                - color: "#c8d6c0"
+                - margin-top: "8px"
+
+          # Weather card - shows forecast and current conditions
+          - type: "weather-forecast"
+            entity: "weather.home"
+            name: "Jungle Weather"
+            show_forecast: true
+            forecast_type: "daily"
+
+      # -----------------------------------------------------------------------
+      # Scene Buttons Row: Quick-access scene activation
+      # -----------------------------------------------------------------------
+      # Each button activates a scene with a tap action.
+      # Uses custom:button-card for icon + color styling.
+      # -----------------------------------------------------------------------
+      - type: "horizontal-stack"
+        cards:
+          # Jungle Day scene
+          - type: "custom:button-card"
+            name: "Jungle Day"
+            icon: "mdi:white-balance-sunny"
+            entity: "scene.jungle_day"
+            tap_action:
+              action: "call-service"
+              service: "scene.turn_on"
+              service_data:
+                entity_id: "scene.jungle_day"
+            styles:
+              card:
+                - background-color: "#1a2b14"
+                - border: "1px solid #2a3a24"
+                - border-radius: "12px"
+                - padding: "12px"
+              icon:
+                - color: "#8fbc5a"
+                - width: "32px"
+                - height: "32px"
+              name:
+                - font-size: "11px"
+                - color: "#c8d6c0"
+                - margin-top: "4px"
+
+          # Evening scene
+          - type: "custom:button-card"
+            name: "Evening"
+            icon: "mdi:weather-night"
+            entity: "scene.jungle_evening"
+            tap_action:
+              action: "call-service"
+              service: "scene.turn_on"
+              service_data:
+                entity_id: "scene.jungle_evening"
+            styles:
+              card:
+                - background-color: "#1a2b14"
+                - border: "1px solid #2a3a24"
+                - border-radius: "12px"
+                - padding: "12px"
+              icon:
+                - color: "#d4a76a"
+                - width: "32px"
+                - height: "32px"
+              name:
+                - font-size: "11px"
+                - color: "#c8d6c0"
+                - margin-top: "4px"
+
+          # Movie scene
+          - type: "custom:button-card"
+            name: "Movie"
+            icon: "mdi:filmstrip"
+            entity: "scene.movie_night"
+            tap_action:
+              action: "call-service"
+              service: "scene.turn_on"
+              service_data:
+                entity_id: "scene.movie_night"
+            styles:
+              card:
+                - background-color: "#1a2b14"
+                - border: "1px solid #2a3a24"
+                - border-radius: "12px"
+                - padding: "12px"
+              icon:
+                - color: "#7a6aaa"
+                - width: "32px"
+                - height: "32px"
+              name:
+                - font-size: "11px"
+                - color: "#c8d6c0"
+                - margin-top: "4px"
+
+          # Focus scene
+          - type: "custom:button-card"
+            name: "Focus"
+            icon: "mdi:head-lightbulb"
+            entity: "scene.deep_focus"
+            tap_action:
+              action: "call-service"
+              service: "scene.turn_on"
+              service_data:
+                entity_id: "scene.deep_focus"
+            styles:
+              card:
+                - background-color: "#1a2b14"
+                - border: "1px solid #2a3a24"
+                - border-radius: "12px"
+                - padding: "12px"
+              icon:
+                - color: "#5a9abf"
+                - width: "32px"
+                - height: "32px"
+              name:
+                - font-size: "11px"
+                - color: "#c8d6c0"
+                - margin-top: "4px"
+
+          # Cozy scene
+          - type: "custom:button-card"
+            name: "Cozy"
+            icon: "mdi:sofa"
+            entity: "scene.cozy_reading"
+            tap_action:
+              action: "call-service"
+              service: "scene.turn_on"
+              service_data:
+                entity_id: "scene.cozy_reading"
+            styles:
+              card:
+                - background-color: "#1a2b14"
+                - border: "1px solid #2a3a24"
+                - border-radius: "12px"
+                - padding: "12px"
+              icon:
+                - color: "#c17f3e"
+                - width: "32px"
+                - height: "32px"
+              name:
+                - font-size: "11px"
+                - color: "#c8d6c0"
+                - margin-top: "4px"
+
+          # Meditation scene
+          - type: "custom:button-card"
+            name: "Meditate"
+            icon: "mdi:meditation"
+            entity: "scene.meditation"
+            tap_action:
+              action: "call-service"
+              service: "scene.turn_on"
+              service_data:
+                entity_id: "scene.meditation"
+            styles:
+              card:
+                - background-color: "#1a2b14"
+                - border: "1px solid #2a3a24"
+                - border-radius: "12px"
+                - padding: "12px"
+              icon:
+                - color: "#9a7abf"
+                - width: "32px"
+                - height: "32px"
+              name:
+                - font-size: "11px"
+                - color: "#c8d6c0"
+                - margin-top: "4px"
+
+      # -----------------------------------------------------------------------
+      # House Mood Selector
+      # -----------------------------------------------------------------------
+      # Dropdown to pick the overall house mood. The selected mood can trigger
+      # automations that adjust lights, sounds, and scene parameters.
+      # -----------------------------------------------------------------------
+      - type: "entities"
+        title: "House Mood"
+        show_header_toggle: false
+        entities:
+          - entity: "input_select.house_mood"
+            name: "Current Mood"
+            icon: "mdi:emoticon-outline"
+
+      # -----------------------------------------------------------------------
+      # Mode Toggles: Grid of boolean switches
+      # -----------------------------------------------------------------------
+      # These input_booleans drive automations throughout the flat.
+      # -----------------------------------------------------------------------
+      - type: "grid"
+        title: "Modes"
+        columns: 3
+        square: false
+        cards:
+          # Movie Mode toggle
+          - type: "custom:mushroom-entity-card"
+            entity: "input_boolean.movie_mode"
+            name: "Movie"
+            icon: "mdi:filmstrip"
+            tap_action:
+              action: "toggle"
+            layout: "vertical"
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+          # Focus Mode toggle
+          - type: "custom:mushroom-entity-card"
+            entity: "input_boolean.focus_mode"
+            name: "Focus"
+            icon: "mdi:head-lightbulb"
+            tap_action:
+              action: "toggle"
+            layout: "vertical"
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+          # Jungle Ambience toggle
+          - type: "custom:mushroom-entity-card"
+            entity: "input_boolean.jungle_ambience"
+            name: "Ambience"
+            icon: "mdi:palm-tree"
+            tap_action:
+              action: "toggle"
+            layout: "vertical"
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+          # Away Mode toggle
+          - type: "custom:mushroom-entity-card"
+            entity: "input_boolean.away_mode"
+            name: "Away"
+            icon: "mdi:home-export-outline"
+            tap_action:
+              action: "toggle"
+            layout: "vertical"
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+          # Do Not Disturb toggle
+          - type: "custom:mushroom-entity-card"
+            entity: "input_boolean.do_not_disturb"
+            name: "DND"
+            icon: "mdi:bell-off"
+            tap_action:
+              action: "toggle"
+            layout: "vertical"
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+      # -----------------------------------------------------------------------
+      # Now Playing: Current music / media player status
+      # -----------------------------------------------------------------------
+      - type: "custom:mushroom-media-player-card"
+        entity: "media_player.living_room_speaker"
+        name: "Now Playing"
+        icon: "mdi:music-note"
+        use_media_info: true
+        show_volume_level: true
+        media_controls:
+          - "on_off"
+          - "play_pause_stop"
+          - "previous"
+          - "next"
+        volume_controls:
+          - "volume_buttons"
+        card_mod:
+          style: |
+            ha-card {
+              background-color: #1a2b14 !important;
+              border: 1px solid #2a3a24 !important;
+              border-radius: 12px !important;
+            }
+
+      # -----------------------------------------------------------------------
+      # Quick Actions: One-tap buttons for common tasks
+      # -----------------------------------------------------------------------
+      - type: "horizontal-stack"
+        cards:
+          # All lights off
+          - type: "custom:button-card"
+            name: "All Off"
+            icon: "mdi:lightbulb-off"
+            tap_action:
+              action: "call-service"
+              service: "light.turn_off"
+              service_data:
+                entity_id: "all"
+            styles:
+              card:
+                - background-color: "#1a2b14"
+                - border: "1px solid #2a3a24"
+                - border-radius: "12px"
+                - padding: "16px"
+              icon:
+                - color: "#c0392b"
+                - width: "36px"
+                - height: "36px"
+              name:
+                - font-size: "12px"
+                - color: "#c8d6c0"
+
+          # Play ambient sounds
+          - type: "custom:button-card"
+            name: "Ambient"
+            icon: "mdi:weather-fog"
+            tap_action:
+              action: "call-service"
+              service: "script.play_ambient_sounds"
+              service_data: {}
+            styles:
+              card:
+                - background-color: "#1a2b14"
+                - border: "1px solid #2a3a24"
+                - border-radius: "12px"
+                - padding: "16px"
+              icon:
+                - color: "#4a7c2e"
+                - width: "36px"
+                - height: "36px"
+              name:
+                - font-size: "12px"
+                - color: "#c8d6c0"
+
+          # Projector toggle
+          - type: "custom:button-card"
+            name: "Projector"
+            icon: "mdi:projector"
+            entity: "switch.projector"
+            tap_action:
+              action: "toggle"
+            styles:
+              card:
+                - background-color: "#1a2b14"
+                - border: "1px solid #2a3a24"
+                - border-radius: "12px"
+                - padding: "16px"
+              icon:
+                - color: "#d4a76a"
+                - width: "36px"
+                - height: "36px"
+              name:
+                - font-size: "12px"
+                - color: "#c8d6c0"
+
+  # ===========================================================================
+  # VIEW 2: LIGHTS
+  # ===========================================================================
+  # Full lighting control for every room and accent lighting.
+  # Organized by room with brightness/color-temp sliders.
+  # ===========================================================================
+  - title: "Lights"
+    path: "lights"
+    icon: "mdi:lightbulb-group"
+    theme: "Jungle"
+    badges: []
+    cards:
+
+      # -----------------------------------------------------------------------
+      # Living Room Lights
+      # -----------------------------------------------------------------------
+      - type: "vertical-stack"
+        cards:
+          - type: "custom:mushroom-title-card"
+            title: "Living Room"
+            subtitle: "Main living area lighting"
+
+          - type: "custom:mushroom-light-card"
+            entity: "light.living_room"
+            name: "Ceiling Light"
+            icon: "mdi:ceiling-light"
+            show_brightness_control: true
+            show_color_temp_control: true
+            use_light_color: true
+            collapsible_controls: false
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+          - type: "custom:mushroom-light-card"
+            entity: "light.living_room_lamp"
+            name: "Floor Lamp"
+            icon: "mdi:floor-lamp"
+            show_brightness_control: true
+            show_color_temp_control: true
+            use_light_color: true
+            collapsible_controls: false
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+      # -----------------------------------------------------------------------
+      # Bedroom Lights
+      # -----------------------------------------------------------------------
+      - type: "vertical-stack"
+        cards:
+          - type: "custom:mushroom-title-card"
+            title: "Bedroom"
+            subtitle: "Sleep sanctuary lighting"
+
+          - type: "custom:mushroom-light-card"
+            entity: "light.bedroom"
+            name: "Ceiling Light"
+            icon: "mdi:ceiling-light"
+            show_brightness_control: true
+            show_color_temp_control: true
+            use_light_color: true
+            collapsible_controls: false
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+          - type: "custom:mushroom-light-card"
+            entity: "light.bedroom_bedside"
+            name: "Bedside Lamp"
+            icon: "mdi:lamp"
+            show_brightness_control: true
+            show_color_temp_control: true
+            use_light_color: true
+            collapsible_controls: false
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+      # -----------------------------------------------------------------------
+      # Kitchen Lights
+      # -----------------------------------------------------------------------
+      - type: "vertical-stack"
+        cards:
+          - type: "custom:mushroom-title-card"
+            title: "Kitchen"
+            subtitle: "Cooking zone lighting"
+
+          - type: "custom:mushroom-light-card"
+            entity: "light.kitchen"
+            name: "Kitchen Main"
+            icon: "mdi:ceiling-light"
+            show_brightness_control: true
+            show_color_temp_control: true
+            use_light_color: true
+            collapsible_controls: false
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+          - type: "custom:mushroom-light-card"
+            entity: "light.kitchen_counter"
+            name: "Counter Lights"
+            icon: "mdi:led-strip-variant"
+            show_brightness_control: true
+            show_color_temp_control: true
+            use_light_color: true
+            collapsible_controls: false
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+      # -----------------------------------------------------------------------
+      # Bathroom Lights
+      # -----------------------------------------------------------------------
+      - type: "vertical-stack"
+        cards:
+          - type: "custom:mushroom-title-card"
+            title: "Bathroom"
+            subtitle: "Rainforest retreat"
+
+          - type: "custom:mushroom-light-card"
+            entity: "light.bathroom"
+            name: "Bathroom Main"
+            icon: "mdi:ceiling-light"
+            show_brightness_control: true
+            show_color_temp_control: true
+            use_light_color: true
+            collapsible_controls: false
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+          - type: "custom:mushroom-light-card"
+            entity: "light.bathroom_mirror"
+            name: "Mirror Light"
+            icon: "mdi:mirror"
+            show_brightness_control: true
+            show_color_temp_control: true
+            use_light_color: true
+            collapsible_controls: false
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+      # -----------------------------------------------------------------------
+      # Office Lights
+      # -----------------------------------------------------------------------
+      - type: "vertical-stack"
+        cards:
+          - type: "custom:mushroom-title-card"
+            title: "Office"
+            subtitle: "Workspace lighting"
+
+          - type: "custom:mushroom-light-card"
+            entity: "light.office"
+            name: "Office Main"
+            icon: "mdi:desk-lamp"
+            show_brightness_control: true
+            show_color_temp_control: true
+            use_light_color: true
+            collapsible_controls: false
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+          - type: "custom:mushroom-light-card"
+            entity: "light.office_desk"
+            name: "Desk Lamp"
+            icon: "mdi:desk-lamp"
+            show_brightness_control: true
+            show_color_temp_control: true
+            use_light_color: true
+            collapsible_controls: false
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+      # -----------------------------------------------------------------------
+      # Accent Lights (LED strips, string lights)
+      # -----------------------------------------------------------------------
+      # These support full RGB color picking in addition to brightness.
+      # -----------------------------------------------------------------------
+      - type: "vertical-stack"
+        cards:
+          - type: "custom:mushroom-title-card"
+            title: "Accent Lights"
+            subtitle: "LED strips and string lights"
+
+          - type: "custom:mushroom-light-card"
+            entity: "light.living_room_led_strip"
+            name: "Living Room LED Strip"
+            icon: "mdi:led-strip-variant"
+            show_brightness_control: true
+            show_color_control: true
+            use_light_color: true
+            collapsible_controls: false
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+          - type: "custom:mushroom-light-card"
+            entity: "light.bedroom_led_strip"
+            name: "Bedroom LED Strip"
+            icon: "mdi:led-strip-variant"
+            show_brightness_control: true
+            show_color_control: true
+            use_light_color: true
+            collapsible_controls: false
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+          - type: "custom:mushroom-light-card"
+            entity: "light.string_lights"
+            name: "String Lights"
+            icon: "mdi:string-lights"
+            show_brightness_control: true
+            show_color_control: true
+            use_light_color: true
+            collapsible_controls: false
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+          - type: "custom:mushroom-light-card"
+            entity: "light.plant_grow_light"
+            name: "Plant Grow Light"
+            icon: "mdi:sprout"
+            show_brightness_control: true
+            use_light_color: true
+            collapsible_controls: false
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+      # -----------------------------------------------------------------------
+      # All Lights: Master brightness slider
+      # -----------------------------------------------------------------------
+      # Controls the "all lights" group with a single brightness slider.
+      # -----------------------------------------------------------------------
+      - type: "vertical-stack"
+        cards:
+          - type: "custom:mushroom-title-card"
+            title: "All Lights"
+            subtitle: "Master control"
+
+          - type: "custom:mushroom-light-card"
+            entity: "light.all_lights"
+            name: "Master Brightness"
+            icon: "mdi:lightbulb-group"
+            show_brightness_control: true
+            show_color_temp_control: true
+            use_light_color: true
+            collapsible_controls: false
+            card_mod:
+              style: |
+                ha-card {
+                  background: linear-gradient(135deg, #2d5016 0%, #1a2b14 100%) !important;
+                  border: 1px solid #4a7c2e !important;
+                  border-radius: 12px !important;
+                }
+
+  # ===========================================================================
+  # VIEW 3: MEDIA
+  # ===========================================================================
+  # Projector, music, ambient sounds, and Jellyfin access.
+  # ===========================================================================
+  - title: "Media"
+    path: "media"
+    icon: "mdi:television-play"
+    theme: "Jungle"
+    badges: []
+    cards:
+
+      # -----------------------------------------------------------------------
+      # Projector Card
+      # -----------------------------------------------------------------------
+      # Power toggle, input source selection, and picture mode.
+      # -----------------------------------------------------------------------
+      - type: "vertical-stack"
+        cards:
+          - type: "custom:mushroom-title-card"
+            title: "Projector"
+            subtitle: "Cinema in the canopy"
+
+          # Projector power toggle
+          - type: "custom:mushroom-entity-card"
+            entity: "switch.projector"
+            name: "Projector Power"
+            icon: "mdi:projector"
+            tap_action:
+              action: "toggle"
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+          # Projector input source and picture mode
+          - type: "entities"
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+            entities:
+              - entity: "input_select.projector_input"
+                name: "Input Source"
+                icon: "mdi:video-input-hdmi"
+              - entity: "input_select.projector_picture_mode"
+                name: "Picture Mode"
+                icon: "mdi:image-filter-hdr"
+
+      # -----------------------------------------------------------------------
+      # Music Player: Full media control card
+      # -----------------------------------------------------------------------
+      # Shows album art, playback controls, volume, and source selection.
+      # -----------------------------------------------------------------------
+      - type: "vertical-stack"
+        cards:
+          - type: "custom:mushroom-title-card"
+            title: "Music"
+            subtitle: "Sounds of the jungle"
+
+          - type: "custom:mushroom-media-player-card"
+            entity: "media_player.living_room_speaker"
+            name: "Living Room"
+            icon: "mdi:speaker"
+            use_media_info: true
+            show_volume_level: true
+            media_controls:
+              - "on_off"
+              - "shuffle"
+              - "previous"
+              - "play_pause_stop"
+              - "next"
+              - "repeat"
+            volume_controls:
+              - "volume_slider"
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+
+          # Source selector for the media player
+          - type: "entities"
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+            entities:
+              - entity: "input_select.music_source"
+                name: "Source"
+                icon: "mdi:speaker-wireless"
+
+      # -----------------------------------------------------------------------
+      # Ambient Sounds: Quick buttons for different soundscapes
+      # -----------------------------------------------------------------------
+      - type: "vertical-stack"
+        cards:
+          - type: "custom:mushroom-title-card"
+            title: "Ambient Sounds"
+            subtitle: "Immersive soundscapes"
+
+          - type: "grid"
+            columns: 3
+            square: true
+            cards:
+              # Rain sounds
+              - type: "custom:button-card"
+                name: "Rain"
+                icon: "mdi:weather-rainy"
+                tap_action:
+                  action: "call-service"
+                  service: "script.play_ambient_rain"
+                  service_data: {}
+                styles:
+                  card:
+                    - background-color: "#1a2b14"
+                    - border: "1px solid #2a3a24"
+                    - border-radius: "12px"
+                    - padding: "16px"
+                  icon:
+                    - color: "#5a9abf"
+                    - width: "40px"
+                    - height: "40px"
+                  name:
+                    - font-size: "12px"
+                    - color: "#c8d6c0"
+                    - margin-top: "8px"
+
+              # Forest sounds
+              - type: "custom:button-card"
+                name: "Forest"
+                icon: "mdi:pine-tree"
+                tap_action:
+                  action: "call-service"
+                  service: "script.play_ambient_forest"
+                  service_data: {}
+                styles:
+                  card:
+                    - background-color: "#1a2b14"
+                    - border: "1px solid #2a3a24"
+                    - border-radius: "12px"
+                    - padding: "16px"
+                  icon:
+                    - color: "#4a7c2e"
+                    - width: "40px"
+                    - height: "40px"
+                  name:
+                    - font-size: "12px"
+                    - color: "#c8d6c0"
+                    - margin-top: "8px"
+
+              # Ocean sounds
+              - type: "custom:button-card"
+                name: "Ocean"
+                icon: "mdi:waves"
+                tap_action:
+                  action: "call-service"
+                  service: "script.play_ambient_ocean"
+                  service_data: {}
+                styles:
+                  card:
+                    - background-color: "#1a2b14"
+                    - border: "1px solid #2a3a24"
+                    - border-radius: "12px"
+                    - padding: "16px"
+                  icon:
+                    - color: "#4a8aaa"
+                    - width: "40px"
+                    - height: "40px"
+                  name:
+                    - font-size: "12px"
+                    - color: "#c8d6c0"
+                    - margin-top: "8px"
+
+              # Bird sounds
+              - type: "custom:button-card"
+                name: "Birds"
+                icon: "mdi:bird"
+                tap_action:
+                  action: "call-service"
+                  service: "script.play_ambient_birds"
+                  service_data: {}
+                styles:
+                  card:
+                    - background-color: "#1a2b14"
+                    - border: "1px solid #2a3a24"
+                    - border-radius: "12px"
+                    - padding: "16px"
+                  icon:
+                    - color: "#a8d86e"
+                    - width: "40px"
+                    - height: "40px"
+                  name:
+                    - font-size: "12px"
+                    - color: "#c8d6c0"
+                    - margin-top: "8px"
+
+              # Fireplace sounds
+              - type: "custom:button-card"
+                name: "Fireplace"
+                icon: "mdi:fireplace"
+                tap_action:
+                  action: "call-service"
+                  service: "script.play_ambient_fireplace"
+                  service_data: {}
+                styles:
+                  card:
+                    - background-color: "#1a2b14"
+                    - border: "1px solid #2a3a24"
+                    - border-radius: "12px"
+                    - padding: "16px"
+                  icon:
+                    - color: "#c17f3e"
+                    - width: "40px"
+                    - height: "40px"
+                  name:
+                    - font-size: "12px"
+                    - color: "#c8d6c0"
+                    - margin-top: "8px"
+
+      # -----------------------------------------------------------------------
+      # Jellyfin: Embedded media server access
+      # -----------------------------------------------------------------------
+      - type: "vertical-stack"
+        cards:
+          - type: "custom:mushroom-title-card"
+            title: "Jellyfin"
+            subtitle: "Media library"
+
+          - type: "iframe"
+            url: "http://jellyfin.local:8096"
+            aspect_ratio: "16:9"
+            card_mod:
+              style: |
+                ha-card {
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                  overflow: hidden;
+                }
+
+  # ===========================================================================
+  # VIEW 4: SCENES & AUTOMATIONS
+  # ===========================================================================
+  # Visual scene cards with descriptions and automation toggles.
+  # ===========================================================================
+  - title: "Scenes"
+    path: "scenes"
+    icon: "mdi:palette"
+    theme: "Jungle"
+    badges: []
+    cards:
+
+      # -----------------------------------------------------------------------
+      # Scene Cards: Visual cards with icons, colors, and descriptions
+      # -----------------------------------------------------------------------
+      - type: "custom:mushroom-title-card"
+        title: "Scenes"
+        subtitle: "Tap to activate a mood"
+
+      - type: "grid"
+        columns: 3
+        square: false
+        cards:
+
+          # --- Jungle Day ---
+          - type: "custom:button-card"
+            name: "Jungle Day"
+            label: "Bright greens, natural light, energizing vibes"
+            show_label: true
+            icon: "mdi:white-balance-sunny"
+            entity: "scene.jungle_day"
+            tap_action:
+              action: "call-service"
+              service: "scene.turn_on"
+              service_data:
+                entity_id: "scene.jungle_day"
+            styles:
+              card:
+                - background: "linear-gradient(135deg, #2d5016 0%, #1a2b14 100%)"
+                - border: "1px solid #4a7c2e"
+                - border-radius: "16px"
+                - padding: "20px"
+                - min-height: "120px"
+              icon:
+                - color: "#8fbc5a"
+                - width: "40px"
+                - height: "40px"
+              name:
+                - font-size: "16px"
+                - font-weight: "bold"
+                - color: "#c8d6c0"
+                - margin-top: "8px"
+              label:
+                - font-size: "11px"
+                - color: "#8a9882"
+                - margin-top: "4px"
+
+          # --- Jungle Evening ---
+          - type: "custom:button-card"
+            name: "Jungle Evening"
+            label: "Warm amber glow, dimmed canopy, wind-down"
+            show_label: true
+            icon: "mdi:weather-night"
+            entity: "scene.jungle_evening"
+            tap_action:
+              action: "call-service"
+              service: "scene.turn_on"
+              service_data:
+                entity_id: "scene.jungle_evening"
+            styles:
+              card:
+                - background: "linear-gradient(135deg, #3a2a10 0%, #1a2b14 100%)"
+                - border: "1px solid #c17f3e"
+                - border-radius: "16px"
+                - padding: "20px"
+                - min-height: "120px"
+              icon:
+                - color: "#d4a76a"
+                - width: "40px"
+                - height: "40px"
+              name:
+                - font-size: "16px"
+                - font-weight: "bold"
+                - color: "#c8d6c0"
+                - margin-top: "8px"
+              label:
+                - font-size: "11px"
+                - color: "#8a9882"
+                - margin-top: "4px"
+
+          # --- Movie Night ---
+          - type: "custom:button-card"
+            name: "Movie Night"
+            label: "Lights off, projector on, immersive cinema"
+            show_label: true
+            icon: "mdi:filmstrip"
+            entity: "scene.movie_night"
+            tap_action:
+              action: "call-service"
+              service: "scene.turn_on"
+              service_data:
+                entity_id: "scene.movie_night"
+            styles:
+              card:
+                - background: "linear-gradient(135deg, #1a1a2e 0%, #0d0d1a 100%)"
+                - border: "1px solid #7a6aaa"
+                - border-radius: "16px"
+                - padding: "20px"
+                - min-height: "120px"
+              icon:
+                - color: "#7a6aaa"
+                - width: "40px"
+                - height: "40px"
+              name:
+                - font-size: "16px"
+                - font-weight: "bold"
+                - color: "#c8d6c0"
+                - margin-top: "8px"
+              label:
+                - font-size: "11px"
+                - color: "#8a9882"
+                - margin-top: "4px"
+
+          # --- Cozy Reading ---
+          - type: "custom:button-card"
+            name: "Cozy Reading"
+            label: "Warm lamp light, soft background, perfect for books"
+            show_label: true
+            icon: "mdi:book-open-variant"
+            entity: "scene.cozy_reading"
+            tap_action:
+              action: "call-service"
+              service: "scene.turn_on"
+              service_data:
+                entity_id: "scene.cozy_reading"
+            styles:
+              card:
+                - background: "linear-gradient(135deg, #3a2a10 0%, #2a1a08 100%)"
+                - border: "1px solid #c17f3e"
+                - border-radius: "16px"
+                - padding: "20px"
+                - min-height: "120px"
+              icon:
+                - color: "#c17f3e"
+                - width: "40px"
+                - height: "40px"
+              name:
+                - font-size: "16px"
+                - font-weight: "bold"
+                - color: "#c8d6c0"
+                - margin-top: "8px"
+              label:
+                - font-size: "11px"
+                - color: "#8a9882"
+                - margin-top: "4px"
+
+          # --- Party Mode ---
+          - type: "custom:button-card"
+            name: "Party Mode"
+            label: "Colorful lights, upbeat music, full energy"
+            show_label: true
+            icon: "mdi:music-note"
+            entity: "scene.party_mode"
+            tap_action:
+              action: "call-service"
+              service: "scene.turn_on"
+              service_data:
+                entity_id: "scene.party_mode"
+            styles:
+              card:
+                - background: "linear-gradient(135deg, #2d1a3a 0%, #1a2b14 100%)"
+                - border: "1px solid #aa5aba"
+                - border-radius: "16px"
+                - padding: "20px"
+                - min-height: "120px"
+              icon:
+                - color: "#aa5aba"
+                - width: "40px"
+                - height: "40px"
+              name:
+                - font-size: "16px"
+                - font-weight: "bold"
+                - color: "#c8d6c0"
+                - margin-top: "8px"
+              label:
+                - font-size: "11px"
+                - color: "#8a9882"
+                - margin-top: "4px"
+
+          # --- Deep Focus ---
+          - type: "custom:button-card"
+            name: "Deep Focus"
+            label: "Cool whites, minimal distraction, DND on"
+            show_label: true
+            icon: "mdi:head-lightbulb"
+            entity: "scene.deep_focus"
+            tap_action:
+              action: "call-service"
+              service: "scene.turn_on"
+              service_data:
+                entity_id: "scene.deep_focus"
+            styles:
+              card:
+                - background: "linear-gradient(135deg, #0a1a2a 0%, #0d1a0a 100%)"
+                - border: "1px solid #5a9abf"
+                - border-radius: "16px"
+                - padding: "20px"
+                - min-height: "120px"
+              icon:
+                - color: "#5a9abf"
+                - width: "40px"
+                - height: "40px"
+              name:
+                - font-size: "16px"
+                - font-weight: "bold"
+                - color: "#c8d6c0"
+                - margin-top: "8px"
+              label:
+                - font-size: "11px"
+                - color: "#8a9882"
+                - margin-top: "4px"
+
+          # --- Romantic ---
+          - type: "custom:button-card"
+            name: "Romantic"
+            label: "Soft pinks, warm reds, candle-like ambience"
+            show_label: true
+            icon: "mdi:heart"
+            entity: "scene.romantic"
+            tap_action:
+              action: "call-service"
+              service: "scene.turn_on"
+              service_data:
+                entity_id: "scene.romantic"
+            styles:
+              card:
+                - background: "linear-gradient(135deg, #2a0a0a 0%, #1a0d14 100%)"
+                - border: "1px solid #c04040"
+                - border-radius: "16px"
+                - padding: "20px"
+                - min-height: "120px"
+              icon:
+                - color: "#c04040"
+                - width: "40px"
+                - height: "40px"
+              name:
+                - font-size: "16px"
+                - font-weight: "bold"
+                - color: "#c8d6c0"
+                - margin-top: "8px"
+              label:
+                - font-size: "11px"
+                - color: "#8a9882"
+                - margin-top: "4px"
+
+          # --- Morning Energize ---
+          - type: "custom:button-card"
+            name: "Morning Energize"
+            label: "Sunrise colors, bright whites, wake-up boost"
+            show_label: true
+            icon: "mdi:weather-sunset-up"
+            entity: "scene.morning_energize"
+            tap_action:
+              action: "call-service"
+              service: "scene.turn_on"
+              service_data:
+                entity_id: "scene.morning_energize"
+            styles:
+              card:
+                - background: "linear-gradient(135deg, #3a2a10 0%, #2d5016 100%)"
+                - border: "1px solid #e8c97a"
+                - border-radius: "16px"
+                - padding: "20px"
+                - min-height: "120px"
+              icon:
+                - color: "#e8c97a"
+                - width: "40px"
+                - height: "40px"
+              name:
+                - font-size: "16px"
+                - font-weight: "bold"
+                - color: "#c8d6c0"
+                - margin-top: "8px"
+              label:
+                - font-size: "11px"
+                - color: "#8a9882"
+                - margin-top: "4px"
+
+          # --- Meditation ---
+          - type: "custom:button-card"
+            name: "Meditation"
+            label: "Ultra dim, soft purple, breathing ambience"
+            show_label: true
+            icon: "mdi:meditation"
+            entity: "scene.meditation"
+            tap_action:
+              action: "call-service"
+              service: "scene.turn_on"
+              service_data:
+                entity_id: "scene.meditation"
+            styles:
+              card:
+                - background: "linear-gradient(135deg, #1a0d2a 0%, #0d1a0a 100%)"
+                - border: "1px solid #9a7abf"
+                - border-radius: "16px"
+                - padding: "20px"
+                - min-height: "120px"
+              icon:
+                - color: "#9a7abf"
+                - width: "40px"
+                - height: "40px"
+              name:
+                - font-size: "16px"
+                - font-weight: "bold"
+                - color: "#c8d6c0"
+                - margin-top: "8px"
+              label:
+                - font-size: "11px"
+                - color: "#8a9882"
+                - margin-top: "4px"
+
+      # -----------------------------------------------------------------------
+      # Active Automations: Toggle switches
+      # -----------------------------------------------------------------------
+      # Enable/disable individual automations without editing YAML.
+      # -----------------------------------------------------------------------
+      - type: "vertical-stack"
+        cards:
+          - type: "custom:mushroom-title-card"
+            title: "Automations"
+            subtitle: "Toggle active automations"
+
+          - type: "entities"
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+            show_header_toggle: false
+            entities:
+              - entity: "automation.jungle_sunrise_routine"
+                name: "Sunrise Routine"
+                icon: "mdi:weather-sunset-up"
+              - entity: "automation.jungle_sunset_routine"
+                name: "Sunset Routine"
+                icon: "mdi:weather-sunset-down"
+              - entity: "automation.movie_mode_trigger"
+                name: "Movie Mode Auto-Dim"
+                icon: "mdi:filmstrip"
+              - entity: "automation.focus_mode_trigger"
+                name: "Focus Mode DND"
+                icon: "mdi:head-lightbulb"
+              - entity: "automation.away_mode_trigger"
+                name: "Away Mode Security"
+                icon: "mdi:shield-home"
+              - entity: "automation.goodnight_routine"
+                name: "Goodnight Routine"
+                icon: "mdi:power-sleep"
+              - entity: "automation.ambient_sound_scheduler"
+                name: "Ambient Sound Schedule"
+                icon: "mdi:weather-fog"
+              - entity: "automation.plant_light_schedule"
+                name: "Plant Light Schedule"
+                icon: "mdi:sprout"
+              - entity: "automation.motion_based_lighting"
+                name: "Motion Lighting"
+                icon: "mdi:motion-sensor"
+              - entity: "automation.adaptive_brightness"
+                name: "Adaptive Brightness"
+                icon: "mdi:brightness-auto"
+
+  # ===========================================================================
+  # VIEW 5: PLANT CARE
+  # ===========================================================================
+  # Watering schedules, environment sensors, tips, and growth tracking.
+  # ===========================================================================
+  - title: "Plants"
+    path: "plants"
+    icon: "mdi:flower"
+    theme: "Jungle"
+    badges: []
+    cards:
+
+      # -----------------------------------------------------------------------
+      # Plant Watering Schedule
+      # -----------------------------------------------------------------------
+      # A markdown card with the weekly watering and care schedule.
+      # Edit the content below to match your actual plant collection.
+      # -----------------------------------------------------------------------
+      - type: "vertical-stack"
+        cards:
+          - type: "custom:mushroom-title-card"
+            title: "Watering Schedule"
+            subtitle: "Keep the jungle alive"
+
+          - type: "markdown"
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+            content: >
+              ## Weekly Plant Care Schedule
+
+
+              | Day | Plants | Task |
+
+              |-----|--------|------|
+
+              | **Monday** | Monstera, Pothos | Water thoroughly |
+
+              | **Tuesday** | Ferns, Calathea | Mist leaves, check soil |
+
+              | **Wednesday** | Succulents, Snake Plant | Light watering (if dry) |
+
+              | **Thursday** | Monstera, Pothos | Mist leaves |
+
+              | **Friday** | All plants | Check for pests, wipe leaves |
+
+              | **Saturday** | Herbs (Basil, Mint) | Water + harvest |
+
+              | **Sunday** | All plants | Rotate pots for even light |
+
+
+              ---
+
+
+              **Fertilizing**: First Saturday of each month, dilute to half strength.
+
+              **Repotting**: Check root-bound plants every 3 months.
+
+      # -----------------------------------------------------------------------
+      # Humidity & Temperature Sensors
+      # -----------------------------------------------------------------------
+      # Gauge cards for environment monitoring.
+      # Replace entity IDs with your actual sensor entities.
+      # -----------------------------------------------------------------------
+      - type: "vertical-stack"
+        cards:
+          - type: "custom:mushroom-title-card"
+            title: "Environment"
+            subtitle: "Humidity and temperature readings"
+
+          - type: "grid"
+            columns: 2
+            square: false
+            cards:
+              # Living room humidity
+              - type: "gauge"
+                entity: "sensor.living_room_humidity"
+                name: "Living Room Humidity"
+                unit: "%"
+                min: 0
+                max: 100
+                needle: true
+                severity:
+                  green: 40
+                  yellow: 60
+                  red: 80
+                card_mod:
+                  style: |
+                    ha-card {
+                      background-color: #1a2b14 !important;
+                      border: 1px solid #2a3a24 !important;
+                      border-radius: 12px !important;
+                    }
+
+              # Living room temperature
+              - type: "gauge"
+                entity: "sensor.living_room_temperature"
+                name: "Living Room Temp"
+                unit: "°C"
+                min: 10
+                max: 40
+                needle: true
+                severity:
+                  green: 18
+                  yellow: 26
+                  red: 32
+                card_mod:
+                  style: |
+                    ha-card {
+                      background-color: #1a2b14 !important;
+                      border: 1px solid #2a3a24 !important;
+                      border-radius: 12px !important;
+                    }
+
+              # Bedroom humidity
+              - type: "gauge"
+                entity: "sensor.bedroom_humidity"
+                name: "Bedroom Humidity"
+                unit: "%"
+                min: 0
+                max: 100
+                needle: true
+                severity:
+                  green: 40
+                  yellow: 60
+                  red: 80
+                card_mod:
+                  style: |
+                    ha-card {
+                      background-color: #1a2b14 !important;
+                      border: 1px solid #2a3a24 !important;
+                      border-radius: 12px !important;
+                    }
+
+              # Bedroom temperature
+              - type: "gauge"
+                entity: "sensor.bedroom_temperature"
+                name: "Bedroom Temp"
+                unit: "°C"
+                min: 10
+                max: 40
+                needle: true
+                severity:
+                  green: 18
+                  yellow: 26
+                  red: 32
+                card_mod:
+                  style: |
+                    ha-card {
+                      background-color: #1a2b14 !important;
+                      border: 1px solid #2a3a24 !important;
+                      border-radius: 12px !important;
+                    }
+
+      # -----------------------------------------------------------------------
+      # Plant Care Tips
+      # -----------------------------------------------------------------------
+      # Rotating tips using a markdown card with template.
+      # The template cycles through tips based on the day of the year.
+      # -----------------------------------------------------------------------
+      - type: "vertical-stack"
+        cards:
+          - type: "custom:mushroom-title-card"
+            title: "Plant Tips"
+            subtitle: "Daily wisdom from the jungle"
+
+          - type: "markdown"
+            card_mod:
+              style: |
+                ha-card {
+                  background: linear-gradient(135deg, #2d5016 0%, #1a2b14 100%) !important;
+                  border: 1px solid #4a7c2e !important;
+                  border-radius: 12px !important;
+                }
+            content: >
+              {% set tips = [
+                "**Tip #1**: Yellowing lower leaves on your Monstera? That is usually overwatering. Let the top 2 inches of soil dry out before watering again.",
+                "**Tip #2**: Group humidity-loving plants together. They create a microclimate that benefits all of them.",
+                "**Tip #3**: Use room-temperature water when watering. Cold water can shock tropical roots.",
+                "**Tip #4**: Brown leaf tips usually mean low humidity. Try misting or placing a tray of pebbles and water nearby.",
+                "**Tip #5**: Rotate your plants a quarter turn each week so they grow evenly toward the light.",
+                "**Tip #6**: Wipe dust off leaves monthly. Dusty leaves cannot photosynthesize efficiently.",
+                "**Tip #7**: When repotting, choose a pot only 1-2 inches larger than the current one. Too much space holds excess moisture.",
+                "**Tip #8**: Spider mites love dry conditions. Keep humidity up and inspect leaf undersides regularly.",
+                "**Tip #9**: Ferns prefer indirect light and consistent moisture. Never let them fully dry out.",
+                "**Tip #10**: Propagate Pothos in water - just snip below a node and wait 2-3 weeks for roots.",
+                "**Tip #11**: Snake plants are nearly indestructible. Water once every 2-3 weeks and they will thrive.",
+                "**Tip #12**: Calatheas fold their leaves at night (they pray!). If they stop moving, check your watering routine.",
+                "**Tip #13**: Coffee grounds make great occasional fertilizer for acid-loving plants.",
+                "**Tip #14**: Neem oil is a natural pest deterrent. Mix a few drops with water and spray monthly."
+              ] %}
+              {{ tips[now().timetuple().tm_yday % tips | length] }}
+
+      # -----------------------------------------------------------------------
+      # Plant Growth Photo Grid (Placeholder)
+      # -----------------------------------------------------------------------
+      # Use the picture-elements card or a custom gallery card here.
+      # Replace placeholder images with your actual plant growth photos.
+      # -----------------------------------------------------------------------
+      - type: "vertical-stack"
+        cards:
+          - type: "custom:mushroom-title-card"
+            title: "Growth Tracker"
+            subtitle: "Visual record of your jungle"
+
+          - type: "markdown"
+            card_mod:
+              style: |
+                ha-card {
+                  background-color: #1a2b14 !important;
+                  border: 1px solid #2a3a24 !important;
+                  border-radius: 12px !important;
+                }
+            content: >
+              ### Plant Growth Photos
+
+
+              To set up the growth tracker:
+
+              1. Create a folder at `/config/www/plant-photos/`
+
+              2. Take periodic photos of your plants
+
+              3. Name them with date format: `monstera-2026-03-26.jpg`
+
+              4. Replace this card with a `picture-glance` or `picture-elements` card
+
+
+              ---
+
+
+              **Suggested tracking plants:**
+
+              - Monstera Deliciosa (monthly new leaf tracking)
+
+              - Pothos vine (length measurement)
+
+              - Fiddle Leaf Fig (height tracking)
+
+              - Herb garden (harvest log)
+
+
+              > Use the Home Assistant Companion app camera to snap quick photos
+              > and save them directly to the plant photos folder.
+
+          # Placeholder image grid - replace with actual picture cards when ready
+          - type: "grid"
+            columns: 3
+            square: true
+            cards:
+              - type: "custom:button-card"
+                name: "Monstera"
+                icon: "mdi:leaf"
+                styles:
+                  card:
+                    - background-color: "#1a2b14"
+                    - border: "2px dashed #3a4a34"
+                    - border-radius: "12px"
+                    - padding: "16px"
+                  icon:
+                    - color: "#4a7c2e"
+                    - width: "40px"
+                    - height: "40px"
+                    - opacity: "0.5"
+                  name:
+                    - font-size: "11px"
+                    - color: "#5a6a54"
+                    - margin-top: "8px"
+
+              - type: "custom:button-card"
+                name: "Pothos"
+                icon: "mdi:leaf"
+                styles:
+                  card:
+                    - background-color: "#1a2b14"
+                    - border: "2px dashed #3a4a34"
+                    - border-radius: "12px"
+                    - padding: "16px"
+                  icon:
+                    - color: "#4a7c2e"
+                    - width: "40px"
+                    - height: "40px"
+                    - opacity: "0.5"
+                  name:
+                    - font-size: "11px"
+                    - color: "#5a6a54"
+                    - margin-top: "8px"
+
+              - type: "custom:button-card"
+                name: "Fiddle Leaf"
+                icon: "mdi:leaf"
+                styles:
+                  card:
+                    - background-color: "#1a2b14"
+                    - border: "2px dashed #3a4a34"
+                    - border-radius: "12px"
+                    - padding: "16px"
+                  icon:
+                    - color: "#4a7c2e"
+                    - width: "40px"
+                    - height: "40px"
+                    - opacity: "0.5"
+                  name:
+                    - font-size: "11px"
+                    - color: "#5a6a54"
+                    - margin-top: "8px"

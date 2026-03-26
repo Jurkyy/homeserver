@@ -7,6 +7,10 @@ services/*/config/*
 
 # Home Assistant config is tracked (production-ready YAML configs)
 !services/homeassistant/config/*.yaml
+!services/homeassistant/config/dashboards/
+!services/homeassistant/config/dashboards/*.yaml
+!services/homeassistant/config/themes/
+!services/homeassistant/config/themes/*.yaml
 
 # OpenClaw config is tracked (agent config, tools, system prompt)
 !services/openclaw/config/openclaw.json

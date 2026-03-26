@@ -1,0 +1,199 @@
+# =============================================================================
+# Jungle Theme for Home Assistant
+# =============================================================================
+# A dark, nature-inspired theme with green accents and warm amber tones.
+# Designed to complement the Jungle Flat dashboard.
+#
+# Usage: Add to your configuration.yaml:
+#   frontend:
+#     themes: !include_dir_merge_named themes/
+#
+# Or reference directly:
+#   frontend:
+#     themes:
+#       !include themes/jungle.yaml
+# =============================================================================
+
+Jungle:
+  # ---------------------------------------------------------------------------
+  # Core palette
+  # ---------------------------------------------------------------------------
+  # Greens:  #2d5016 (deep), #4a7c2e (mid), #8fbc5a (bright), #a8d86e (accent)
+  # Ambers:  #d4a76a (warm), #c17f3e (deep amber), #e8c97a (light amber)
+  # Darks:   #0d1a0a (deepest bg), #121f0e (card bg), #1a2b14 (surface)
+  # Neutrals: #c8d6c0 (text), #8a9882 (secondary text), #3a4a34 (borders)
+
+  # ---------------------------------------------------------------------------
+  # Base colors
+  # ---------------------------------------------------------------------------
+  primary-color: "#4a7c2e"                        # Mid green - main interactive
+  accent-color: "#8fbc5a"                         # Bright green - highlights
+  primary-background-color: "#0d1a0a"             # Deepest dark green-black
+  secondary-background-color: "#121f0e"           # Slightly lighter dark green
+  divider-color: "#3a4a34"                        # Subtle green-grey border
+
+  # ---------------------------------------------------------------------------
+  # Text colors
+  # ---------------------------------------------------------------------------
+  primary-text-color: "#c8d6c0"                   # Soft green-white
+  secondary-text-color: "#8a9882"                 # Muted green-grey
+  text-primary-color: "#c8d6c0"                   # For text on primary color bg
+  disabled-text-color: "#5a6a54"                  # Faded green-grey
+
+  # ---------------------------------------------------------------------------
+  # Header / App bar
+  # ---------------------------------------------------------------------------
+  app-header-background-color: "#0d1a0a"          # Match deepest background
+  app-header-text-color: "#c8d6c0"                # Soft text on header
+  app-header-selection-bar-color: "#8fbc5a"        # Bright green underline
+
+  # ---------------------------------------------------------------------------
+  # Sidebar
+  # ---------------------------------------------------------------------------
+  sidebar-background-color: "#0f1c0b"             # Slightly off from main bg
+  sidebar-text-color: "#c8d6c0"
+  sidebar-icon-color: "#6a8a5e"                   # Muted green icons
+  sidebar-selected-background-color: "#1a2b14"    # Surface color for selection
+  sidebar-selected-icon-color: "#8fbc5a"          # Bright green selected icon
+  sidebar-selected-text-color: "#a8d86e"          # Bright accent text
+
+  # ---------------------------------------------------------------------------
+  # Cards
+  # ---------------------------------------------------------------------------
+  card-background-color: "#141f10"                # Dark green card background
+  ha-card-background: "#141f10"                   # HA card background override
+  ha-card-border-color: "#2a3a24"                 # Subtle green border
+  ha-card-border-radius: "12px"                   # Rounded corners
+  ha-card-border-width: "1px"
+  ha-card-box-shadow: "0 2px 8px rgba(0, 0, 0, 0.4), 0 0 1px rgba(75, 124, 46, 0.1)"
+
+  # ---------------------------------------------------------------------------
+  # States / Entities
+  # ---------------------------------------------------------------------------
+  state-icon-color: "#6a8a5e"                     # Default entity icon color
+  state-icon-active-color: "#8fbc5a"              # Active/on entity icon
+  state-icon-unavailable-color: "#3a4a34"         # Unavailable entity icon
+
+  # State badge colors
+  state-active-color: "#4a7c2e"
+  state-inactive-color: "#2a3a24"
+
+  # ---------------------------------------------------------------------------
+  # Switches / Toggles
+  # ---------------------------------------------------------------------------
+  switch-checked-button-color: "#8fbc5a"          # Toggle knob when on
+  switch-checked-track-color: "#4a7c2e"           # Toggle track when on
+  switch-unchecked-button-color: "#5a6a54"        # Toggle knob when off
+  switch-unchecked-track-color: "#2a3a24"         # Toggle track when off
+
+  # ---------------------------------------------------------------------------
+  # Sliders
+  # ---------------------------------------------------------------------------
+  paper-slider-knob-color: "#8fbc5a"
+  paper-slider-knob-start-color: "#4a7c2e"
+  paper-slider-active-color: "#4a7c2e"
+  paper-slider-container-color: "#2a3a24"
+  paper-slider-pin-color: "#8fbc5a"
+  paper-slider-secondary-color: "#6a8a5e"
+
+  # ---------------------------------------------------------------------------
+  # Buttons
+  # ---------------------------------------------------------------------------
+  mdc-button-outline-color: "#4a7c2e"
+
+  # ---------------------------------------------------------------------------
+  # Input fields
+  # ---------------------------------------------------------------------------
+  input-fill-color: "#1a2b14"
+  input-ink-color: "#c8d6c0"
+  input-label-ink-color: "#8a9882"
+  input-idle-line-color: "#3a4a34"
+  input-hover-line-color: "#4a7c2e"
+  input-disabled-fill-color: "#0d1a0a"
+  input-disabled-ink-color: "#5a6a54"
+  input-disabled-line-color: "#2a3a24"
+  input-dropdown-icon-color: "#6a8a5e"
+
+  # ---------------------------------------------------------------------------
+  # Labels / Badges / Chips
+  # ---------------------------------------------------------------------------
+  label-badge-background-color: "#1a2b14"
+  label-badge-text-color: "#c8d6c0"
+  label-badge-red: "#c0392b"
+  label-badge-green: "#8fbc5a"
+  label-badge-blue: "#5a8aaa"
+  label-badge-yellow: "#d4a76a"
+
+  # ---------------------------------------------------------------------------
+  # Tabs
+  # ---------------------------------------------------------------------------
+  paper-tabs-selection-bar-color: "#8fbc5a"
+  paper-tab-ink: "#4a7c2e"
+
+  # ---------------------------------------------------------------------------
+  # Dialogs / Popups
+  # ---------------------------------------------------------------------------
+  dialog-backdrop-color: "rgba(0, 0, 0, 0.7)"
+
+  # ---------------------------------------------------------------------------
+  # Tables
+  # ---------------------------------------------------------------------------
+  table-row-background-color: "#141f10"
+  table-row-alternative-background-color: "#1a2b14"
+  data-table-background-color: "#141f10"
+
+  # ---------------------------------------------------------------------------
+  # Lovelace-specific
+  # ---------------------------------------------------------------------------
+  lovelace-background: "#0d1a0a"
+
+  # ---------------------------------------------------------------------------
+  # Mushroom card overrides
+  # ---------------------------------------------------------------------------
+  # These CSS variables style mushroom cards when the theme is active
+  mush-rgb-state-light: "143, 188, 90"            # #8fbc5a as RGB
+  mush-rgb-state-media-player: "212, 167, 106"    # #d4a76a as RGB
+  mush-rgb-state-switch: "143, 188, 90"
+  mush-rgb-state-climate: "168, 216, 110"         # #a8d86e as RGB
+
+  # ---------------------------------------------------------------------------
+  # Custom CSS variables for the dashboard
+  # ---------------------------------------------------------------------------
+  # These are non-standard variables we reference in custom cards
+  jungle-green-deep: "#2d5016"
+  jungle-green-mid: "#4a7c2e"
+  jungle-green-bright: "#8fbc5a"
+  jungle-green-accent: "#a8d86e"
+  jungle-amber-warm: "#d4a76a"
+  jungle-amber-deep: "#c17f3e"
+  jungle-amber-light: "#e8c97a"
+  jungle-bg-deepest: "#0d1a0a"
+  jungle-bg-card: "#141f10"
+  jungle-bg-surface: "#1a2b14"
+
+  # ---------------------------------------------------------------------------
+  # Code editor
+  # ---------------------------------------------------------------------------
+  code-editor-background-color: "#0d1a0a"
+  codemirror-keyword: "#8fbc5a"
+  codemirror-atom: "#d4a76a"
+  codemirror-number: "#a8d86e"
+  codemirror-string: "#e8c97a"
+  codemirror-variable: "#c8d6c0"
+  codemirror-comment: "#5a6a54"
+  codemirror-meta: "#6a8a5e"
+
+  # ---------------------------------------------------------------------------
+  # Energy dashboard
+  # ---------------------------------------------------------------------------
+  energy-grid-consumption-color: "#d4a76a"
+  energy-grid-return-color: "#8fbc5a"
+  energy-solar-color: "#a8d86e"
+  energy-battery-in-color: "#4a7c2e"
+  energy-battery-out-color: "#c17f3e"
+
+  # ---------------------------------------------------------------------------
+  # Map
+  # ---------------------------------------------------------------------------
+  dark-primary-color: "#2d5016"
+  light-primary-color: "#8fbc5a"
