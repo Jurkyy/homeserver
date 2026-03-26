@@ -60,26 +60,87 @@ activate_projector:
 play_ambient_sounds:
   alias: "Play Ambient Sounds"
   description: >
-    Starts a nature/ambient sounds playlist on the living room speaker.
+    Starts a nature/ambient sounds playlist. Plays on Spotify first
+    (Nature Sounds playlist), falls back to living room speaker.
     Volume is set to a comfortable background level.
   icon: mdi:music-note
   sequence:
-    # Set a comfortable background volume (not too loud, not too quiet)
+    # Set comfortable volume on Spotify
+    - service: media_player.volume_set
+      target:
+        entity_id: media_player.spotify
+      data:
+        volume_level: 0.25
+    # Play nature sounds on Spotify
+    - service: media_player.play_media
+      target:
+        entity_id: media_player.spotify
+      data:
+        media_content_type: "playlist"
+        media_content_id: "spotify:playlist:37i9dQZF1DX4PP3DA4J0N8"
+    # Also set living room speaker volume as fallback
     - service: media_player.volume_set
       target:
         entity_id: media_player.living_room_speaker
       data:
         volume_level: 0.25
-    # Play the ambient sounds playlist
-    # Update this URL/source to match your actual media setup
+  mode: single
+
+# =============================================================================
+# Play Spotify Playlist (Parameterized)
+# =============================================================================
+# Plays any Spotify playlist by URI with optional shuffle.
+# Can be called from automations, the UI, or voice assistants.
+play_spotify_playlist:
+  alias: "Play Spotify Playlist"
+  description: >
+    Plays a Spotify playlist by URI on the Spotify media player.
+    Accepts a playlist URI and an optional shuffle toggle.
+  icon: mdi:spotify
+  fields:
+    playlist_uri:
+      description: "Spotify playlist URI (e.g., spotify:playlist:37i9dQZF1DX3Ogo9pFvBkY)"
+      required: true
+      example: "spotify:playlist:37i9dQZF1DX3Ogo9pFvBkY"
+      selector:
+        text:
+    shuffle:
+      description: "Enable shuffle mode"
+      required: false
+      default: true
+      example: true
+      selector:
+        boolean:
+  sequence:
+    # Set shuffle mode
+    - service: media_player.shuffle_set
+      target:
+        entity_id: media_player.spotify
+      data:
+        shuffle: "{{ shuffle | default(true) }}"
+    # Play the requested playlist
     - service: media_player.play_media
       target:
-        entity_id: media_player.living_room_speaker
+        entity_id: media_player.spotify
       data:
         media_content_type: "playlist"
-        media_content_id: "library/playlists/ambient-nature-sounds"
-        # For Spotify, use: spotify:playlist:xxxxx
-        # For local media: /media/playlists/nature-sounds
+        media_content_id: "{{ playlist_uri }}"
+  mode: single
+
+# =============================================================================
+# Spotify Play/Pause Toggle
+# =============================================================================
+# Simple play/pause toggle for Spotify. Convenient for buttons, voice, etc.
+spotify_play_pause:
+  alias: "Spotify Play/Pause"
+  description: >
+    Toggles play/pause on the Spotify media player.
+    Useful as a dashboard button or voice command target.
+  icon: mdi:spotify
+  sequence:
+    - service: media_player.media_play_pause
+      target:
+        entity_id: media_player.spotify
   mode: single
 
 # =============================================================================

@@ -126,6 +126,15 @@ rest_command:
     timeout: 10
 
 # -----------------------------------------------------------------------------
+# Spotify Integration
+# -----------------------------------------------------------------------------
+# Spotify is configured via the HA UI after first boot (OAuth flow).
+# Go to Settings > Integrations > Add Integration > Spotify
+# Requires: Spotify Developer App (https://developer.spotify.com/dashboard)
+# Set redirect URI to: http://localhost:8123/auth/external/callback
+spotify:
+
+# -----------------------------------------------------------------------------
 # Media Player Platform Configs
 # -----------------------------------------------------------------------------
 # Uncomment and configure the platforms that match your hardware.

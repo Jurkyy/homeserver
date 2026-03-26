@@ -154,6 +154,10 @@ x_anchors:
         brightness_pct: 10
         rgb_color: [255, 244, 229]
         transition: *fast_transition
+    # Pause Spotify so it doesn't compete with movie audio
+    - service: media_player.media_pause
+      target:
+        entity_id: media_player.spotify
     # Start the projector sequence
     - service: script.activate_projector
   mode: single
@@ -217,12 +221,22 @@ x_anchors:
         entity_id: group.accent_lights
       data:
         transition: *fast_transition
-    # Mute media player to eliminate audio distractions
+    # Mute living room speaker to eliminate audio distractions
     - service: media_player.volume_mute
       target:
         entity_id: media_player.living_room_speaker
       data:
         is_volume_muted: true
+    # Play lo-fi focus beats on Spotify at low volume
+    - service: media_player.volume_set
+      target:
+        entity_id: media_player.spotify
+      data:
+        volume_level: 0.20
+    - service: script.play_spotify_playlist
+      data:
+        playlist_uri: "spotify:playlist:37i9dQZF1DWWQRwui0ExPn"
+        shuffle: true
   mode: single
 
 # Focus Mode - Deactivate
@@ -239,6 +253,10 @@ x_anchors:
         entity_id: media_player.living_room_speaker
       data:
         is_volume_muted: false
+    # Stop Spotify focus music
+    - service: media_player.media_stop
+      target:
+        entity_id: media_player.spotify
     - service: light.turn_on
       target:
         entity_id: group.accent_lights
@@ -285,7 +303,12 @@ x_anchors:
         kelvin: 2700
         brightness_pct: 35
         transition: *medium_transition
-    # Play ambient nature sounds
+    # Play jungle/nature ambience on Spotify
+    - service: script.play_spotify_playlist
+      data:
+        playlist_uri: "spotify:playlist:37i9dQZF1DX4PP3DA4J0N8"
+        shuffle: false
+    # Also play on local speaker as fallback
     - service: script.play_ambient_sounds
   mode: single
 
@@ -308,6 +331,10 @@ x_anchors:
     - service: media_player.media_stop
       target:
         entity_id: media_player.living_room_speaker
+    # Stop Spotify playback as well
+    - service: media_player.media_stop
+      target:
+        entity_id: media_player.spotify
   mode: single
 
 # =============================================================================
@@ -399,10 +426,14 @@ x_anchors:
     - service: input_boolean.turn_on
       target:
         entity_id: input_boolean.do_not_disturb
-    # Stop all media players
+    # Stop all media players (including Spotify)
     - service: media_player.media_stop
       target:
         entity_id: all
+    # Explicitly stop Spotify in case it's playing on a remote device
+    - service: media_player.media_stop
+      target:
+        entity_id: media_player.spotify
     # Turn off all lights
     - service: light.turn_off
       target:
@@ -618,6 +649,11 @@ x_anchors:
             - service: scene.turn_on
               target:
                 entity_id: scene.morning_energize
+            # Play upbeat morning playlist on Spotify
+            - service: script.play_spotify_playlist
+              data:
+                playlist_uri: "spotify:playlist:37i9dQZF1DX1g0iEXLFycr"
+                shuffle: true
         - conditions:
             - condition: state
               entity_id: input_select.house_mood

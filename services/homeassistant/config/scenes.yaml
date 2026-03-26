@@ -79,6 +79,11 @@
     light.string_lights:
       state: "on"
       brightness_pct: 60
+    # Spotify: chill ambient music for the evening
+    media_player.spotify:
+      state: "playing"
+      volume_level: 0.30
+      shuffle: true
 
 # =============================================================================
 # 3. Movie Night
@@ -107,6 +112,9 @@
     # Other accent LEDs off
     light.bedroom_led_strip:
       state: "off"
+    # Spotify: paused so it doesn't compete with movie audio
+    media_player.spotify:
+      state: "paused"
 
 # =============================================================================
 # 4. Cozy Reading
@@ -173,6 +181,11 @@
     light.string_lights:
       state: "on"
       brightness_pct: 100
+    # Spotify: playing Party Hits at full volume
+    media_player.spotify:
+      state: "playing"
+      volume_level: 0.75
+      shuffle: true
 
 # =============================================================================
 # 6. Deep Focus
@@ -204,6 +217,11 @@
       state: "off"
     light.string_lights:
       state: "off"
+    # Spotify: lo-fi focus beats at low volume
+    media_player.spotify:
+      state: "playing"
+      volume_level: 0.20
+      shuffle: true
 
 # =============================================================================
 # 7. Romantic
@@ -241,6 +259,11 @@
     light.string_lights:
       state: "on"
       brightness_pct: 30
+    # Spotify: jazz vibes at low intimate volume
+    media_player.spotify:
+      state: "playing"
+      volume_level: 0.25
+      shuffle: true
 
 # =============================================================================
 # 8. Morning Energize
@@ -276,6 +299,11 @@
       state: "on"
       brightness_pct: 50
       rgb_color: [255, 255, 255]
+    # Spotify: upbeat morning playlist
+    media_player.spotify:
+      state: "playing"
+      volume_level: 0.50
+      shuffle: true
 
 # =============================================================================
 # 9. Meditation
@@ -306,3 +334,8 @@
     light.string_lights:
       state: "on"
       brightness_pct: 10
+    # Spotify: ambient relaxation at whisper volume
+    media_player.spotify:
+      state: "playing"
+      volume_level: 0.15
+      shuffle: false

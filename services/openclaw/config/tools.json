@@ -217,6 +217,66 @@
       }
     },
     {
+      "name": "spotify_control",
+      "description": "Control Spotify playback. Play, pause, skip tracks, adjust volume, play specific playlists by URI, toggle shuffle and repeat modes.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["play", "pause", "next", "previous", "volume", "play_playlist", "shuffle", "repeat"],
+            "description": "The Spotify action to perform"
+          },
+          "playlist_uri": {
+            "type": "string",
+            "description": "Spotify playlist URI (e.g., spotify:playlist:37i9dQZF1DX3Ogo9pFvBkY). Only used with play_playlist action."
+          },
+          "volume_level": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "description": "Volume level from 0.0 to 1.0. Only used with volume action."
+          },
+          "shuffle": {
+            "type": "boolean",
+            "description": "Enable or disable shuffle. Only used with shuffle action."
+          },
+          "repeat": {
+            "type": "string",
+            "enum": ["off", "all", "one"],
+            "description": "Repeat mode. Only used with repeat action."
+          }
+        },
+        "required": ["action"]
+      },
+      "execution": {
+        "method": "POST",
+        "url": "http://homeassistant:8123/api/services/media_player/${action}",
+        "headers": {
+          "Authorization": "Bearer ${HA_LONG_LIVED_TOKEN}",
+          "Content-Type": "application/json"
+        },
+        "body_template": {
+          "entity_id": "media_player.spotify",
+          "media_content_type": "playlist",
+          "media_content_id": "${playlist_uri}",
+          "volume_level": "${volume_level}",
+          "shuffle": "${shuffle}",
+          "repeat": "${repeat}"
+        },
+        "action_map": {
+          "play": "media_play",
+          "pause": "media_pause",
+          "next": "media_next_track",
+          "previous": "media_previous_track",
+          "volume": "volume_set",
+          "play_playlist": "play_media",
+          "shuffle": "shuffle_set",
+          "repeat": "repeat_set"
+        }
+      }
+    },
+    {
       "name": "ha_send_notification",
       "description": "Send a push notification to the Home Assistant mobile app.",
       "input_schema": {
