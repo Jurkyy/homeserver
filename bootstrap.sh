@@ -121,9 +121,10 @@ install_basic_tools() {
             git curl wget \
             htop btop \
             neovim \
-            bat fd-find ripgrep fzf \
+            bat eza fd-find ripgrep fzf \
             tmux \
             unzip jq tree \
+            zoxide \
             zsh
 
         # Create symlinks for tools with different names on Debian
@@ -263,6 +264,11 @@ install_docker() {
         info "Adding user $SUDO_USER to docker group..."
         usermod -aG docker "$SUDO_USER"
         success "User $SUDO_USER added to docker group"
+
+        # Audio group for ALSA passthrough (e.g. music player container)
+        info "Adding user $SUDO_USER to audio group..."
+        usermod -aG audio "$SUDO_USER"
+        success "User $SUDO_USER added to audio group"
     fi
 }
 
@@ -288,8 +294,16 @@ install_tailscale() {
     success "Tailscale service enabled and started"
 }
 
-# Set Tailscale hostname
+# Set Tailscale hostname (requires tailscale to be logged in)
 setup_server_hostname() {
+    # Skip silently if tailscale isn't authenticated yet — connect_tailscale
+    # may have been declined, or the daemon isn't logged in.
+    if ! tailscale status &>/dev/null; then
+        warn "Tailscale not logged in — skipping hostname setup"
+        warn "Run 'sudo tailscale set --hostname=homeserver' after connecting"
+        return
+    fi
+
     info "Setting Tailscale hostname to 'homeserver'..."
     tailscale set --hostname=homeserver
     success "Tailscale hostname set to 'homeserver'"
@@ -574,8 +588,8 @@ setup_shell_config() {
         touch "$shell_rc"
     fi
 
-    # Add zoxide init if not present (Arch only)
-    if [[ $DISTRO_FAMILY == "arch" ]] && ! grep -q "zoxide init" "$shell_rc" 2>/dev/null; then
+    # Add zoxide init if not present (Arch + Debian both ship zoxide)
+    if ! grep -q "zoxide init" "$shell_rc" 2>/dev/null; then
         echo '' >> "$shell_rc"
         echo '# Zoxide (smart cd)' >> "$shell_rc"
         if [[ "$shell_rc" == *".zshrc"* ]]; then
@@ -653,7 +667,6 @@ main() {
     install_ssh
     install_docker
     install_tailscale
-    setup_server_hostname
 
     echo ""
     setup_storage_hdd
@@ -667,6 +680,7 @@ main() {
     setup_projects_dir
 
     connect_tailscale
+    setup_server_hostname
     start_services
 
     echo ""
