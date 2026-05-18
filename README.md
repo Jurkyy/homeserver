@@ -41,6 +41,8 @@ That's it. One script does everything.
 | OpenClaw       | 18789 | http://localhost:18789       | AI bot control UI              |
 | Home Assistant | 8123  | http://localhost:8123        | Home automation dashboard      |
 | Jellyfin       | 8096  | http://localhost:8096        | Media streaming interface      |
+| Navidrome      | 4533  | http://localhost:4533        | Local music streaming          |
+| Mopidy / Iris  | 6680  | http://localhost:6680/iris/  | LAN web music player (Spotify/YT/local) |
 
 ## Project Structure
 
@@ -111,3 +113,23 @@ ssh homeserver 'journalctl -u polymarket-insider-bot -f'
 ## Documentation
 
 For detailed setup instructions, troubleshooting, and configuration guides, see [SETUP.md](SETUP.md).
+
+### Mopidy / Iris web player
+
+Mopidy with the Iris web UI gives you a browser-based music player that
+streams Spotify, YouTube, and your local library, and plays audio out of
+the homeserver's physical sound-card jack (ALSA passthrough via
+`/dev/snd`). Open `http://<homeserver>:6680/iris/` from any device on
+the LAN.
+
+**Spotify Premium is required** for Mopidy-Spotify to stream tracks —
+free accounts cannot authenticate against librespot. Set the following
+in `.env` (see `.env.example` for full notes):
+
+- `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` — Spotify Developer App
+  (shared with the Home Assistant Spotify integration)
+- `SPOTIFY_USERNAME` / `SPOTIFY_PASSWORD` — your Spotify account
+  credentials (a Spotify-issued password, not Facebook/Google login)
+- `MOPIDY_AUDIO_GID` — host audio group GID so the container can access
+  `/dev/snd` (Debian 13 = 29, Arch = 996; default 29). Find yours with
+  `getent group audio | cut -d: -f3`.

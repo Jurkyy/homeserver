@@ -73,6 +73,36 @@ services:
       - JELLYFIN_PublishedServerUrl=${JELLYFIN_URL:-http://localhost:8096}
     restart: unless-stopped
 
+  mopidy:
+    # LAN-hosted web music player (Spotify + YouTube + local library) with
+    # Iris as the browser UI. Audio plays out the host's physical 3.5mm /
+    # sound-card jack via ALSA — `/dev/snd` is passed through and the
+    # container joins the host `audio` group.
+    #
+    # Gotcha: the host `audio` GID differs between distros (Debian 13 = 29,
+    # Arch = 996). Set MOPIDY_AUDIO_GID in .env to your host's value:
+    #   getent group audio | cut -d: -f3
+    build:
+      context: ./services/mopidy
+    container_name: mopidy
+    ports:
+      - "6680:6680"
+    volumes:
+      - ./services/mopidy/config/mopidy.conf:/etc/mopidy/mopidy.conf:ro
+      - ./services/mopidy/data:/var/lib/mopidy
+      - ${MEDIA_PATH:-/mnt/storage/media}/music:/var/lib/mopidy/media:ro
+    devices:
+      - /dev/snd:/dev/snd
+    group_add:
+      - "${MOPIDY_AUDIO_GID:-29}"
+    environment:
+      # Spotify Premium is required for Mopidy-Spotify to play tracks.
+      - SPOTIFY_USERNAME=${SPOTIFY_USERNAME:-}
+      - SPOTIFY_PASSWORD=${SPOTIFY_PASSWORD:-}
+      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
+      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
+    restart: unless-stopped
+
   tailscale:
     image: tailscale/tailscale:latest
     container_name: tailscale

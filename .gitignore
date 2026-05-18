@@ -17,6 +17,9 @@ services/*/config/*
 !services/openclaw/config/tools.json
 !services/openclaw/config/system_prompt.md
 
+# Mopidy config is tracked (player config with ALSA/Spotify/YouTube sections)
+!services/mopidy/config/mopidy.conf
+
 # Jellyfin cache
 services/jellyfin/cache/*
 !services/jellyfin/cache/.gitkeep
