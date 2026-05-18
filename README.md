@@ -104,6 +104,59 @@ Once Tailscale is connected, access services via your Tailscale IP:
 - `http://100.x.x.x:8096` - Jellyfin
 - `http://100.x.x.x:6680/iris/` - Mopidy / Iris
 
+## VPN (NordVPN, always-on)
+
+The bootstrap installs the official NordVPN CLI and configures it as an
+**always-on, whole-host VPN**. All outbound traffic from the homeserver
+— including every Docker container that uses the host's network stack —
+exits through Nord. Autoconnect is enabled, so the VPN comes up on every
+boot before user services start.
+
+A few practical notes:
+
+- **Spotify catalog follows your exit country.** Pin `NORDVPN_COUNTRY` in
+  `.env` (e.g. `Netherlands`, `Germany`, `United_States`) if your Spotify
+  account is region-locked or you want a specific catalog. Leave blank to
+  let Nord pick the fastest server.
+- **LAN access is preserved.** The bootstrap detects your LAN subnet
+  (e.g. `192.168.1.0/24`) and adds it to NordVPN's allowlist before the
+  kill-switch engages. Phones/laptops on the same network can still hit
+  `music.local`, Jellyfin, Home Assistant, etc. on the homeserver's LAN
+  IP without going through Nord.
+- **Tailscale keeps working.** The Tailscale CGNAT range (`100.64.0.0/10`)
+  is also allowlisted, so remote access via your tailnet is unaffected.
+- **Kill-switch is on.** If the Nord tunnel ever drops, non-LAN /
+  non-Tailscale traffic is blocked rather than leaking out the bare WAN.
+
+Operate it with:
+
+```bash
+# Temporarily disable (e.g. for a service that breaks behind VPN):
+sudo nordvpn disconnect
+sudo nordvpn set autoconnect off    # also stop it coming back on reboot
+
+# Re-enable always-on:
+sudo nordvpn set autoconnect on
+sudo nordvpn connect
+
+# Check state:
+nordvpn status
+nordvpn settings
+nordvpn allowlist
+```
+
+If you left `NORDVPN_TOKEN` blank during bootstrap, the client is
+installed but not logged in. Generate a token at
+<https://my.nordaccount.com/dashboard/nordvpn/access-tokens/>, add it to
+`.env`, then run:
+
+```bash
+sudo nordvpn login --token "$NORDVPN_TOKEN"
+sudo nordvpn set killswitch on
+sudo nordvpn set autoconnect on
+sudo nordvpn connect
+```
+
 ## Project Deployment
 
 Deploy git repos (Python bots, etc.) from your dev machine to the server and run them as systemd services.

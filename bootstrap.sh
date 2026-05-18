@@ -619,6 +619,21 @@ prompt_api_keys() {
         update_env_key "TAILSCALE_AUTHKEY" "$tailscale_key"
         success "Saved"
     fi
+
+    echo ""
+    echo "  NordVPN: generate a token at"
+    echo "  https://my.nordaccount.com/dashboard/nordvpn/access-tokens/"
+    read -p "NORDVPN_TOKEN: " nordvpn_token
+    if [ -n "$nordvpn_token" ]; then
+        update_env_key "NORDVPN_TOKEN" "$nordvpn_token"
+        success "Saved"
+    fi
+
+    read -p "NORDVPN_COUNTRY (optional, e.g. Netherlands): " nordvpn_country
+    if [ -n "$nordvpn_country" ]; then
+        update_env_key "NORDVPN_COUNTRY" "$nordvpn_country"
+        success "Saved"
+    fi
 }
 
 # Setup shell config for the user
@@ -688,6 +703,165 @@ connect_tailscale() {
     fi
 }
 
+# Install NordVPN (host-level, always-on, whole-system).
+#
+# Runs AFTER Tailscale is up so the Tailscale CGNAT range can be added
+# to the allowlist before NordVPN's kill-switch starts blocking traffic.
+# Debian-only for now (Arch users can adapt the official installer).
+#
+# Carve-outs we MUST add before connecting, or we lose the LAN/SSH/Tailscale:
+#   - The host's LAN subnet (so phones/laptops can still reach
+#     music.local, Jellyfin, Home Assistant on http://<lan-ip>:...)
+#   - 100.64.0.0/10 — Tailscale's CGNAT range
+#   - port 22 (defensive, in case the SSH client comes from outside the
+#     detected LAN — e.g. another tailnet device)
+install_nordvpn() {
+    if [[ $DISTRO_FAMILY != "debian" ]]; then
+        warn "NordVPN auto-install only supported on Debian here — skipping"
+        warn "Arch users: see https://nordvpn.com/download/linux/"
+        return
+    fi
+
+    info "Installing NordVPN CLI..."
+
+    if command -v nordvpn &> /dev/null; then
+        success "NordVPN already installed"
+    else
+        # Official installer. We're already root (check_root ran in main),
+        # so the installer's internal `sudo` calls are no-ops — no extra
+        # piping needed. `-p nordvpn` selects the CLI package (not the GUI).
+        sh <(curl -sSf https://downloads.nordcdn.com/apps/linux/install.sh) -p nordvpn
+        success "NordVPN CLI installed"
+    fi
+
+    # The nordvpn CLI requires the invoking user to be in the `nordvpn`
+    # group. usermod is idempotent — re-adding is a no-op.
+    if [ -n "$SUDO_USER" ]; then
+        info "Adding user $SUDO_USER to nordvpn group..."
+        usermod -aG nordvpn "$SUDO_USER"
+        success "User $SUDO_USER added to nordvpn group"
+    fi
+
+    info "Enabling and starting nordvpnd service..."
+    systemctl enable nordvpnd
+    systemctl start nordvpnd
+
+    # Give the daemon a moment to come up before we start hitting it.
+    sleep 2
+    success "nordvpnd running"
+
+    # Load the token from .env (the file was created earlier by
+    # setup_env_file / prompt_api_keys). We source carefully — strip
+    # surrounding quotes that users sometimes add.
+    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local env_file="$script_dir/.env"
+    local nord_token=""
+    local nord_country=""
+    if [ -f "$env_file" ]; then
+        nord_token=$(grep -E '^NORDVPN_TOKEN=' "$env_file" | head -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+        nord_country=$(grep -E '^NORDVPN_COUNTRY=' "$env_file" | head -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+    fi
+
+    if [ -z "$nord_token" ]; then
+        warn "NORDVPN_TOKEN not set in .env — skipping login + connect."
+        warn "Generate a token at:"
+        warn "  https://my.nordaccount.com/dashboard/nordvpn/access-tokens/"
+        warn "Then set NORDVPN_TOKEN in .env and re-run just the connect with:"
+        warn "  sudo nordvpn login --token \"\$NORDVPN_TOKEN\" && sudo nordvpn set killswitch on && sudo nordvpn set autoconnect on && sudo nordvpn connect"
+        return
+    fi
+
+    info "Logging in to NordVPN with token..."
+    if ! nordvpn login --token "$nord_token"; then
+        warn "NordVPN login failed — skipping rest of NordVPN setup"
+        return
+    fi
+    success "NordVPN logged in"
+
+    info "Configuring NordVPN client..."
+    # NordLynx = WireGuard-based, much faster than OpenVPN.
+    nordvpn set technology nordlynx   || warn "Failed to set technology"
+    # Kill-switch: block all non-VPN traffic when the tunnel drops.
+    nordvpn set killswitch on         || warn "Failed to enable killswitch"
+    # Auto-reconnect on every boot — keeps the whole host on Nord 24/7.
+    nordvpn set autoconnect on        || warn "Failed to enable autoconnect"
+    # Suppress notifications (otherwise they spam the systemd journal).
+    nordvpn set notify off            || warn "Failed to disable notify"
+    nordvpn set analytics off         || warn "Failed to disable analytics"
+    success "NordVPN client configured"
+
+    # === Allowlist BEFORE connecting ===
+    # Once killswitch+connect are active, anything not on the allowlist
+    # gets dropped. If our SSH session comes in via the LAN or Tailscale,
+    # we MUST carve those out first or we lock ourselves out.
+    info "Setting up NordVPN allowlist (LAN + Tailscale + SSH)..."
+
+    # Detect LAN subnet from the default-route interface.
+    local def_iface lan_cidr lan_network=""
+    def_iface=$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+    if [ -n "$def_iface" ]; then
+        lan_cidr=$(ip -4 -o addr show dev "$def_iface" 2>/dev/null | awk '{print $4; exit}')
+        if [ -n "$lan_cidr" ]; then
+            # Derive the network address from <host-ip>/<prefix>. We
+            # support common home prefixes (/24, /23, /22, /16) by
+            # masking the host octets to zero. For /24 this is trivial:
+            # 192.168.1.42/24 -> 192.168.1.0/24.
+            local ip_part prefix
+            ip_part="${lan_cidr%/*}"
+            prefix="${lan_cidr#*/}"
+            case "$prefix" in
+                24)
+                    lan_network="$(echo "$ip_part" | awk -F. '{print $1"."$2"."$3".0"}')/24"
+                    ;;
+                16)
+                    lan_network="$(echo "$ip_part" | awk -F. '{print $1"."$2".0.0"}')/16"
+                    ;;
+                23|22|21|20)
+                    # For non-/24 prefixes, fall back to ipcalc if available,
+                    # otherwise warn and skip the LAN entry rather than
+                    # guessing wrong and leaving a gap in the allowlist.
+                    if command -v ipcalc &> /dev/null; then
+                        lan_network=$(ipcalc -n "$lan_cidr" 2>/dev/null | awk -F= '/^Network/ {print $2; exit}')
+                    fi
+                    ;;
+            esac
+        fi
+    fi
+
+    if [ -n "$lan_network" ]; then
+        info "Allowlisting LAN subnet $lan_network"
+        nordvpn allowlist add subnet "$lan_network" || warn "Failed to allowlist $lan_network"
+    else
+        warn "Could not detect LAN subnet — skipping LAN allowlist entry"
+        warn "Add it manually later with: sudo nordvpn allowlist add subnet <your-lan>/24"
+    fi
+
+    # Tailscale CGNAT range — always 100.64.0.0/10, regardless of tailnet.
+    info "Allowlisting Tailscale CGNAT range 100.64.0.0/10"
+    nordvpn allowlist add subnet 100.64.0.0/10 || warn "Failed to allowlist Tailscale range"
+
+    # SSH port — defensive carve-out in case the operator SSHs in from
+    # outside the detected LAN subnet (e.g. a coworker's network bridged
+    # via some other means). Cheap insurance.
+    info "Allowlisting SSH port 22"
+    nordvpn allowlist add port 22 || warn "Failed to allowlist SSH"
+    success "Allowlist configured"
+
+    # === Now safe to connect ===
+    info "Connecting to NordVPN${nord_country:+ ($nord_country)}..."
+    if [ -n "$nord_country" ]; then
+        nordvpn connect "$nord_country" || warn "NordVPN connect failed — retry manually with: sudo nordvpn connect $nord_country"
+    else
+        nordvpn connect || warn "NordVPN connect failed — retry manually with: sudo nordvpn connect"
+    fi
+
+    echo ""
+    info "NordVPN status:"
+    nordvpn status || true
+    echo ""
+    success "NordVPN setup complete (always-on, autoconnect enabled)"
+}
+
 # Start services
 start_services() {
     local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -748,6 +922,10 @@ main() {
 
     connect_tailscale
     setup_server_hostname
+
+    echo ""
+    install_nordvpn
+
     start_services
 
     echo ""
