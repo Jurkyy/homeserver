@@ -150,7 +150,11 @@ free accounts cannot authenticate against librespot. Set the following
 in `.env` (see `.env.example` for full notes):
 
 - `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` — Spotify Developer App
-  (shared with the Home Assistant Spotify integration)
+  (shared with the Home Assistant Spotify integration). When creating
+  the app at <https://developer.spotify.com/dashboard>, the Redirect URI
+  must use HTTPS — Spotify rejects plain `http://localhost`. Use
+  `https://localhost:6680` (the URL isn't actually loaded by Mopidy,
+  Spotify just validates the scheme).
 - `SPOTIFY_USERNAME` / `SPOTIFY_PASSWORD` — your Spotify account
   credentials (a Spotify-issued password, not Facebook/Google login)
 - `MOPIDY_AUDIO_GID` — host audio group GID so the container can access
