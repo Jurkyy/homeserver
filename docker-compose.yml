@@ -103,6 +103,26 @@ services:
       - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
     restart: unless-stopped
 
+  caddy:
+    # Reverse proxy fronting the home server on :80. Pairs with the
+    # host's avahi-daemon (see install_avahi() in bootstrap.sh) so
+    # `http://music.local` resolves on the LAN and routes to Mopidy/Iris.
+    # Plain HTTP only — `.local` mDNS names can't get Let's Encrypt
+    # certs, and we don't want to ship a custom CA to every client.
+    image: caddy:2-alpine
+    container_name: caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./services/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./services/caddy/welcome:/srv/welcome:ro
+      - ./services/caddy/data:/data
+      - ./services/caddy/config:/config
+    depends_on:
+      - mopidy
+    restart: unless-stopped
+
   tailscale:
     image: tailscale/tailscale:latest
     container_name: tailscale

@@ -43,6 +43,7 @@ That's it. One script does everything.
 | Jellyfin       | 8096  | http://localhost:8096        | Media streaming interface      |
 | Navidrome      | 4533  | http://localhost:4533        | Local music streaming          |
 | Mopidy / Iris  | 6680  | http://localhost:6680/iris/  | LAN web music player (Spotify/YT/local) |
+| Caddy (proxy)  | 80    | http://music.local           | LAN reverse proxy &rarr; Mopidy/Iris    |
 
 ## Project Structure
 
@@ -75,11 +76,33 @@ homeserver/
 - **Backup configs**: `./scripts/backup.sh`
 - **Update services**: `./scripts/update.sh` (use `--force` to force recreate)
 
+## Local DNS
+
+The bootstrap installs `avahi-daemon` on the host and publishes a
+`music.local` CNAME alias over mDNS. A Caddy reverse proxy container
+fronts the stack on port 80 and routes `music.local` &rarr; Mopidy/Iris.
+
+- **macOS / Linux / Android (with an mDNS-aware app):** just open
+  [http://music.local](http://music.local) on the LAN.
+- **Windows:** `.local` resolution requires
+  [Bonjour Print Services](https://support.apple.com/kb/DL999) (free
+  Apple install). Without it, add a line to
+  `C:\Windows\System32\drivers\etc\hosts`:
+  ```
+  192.168.x.x   music.local
+  ```
+  (replace with the homeserver's LAN IP).
+- **Tailscale fallback:** Caddy listens on `:80`, so
+  `http://<tailscale-ip>` reaches the welcome page and `music.local`
+  works inside the tailnet if the resolver knows about it. If not, hit
+  Mopidy directly at `http://<tailscale-ip>:6680/iris/`.
+
 ## Remote Access
 
 Once Tailscale is connected, access services via your Tailscale IP:
 - `http://100.x.x.x:8123` - Home Assistant
 - `http://100.x.x.x:8096` - Jellyfin
+- `http://100.x.x.x:6680/iris/` - Mopidy / Iris
 
 ## Project Deployment
 

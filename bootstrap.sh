@@ -294,6 +294,72 @@ install_tailscale() {
     success "Tailscale service enabled and started"
 }
 
+# Install avahi (mDNS) and publish a CNAME alias for music.local so any
+# LAN client that resolves `.local` names (macOS, Linux, Android with
+# apps, Windows with Bonjour Print Services installed) can reach the
+# Caddy reverse proxy at http://music.local without editing hosts files.
+#
+# We use `avahi-publish -a -R <alias> <local-ip>` driven by a systemd
+# unit. The XML <service>-file route only publishes services, not host
+# aliases, and there's no first-class CNAME directive in avahi.service
+# files — `avahi-publish` is the documented, reliable way.
+install_avahi() {
+    info "Installing avahi-daemon for mDNS (.local resolution)..."
+    if [[ $DISTRO_FAMILY == "debian" ]]; then
+        install_packages avahi-daemon avahi-utils
+    elif [[ $DISTRO_FAMILY == "arch" ]]; then
+        install_packages avahi nss-mdns
+    fi
+
+    systemctl enable avahi-daemon
+    systemctl start avahi-daemon
+    success "avahi-daemon running"
+
+    info "Setting up music.local CNAME alias..."
+
+    # Pick the host's primary LAN IP (the source IP we'd use to reach
+    # the default gateway). Falls back to first non-loopback v4 addr.
+    local host_ip
+    host_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
+    if [ -z "$host_ip" ]; then
+        host_ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    fi
+    if [ -z "$host_ip" ]; then
+        warn "Could not determine host LAN IP — skipping music.local alias"
+        warn "Add it later with: avahi-publish -a -R music.local <your-ip>"
+        return
+    fi
+    info "Publishing music.local -> $host_ip"
+
+    # Install a systemd unit that runs avahi-publish as a long-lived
+    # foreground process. `-a` = address record, `-R` = allow re-publishing
+    # if another responder already advertises it (e.g. on reboot).
+    cat > /etc/systemd/system/avahi-alias-music.service <<EOF
+[Unit]
+Description=Publish music.local mDNS alias -> $host_ip
+After=network-online.target avahi-daemon.service
+Wants=network-online.target
+Requires=avahi-daemon.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/avahi-publish -a -R music.local $host_ip
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable avahi-alias-music.service
+    systemctl restart avahi-alias-music.service
+    success "music.local published over mDNS (-> $host_ip)"
+
+    warn "Windows clients need Bonjour Print Services (or an entry in"
+    warn "C:\\Windows\\System32\\drivers\\etc\\hosts) to resolve .local names."
+}
+
 # Set Tailscale hostname (requires tailscale to be logged in)
 setup_server_hostname() {
     # Skip silently if tailscale isn't authenticated yet — connect_tailscale
@@ -667,6 +733,7 @@ main() {
     install_ssh
     install_docker
     install_tailscale
+    install_avahi
 
     echo ""
     setup_storage_hdd
@@ -690,6 +757,7 @@ main() {
     echo ""
 
     info "Services:"
+    echo "  - Music (Mopidy): http://music.local        (LAN mDNS via Caddy)"
     echo "  - OpenClaw:       http://localhost:18789"
     echo "  - Home Assistant: http://localhost:8123"
     echo "  - Jellyfin:       http://localhost:8096"
