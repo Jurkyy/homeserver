@@ -194,9 +194,10 @@ For detailed setup instructions, troubleshooting, and configuration guides, see 
 
 Mopidy with the Iris web UI gives you a browser-based music player that
 streams Spotify, YouTube, and your local library, and plays audio out of
-the homeserver's physical sound-card jack (ALSA passthrough via
-`/dev/snd`). Open `http://<homeserver>:6680/iris/` from any device on
-the LAN.
+the homeserver's physical audio interface (ALSA passthrough via
+`/dev/snd`). Default audio path: USB → **Focusrite Scarlett 2i2** →
+1/4" TRS → speakers. Open `http://<homeserver>:6680/iris/` from any
+device on the LAN.
 
 **Spotify Premium is required** for Mopidy-Spotify to stream tracks —
 free accounts cannot authenticate against librespot. Set the following
@@ -213,3 +214,8 @@ in `.env` (see `.env.example` for full notes):
 - `MOPIDY_AUDIO_GID` — host audio group GID so the container can access
   `/dev/snd` (Debian 13 = 29, Arch = 996; default 29). Find yours with
   `getent group audio | cut -d: -f3`.
+- `MOPIDY_ALSA_DEVICE` — ALSA output device. Defaults to
+  `plughw:CARD=USB,DEV=0`, which targets the Focusrite Scarlett 2i2
+  (class-compliant USB; Linux names the card `USB`). Confirm with
+  `aplay -l` on the host. If you ever swap interfaces, this is the one
+  knob to change — no rebuild needed, just `docker compose up -d mopidy`.

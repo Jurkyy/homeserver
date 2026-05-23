@@ -101,6 +101,10 @@ services:
       - SPOTIFY_PASSWORD=${SPOTIFY_PASSWORD:-}
       - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
       - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
+      # ALSA output device — defaults to the Focusrite Scarlett 2i2
+      # (card name "USB" via class-compliant USB audio). Override in .env
+      # if `aplay -l` on the host shows a different card name.
+      - MOPIDY_ALSA_DEVICE=${MOPIDY_ALSA_DEVICE:-plughw:CARD=USB,DEV=0}
     restart: unless-stopped
 
   caddy:
