@@ -1,28 +1,14 @@
-# Caddy reverse proxy for the home server.
+# Caddy reverse proxy on :80 for LAN-only services.
 #
-# music.local is published over mDNS by avahi on the host (see
-# install_avahi() in bootstrap.sh), so any client on the LAN that can
-# resolve `.local` names (macOS, Linux, Android with apps, Windows with
-# Bonjour Print Services installed) will reach this vhost.
-#
-# We deliberately serve plain HTTP on :80 — `.local` names cannot get a
-# public Let's Encrypt cert, and Caddy's internal CA would require every
-# client to trust a custom root. HTTP on the LAN is fine for now;
-# revisit if/when we add real DNS + TLS.
+# Plain HTTP because the published mDNS names (e.g. music.local from
+# avahi-publish) can't get a Let's Encrypt cert, and an internal CA
+# would mean trusting a custom root on every client.
 {
-	# Disable the on-by-default automatic HTTPS for the whole server.
-	# We're terminating only HTTP for `.local` hosts.
 	auto_https off
 }
 
-# Primary virtual host: music.local -> Mopidy/Iris
-http://music.local {
-	encode gzip
-	reverse_proxy mopidy:6680
-}
-
-# Fallback: anything else hitting the box on :80 (bare IP, Tailscale IP,
-# homeserver.local) gets a friendly directory of what's available.
+# Default :80 host — welcome page. Add reverse_proxy vhosts above this
+# block as services come online (e.g. http://music.local -> librespot UI).
 :80 {
 	encode gzip
 	root * /srv/welcome
