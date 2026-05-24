@@ -42,8 +42,8 @@ That's it. One script does everything.
 | Home Assistant | 8123  | http://localhost:8123        | Home automation dashboard      |
 | Jellyfin       | 8096  | http://localhost:8096        | Media streaming interface      |
 | Navidrome      | 4533  | http://localhost:4533        | Local music streaming          |
-| Mopidy / Iris  | 6680  | http://localhost:6680/iris/  | LAN web music player (Spotify/YT/local) |
-| Caddy (proxy)  | 80    | http://music.local           | LAN reverse proxy &rarr; Mopidy/Iris    |
+| librespot      | n/a   | (Spotify app device picker)  | Spotify Connect target → Scarlett 2i2  |
+| Caddy (proxy)  | 80    | http://&lt;lan-ip&gt;/         | LAN welcome page                       |
 
 ## Project Structure
 
@@ -76,33 +76,39 @@ homeserver/
 - **Backup configs**: `./scripts/backup.sh`
 - **Update services**: `./scripts/update.sh` (use `--force` to force recreate)
 
-## Local DNS
+## Music: Spotify Connect via librespot
 
-The bootstrap installs `avahi-daemon` on the host and publishes a
-`music.local` CNAME alias over mDNS. A Caddy reverse proxy container
-fronts the stack on port 80 and routes `music.local` &rarr; Mopidy/Iris.
+Spotify playback goes through the `librespot` container, which
+advertises itself on the LAN as a Spotify Connect target via mDNS
+(zeroconf). The audio path is **librespot → ALSA → USB → Focusrite
+Scarlett 2i2 → 1/4" TRS → speakers**.
 
-- **macOS / Linux / Android (with an mDNS-aware app):** just open
-  [http://music.local](http://music.local) on the LAN.
-- **Windows:** `.local` resolution requires
-  [Bonjour Print Services](https://support.apple.com/kb/DL999) (free
-  Apple install). Without it, add a line to
-  `C:\Windows\System32\drivers\etc\hosts`:
-  ```
-  192.168.x.x   music.local
-  ```
-  (replace with the homeserver's LAN IP).
-- **Tailscale fallback:** Caddy listens on `:80`, so
-  `http://<tailscale-ip>` reaches the welcome page and `music.local`
-  works inside the tailnet if the resolver knows about it. If not, hit
-  Mopidy directly at `http://<tailscale-ip>:6680/iris/`.
+To use it, open Spotify on any device logged into your account, tap
+the device picker, and select **Homeserver**. (Requires Spotify
+Premium — Connect doesn't work on free tier.) The container exposes
+no web UI; the Spotify app is the remote.
+
+Bits worth knowing:
+
+- mDNS discovery requires the controlling device to be on the same
+  LAN as the homeserver (or a Spotify Connect-aware proxy in between).
+- The `bootstrap.sh` `install_mdns_carveout` step installs a systemd
+  unit that adds an `ip rule` + iptables ACCEPT for outbound multicast
+  on the LAN interface — without it, NordVPN's kill-switch swallows
+  the announcements.
+- ALSA card name is set via `LIBRESPOT_ALSA_DEVICE` in `.env`. Default
+  is `plughw:CARD=USB,DEV=0`; verify with `aplay -l` on the host.
 
 ## Remote Access
 
 Once Tailscale is connected, access services via your Tailscale IP:
 - `http://100.x.x.x:8123` - Home Assistant
 - `http://100.x.x.x:8096` - Jellyfin
-- `http://100.x.x.x:6680/iris/` - Mopidy / Iris
+- `http://100.x.x.x/` - Caddy welcome page (LAN service directory)
+
+(Spotify Connect is LAN-only — the librespot device is announced over
+mDNS, which doesn't cross subnets, so it only shows up in the Spotify
+device picker when the controlling device is on the home LAN.)
 
 ## VPN (NordVPN, always-on)
 
@@ -121,8 +127,14 @@ A few practical notes:
 - **LAN access is preserved.** The bootstrap detects your LAN subnet
   (e.g. `192.168.1.0/24`) and adds it to NordVPN's allowlist before the
   kill-switch engages. Phones/laptops on the same network can still hit
-  `music.local`, Jellyfin, Home Assistant, etc. on the homeserver's LAN
-  IP without going through Nord.
+  the Caddy welcome page, Jellyfin, Home Assistant, etc. on the
+  homeserver's LAN IP without going through Nord.
+- **mDNS multicast carve-out.** NordVPN's allowlist is per-subnet — it
+  doesn't cover `224.0.0.0/4` (the mDNS group), so the kill-switch
+  drops librespot's Spotify Connect announcements by default.
+  `install_mdns_carveout` (run after `install_nordvpn` in bootstrap)
+  installs a small systemd unit that re-adds the `ip rule` + iptables
+  ACCEPT after every boot or `nordvpnd` restart.
 - **Tailscale keeps working.** The Tailscale CGNAT range (`100.64.0.0/10`)
   is also allowlisted, so remote access via your tailnet is unaffected.
 - **Kill-switch is on.** If the Nord tunnel ever drops, non-LAN /
@@ -190,32 +202,27 @@ ssh homeserver 'journalctl -u polymarket-insider-bot -f'
 
 For detailed setup instructions, troubleshooting, and configuration guides, see [SETUP.md](SETUP.md).
 
-### Mopidy / Iris web player
+### librespot (Spotify Connect)
 
-Mopidy with the Iris web UI gives you a browser-based music player that
-streams Spotify, YouTube, and your local library, and plays audio out of
-the homeserver's physical audio interface (ALSA passthrough via
-`/dev/snd`). Default audio path: USB → **Focusrite Scarlett 2i2** →
-1/4" TRS → speakers. Open `http://<homeserver>:6680/iris/` from any
-device on the LAN.
+The `librespot` container is a Spotify Connect target. The user's
+Spotify app — mobile, desktop, or web — sees it in the device picker
+and streams audio to it directly from Spotify's servers. ALSA
+passthrough via `/dev/snd` puts the audio on the host's sound card.
+Default path: USB → **Focusrite Scarlett 2i2** → 1/4" TRS → speakers.
 
-**Spotify Premium is required** for Mopidy-Spotify to stream tracks —
-free accounts cannot authenticate against librespot. Set the following
-in `.env` (see `.env.example` for full notes):
+**Spotify Premium is required** — Spotify Connect doesn't work on free
+accounts. No credentials live in `.env`: the Spotify app hands
+librespot a session token when you pick the device.
 
-- `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` — Spotify Developer App
-  (shared with the Home Assistant Spotify integration). When creating
-  the app at <https://developer.spotify.com/dashboard>, the Redirect URI
-  must use HTTPS — Spotify rejects plain `http://localhost`. Use
-  `https://localhost:6680` (the URL isn't actually loaded by Mopidy,
-  Spotify just validates the scheme).
-- `SPOTIFY_USERNAME` / `SPOTIFY_PASSWORD` — your Spotify account
-  credentials (a Spotify-issued password, not Facebook/Google login)
-- `MOPIDY_AUDIO_GID` — host audio group GID so the container can access
-  `/dev/snd` (Debian 13 = 29, Arch = 996; default 29). Find yours with
-  `getent group audio | cut -d: -f3`.
-- `MOPIDY_ALSA_DEVICE` — ALSA output device. Defaults to
+Knobs in `.env` (see `.env.example` for the full notes):
+
+- `LIBRESPOT_NAME` — display name shown in the Spotify device picker
+  (default `Homeserver`).
+- `LIBRESPOT_AUDIO_GID` — host audio group GID so the container can
+  access `/dev/snd` (Debian 13 = 29, Arch = 996; default 29). Find
+  yours with `getent group audio | cut -d: -f3`.
+- `LIBRESPOT_ALSA_DEVICE` — ALSA output device. Defaults to
   `plughw:CARD=USB,DEV=0`, which targets the Focusrite Scarlett 2i2
   (class-compliant USB; Linux names the card `USB`). Confirm with
-  `aplay -l` on the host. If you ever swap interfaces, this is the one
-  knob to change — no rebuild needed, just `docker compose up -d mopidy`.
+  `aplay -l` on the host. If you swap interfaces, this is the only
+  knob — no rebuild needed, just `docker compose up -d librespot`.

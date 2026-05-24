@@ -135,8 +135,10 @@ The script will run through, in order:
 7. Connect Tailscale (browser auth, or pre-supplied auth key)
 8. Install NordVPN, build allowlist (LAN + Tailscale CGNAT + SSH), connect
 9. Set Tailscale hostname to `homeserver`
-10. Install Avahi → publish `music.local` over mDNS
-11. `docker compose up -d` → Home Assistant, Jellyfin, Navidrome, Mopidy/Iris,
+10. Install mDNS multicast carve-out (systemd unit that punches a hole in
+    NordVPN's kill-switch so librespot can announce Spotify Connect on
+    the LAN)
+11. `docker compose up -d` → Home Assistant, Jellyfin, Navidrome, librespot,
     Caddy, OpenClaw, Mosquitto
 
 ---
@@ -151,34 +153,46 @@ ssh <user>@<lan-ip>
 # Containers all running?
 docker compose ps
 
-# Music endpoint reachable through Caddy?
-curl -I http://music.local
+# Welcome page reachable?
+curl -I http://<lan-ip>/
 
-# Audio group GID — Mopidy needs this to access /dev/snd.
-# Should print 29 on Debian 13. If different, set MOPIDY_AUDIO_GID in .env
-# and restart mopidy: docker compose restart mopidy
+# Audio group GID — librespot needs this to access /dev/snd.
+# Should print 29 on Debian 13. If different, set LIBRESPOT_AUDIO_GID in
+# .env and restart: docker compose up -d librespot
 getent group audio | cut -d: -f3
 
 # Scarlett 2i2 visible to ALSA? Plug it in via USB first.
 # Expect a line like:
-#   card 1: USB [Scarlett 2i2 USB], device 0: USB Audio [USB Audio]
-# If the card name is not "USB", set MOPIDY_ALSA_DEVICE in .env to
-# plughw:CARD=<that-name>,DEV=0 and restart mopidy.
+#   card 2: USB [Scarlett 2i2 USB], device 0: USB Audio [USB Audio]
+# If the card name is not "USB", set LIBRESPOT_ALSA_DEVICE in .env to
+# plughw:CARD=<that-name>,DEV=0 and restart librespot.
 aplay -l | grep -i scarlett
 
 # NordVPN status — should be Connected
 nordvpn status
+
+# mDNS carve-out active? (active = it re-applied the ip rule + iptables
+# ACCEPT after the last nordvpnd start)
+systemctl is-active nordvpn-mdns-carveout.service
+
+# Spotify Connect announcement actually leaving the box on the LAN iface?
+# Restart librespot first to force re-announcement, then sniff. You
+# should see traffic between 192.168.x.22.5353 and 224.0.0.251.5353
+# carrying _spotify-connect._tcp.local. records.
+docker compose restart librespot &
+sudo tcpdump -nn -i <lan-iface> -c 10 'udp port 5353'
 ```
 
 From your laptop's browser on the same LAN:
 
-- `http://music.local` → Caddy welcome page
-- `http://music.local/iris/` (or `http://<lan-ip>:6680/iris/`) → Mopidy
+- `http://<lan-ip>/` → Caddy welcome page
 - `http://<lan-ip>:8123` → Home Assistant
 - `http://<lan-ip>:8096` → Jellyfin
 
-**Windows clients** can't resolve `.local` by default — install Bonjour Print
-Services or add `<lan-ip> music.local` to `C:\Windows\System32\drivers\etc\hosts`.
+And from the Spotify app (mobile/desktop/web) on any device logged into
+your account on the same LAN:
+
+- Device picker → **Homeserver** → press play → audio out the Scarlett.
 
 ---
 
@@ -202,17 +216,19 @@ Services or add `<lan-ip> music.local` to `C:\Windows\System32\drivers\etc\hosts
 - **Spotify catalog looks wrong.** NordVPN exit country drives Spotify's
   region. Pin it: edit `.env`, set `NORDVPN_COUNTRY=Netherlands` (or whatever),
   then `sudo nordvpn disconnect && sudo nordvpn connect`.
-- **Mopidy can't reach ALSA.** GID mismatch — see Phase 6 audio-group check.
-- **Music plays but you hear nothing.** Mopidy is hitting the wrong card
+- **librespot can't reach ALSA.** GID mismatch — see Phase 6 audio-group check.
+- **Music plays but you hear nothing.** librespot is hitting the wrong card
   (probably onboard HDA instead of the Scarlett). Run `aplay -l` on the
   host, take the card name from the Scarlett line, and set
-  `MOPIDY_ALSA_DEVICE=plughw:CARD=<name>,DEV=0` in `.env`. Restart with
-  `docker compose up -d mopidy`. Also confirm the Scarlett's front-panel
+  `LIBRESPOT_ALSA_DEVICE=plughw:CARD=<name>,DEV=0` in `.env`. Restart with
+  `docker compose up -d librespot`. Also confirm the Scarlett's front-panel
   monitor knob is up and the speakers are powered on (always check the
   physical chain first).
-- **Spotify rejects the redirect URI.** Must be `https://`, not `http://`. Use
-  `https://localhost:6680` in the Spotify Developer dashboard even though the
-  URL is never loaded.
+- **"Homeserver" doesn't appear in the Spotify device picker.** The mDNS
+  announcement isn't reaching the LAN. Most likely the NordVPN carve-out
+  isn't loaded — `systemctl is-active nordvpn-mdns-carveout.service`
+  should return `active`. If it's not, `sudo systemctl restart
+  nordvpn-mdns-carveout` re-applies the routing/iptables fix.
 - **Tailscale dies after NordVPN connect.** Allowlist missing the Tailscale
   CGNAT range. Bootstrap adds it automatically, but to fix manually:
   ```bash

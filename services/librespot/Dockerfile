@@ -33,11 +33,20 @@ ENV RUSTFLAGS="-C target-feature=-crt-static"
 #
 #   alsa-backend             — audio out through libasound to the
 #                              Focusrite Scarlett 2i2.
-#   with-libmdns             — pure-Rust zeroconf so the Spotify
-#                              app can discover the device. Picked
-#                              over with-avahi to avoid a host
-#                              avahi-daemon dependency inside the
-#                              container.
+#   with-libmdns             — pure-Rust mDNS responder so the
+#                              Spotify app on the LAN can discover
+#                              the device. We deliberately don't
+#                              run avahi-daemon on the host alongside
+#                              this: two mDNS responders racing on
+#                              UDP 5353 means neither answers
+#                              _spotify-connect._tcp queries
+#                              reliably, and avahi refused to publish
+#                              on our wlp4s0 wifi interface anyway
+#                              (operstate DORMANT trips its filter).
+#                              See bootstrap.sh — install_avahi has
+#                              been removed and a route carve-out
+#                              for multicast on the LAN interface
+#                              keeps NordVPN from swallowing it.
 #   rustls-tls-webpki-roots  — TLS for the Spotify control channel,
 #                              backed by Rust's rustls plus the
 #                              bundled webpki root certs. Picked

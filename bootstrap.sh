@@ -294,70 +294,90 @@ install_tailscale() {
     success "Tailscale service enabled and started"
 }
 
-# Install avahi (mDNS) and publish a CNAME alias for music.local so any
-# LAN client that resolves `.local` names (macOS, Linux, Android with
-# apps, Windows with Bonjour Print Services installed) can reach the
-# Caddy reverse proxy at http://music.local without editing hosts files.
+# Punch holes in NordVPN's kill-switch for mDNS multicast on the LAN
+# interface, so librespot (Spotify Connect target, see
+# services/librespot) can announce itself to the Spotify app on
+# phones / laptops on the same LAN.
 #
-# We use `avahi-publish -a -R <alias> <local-ip>` driven by a systemd
-# unit. The XML <service>-file route only publishes services, not host
-# aliases, and there's no first-class CNAME directive in avahi.service
-# files — `avahi-publish` is the documented, reliable way.
-install_avahi() {
-    info "Installing avahi-daemon for mDNS (.local resolution)..."
-    if [[ $DISTRO_FAMILY == "debian" ]]; then
-        install_packages avahi-daemon avahi-utils
-    elif [[ $DISTRO_FAMILY == "arch" ]]; then
-        install_packages avahi nss-mdns
-    fi
+# Two NordVPN layers block this by default:
+#   1. `ip rule` 32765 ("not from fwmark 0xe1f1 lookup 205") pushes
+#      anything not destined for the LAN /24 or Tailscale CGNAT into
+#      table 205 -> nordlynx tunnel. 224.0.0.0/4 isn't in the
+#      carve-outs, so mDNS multicast goes into the VPN.
+#   2. The mangle POSTROUTING chain ends in a catch-all DROP for
+#      non-allowlisted destinations on the LAN interface — even
+#      packets that escape the routing diversion get filtered.
+#
+# We install a systemd unit + script that re-applies both fixes on
+# every boot, and is also yanked along when nordvpnd restarts (so the
+# next reapply fixes the wipe). PartOf=nordvpnd.service in the unit
+# handles the latter.
+#
+# This replaces the old install_avahi() that ran avahi-daemon for a
+# `music.local` CNAME alias — avahi can't coexist with librespot's
+# built-in libmdns responder (both bind UDP 5353 and race for replies)
+# and refused to publish on our wlp4s0 wifi interface anyway. Users
+# can still reach the Caddy welcome page at http://<lan-ip>/.
+install_mdns_carveout() {
+    info "Installing mDNS multicast carve-out for NordVPN kill-switch..."
 
-    systemctl enable avahi-daemon
-    systemctl start avahi-daemon
-    success "avahi-daemon running"
+    cat > /usr/local/sbin/nordvpn-mdns-carveout <<'CARVEOUT'
+#!/usr/bin/env bash
+# Idempotent. Detects the LAN interface (default-route iface, with a
+# fallback for the case where nordlynx already owns the default
+# route), then adds an `ip rule` keeping 224.0.0.0/4 in the main
+# table and a mangle POSTROUTING ACCEPT for outbound multicast on
+# the LAN iface.
+set -euo pipefail
 
-    info "Setting up music.local CNAME alias..."
+LAN_IFACE=$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+if [ -z "$LAN_IFACE" ] || [ "$LAN_IFACE" = "nordlynx" ]; then
+    LAN_IFACE=$(ip -4 -o addr show scope global 2>/dev/null \
+        | awk '$2 != "lo" && $2 != "nordlynx" && $2 !~ /^docker/ && $2 !~ /^br-/ && $2 != "tailscale0" {print $2; exit}')
+fi
+if [ -z "$LAN_IFACE" ]; then
+    echo "nordvpn-mdns-carveout: could not detect LAN interface" >&2
+    exit 1
+fi
 
-    # Pick the host's primary LAN IP (the source IP we'd use to reach
-    # the default gateway). Falls back to first non-loopback v4 addr.
-    local host_ip
-    host_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
-    if [ -z "$host_ip" ]; then
-        host_ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
-    fi
-    if [ -z "$host_ip" ]; then
-        warn "Could not determine host LAN IP — skipping music.local alias"
-        warn "Add it later with: avahi-publish -a -R music.local <your-ip>"
-        return
-    fi
-    info "Publishing music.local -> $host_ip"
+# Pref 32761 sits just above NordVPN's tailscale/LAN carve-outs
+# (32762/32763) so it's evaluated before the catch-all at 32765
+# that diverts to table 205.
+if ! ip rule show | grep -q "to 224.0.0.0/4 lookup main"; then
+    ip rule add to 224.0.0.0/4 lookup main pref 32761
+fi
 
-    # Install a systemd unit that runs avahi-publish as a long-lived
-    # foreground process. `-a` = address record, `-R` = allow re-publishing
-    # if another responder already advertises it (e.g. on reboot).
-    cat > /etc/systemd/system/avahi-alias-music.service <<EOF
+if ! iptables -t mangle -C POSTROUTING -o "$LAN_IFACE" -d 224.0.0.0/4 \
+        -m comment --comment "mdns-multicast" -j ACCEPT 2>/dev/null; then
+    iptables -t mangle -I POSTROUTING 1 -o "$LAN_IFACE" -d 224.0.0.0/4 \
+        -m comment --comment "mdns-multicast" -j ACCEPT
+fi
+
+echo "nordvpn-mdns-carveout: applied (LAN iface: $LAN_IFACE)"
+CARVEOUT
+    chmod 0755 /usr/local/sbin/nordvpn-mdns-carveout
+
+    cat > /etc/systemd/system/nordvpn-mdns-carveout.service <<'UNIT'
 [Unit]
-Description=Publish music.local mDNS alias -> $host_ip
-After=network-online.target avahi-daemon.service
+Description=Carve mDNS multicast out of the NordVPN kill-switch
+After=nordvpnd.service network-online.target
 Wants=network-online.target
-Requires=avahi-daemon.service
+# nordvpnd is what manages the iptables rules; if it restarts, the
+# carve-out is wiped and the next start re-applies it.
+PartOf=nordvpnd.service
 
 [Service]
-Type=simple
-ExecStart=/usr/bin/avahi-publish -a -R music.local $host_ip
-Restart=on-failure
-RestartSec=5
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/nordvpn-mdns-carveout
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT
 
     systemctl daemon-reload
-    systemctl enable avahi-alias-music.service
-    systemctl restart avahi-alias-music.service
-    success "music.local published over mDNS (-> $host_ip)"
-
-    warn "Windows clients need Bonjour Print Services (or an entry in"
-    warn "C:\\Windows\\System32\\drivers\\etc\\hosts) to resolve .local names."
+    systemctl enable --now nordvpn-mdns-carveout.service
+    success "mDNS multicast carve-out installed and active"
 }
 
 # Set Tailscale hostname (requires tailscale to be logged in)
@@ -751,11 +771,17 @@ connect_tailscale() {
 # Debian-only for now (Arch users can adapt the official installer).
 #
 # Carve-outs we MUST add before connecting, or we lose the LAN/SSH/Tailscale:
-#   - The host's LAN subnet (so phones/laptops can still reach
-#     music.local, Jellyfin, Home Assistant on http://<lan-ip>:...)
+#   - The host's LAN subnet (so phones/laptops can still reach the
+#     Caddy welcome page, Jellyfin, Home Assistant on http://<lan-ip>:...)
 #   - 100.64.0.0/10 — Tailscale's CGNAT range
 #   - port 22 (defensive, in case the SSH client comes from outside the
 #     detected LAN — e.g. another tailnet device)
+#
+# Even with all that, the kill-switch still drops outbound multicast to
+# 224.0.0.0/4 (the mDNS group), which breaks Spotify Connect discovery
+# from librespot. install_mdns_carveout() (below) installs a separate
+# systemd unit that punches that hole — run it AFTER NordVPN comes up
+# so it can layer on top of nordvpnd's rules.
 install_nordvpn() {
     if [[ $DISTRO_FAMILY != "debian" ]]; then
         warn "NordVPN auto-install only supported on Debian here — skipping"
@@ -948,7 +974,6 @@ main() {
     install_ssh
     install_docker
     install_tailscale
-    install_avahi
 
     echo ""
     setup_storage_hdd
@@ -966,6 +991,7 @@ main() {
 
     echo ""
     install_nordvpn
+    install_mdns_carveout
 
     start_services
 
