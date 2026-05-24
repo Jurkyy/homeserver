@@ -73,52 +73,45 @@ services:
       - JELLYFIN_PublishedServerUrl=${JELLYFIN_URL:-http://localhost:8096}
     restart: unless-stopped
 
-  mopidy:
-    # LAN-hosted web music player (Spotify + YouTube + local library) with
-    # Iris as the browser UI. Audio plays out the host's physical 3.5mm /
-    # sound-card jack via ALSA — `/dev/snd` is passed through and the
-    # container joins the host `audio` group.
+  librespot:
+    # Spotify Connect target. The user controls playback from any
+    # Spotify app on the LAN — the container shows up in the device
+    # picker (named via LIBRESPOT_NAME) and streams audio out the
+    # Focusrite Scarlett 2i2 over ALSA.
     #
-    # Gotcha: the host `audio` GID differs between distros (Debian 13 = 29,
-    # Arch = 996). Set MOPIDY_AUDIO_GID in .env to your host's value:
+    # network_mode: host is load-bearing: Spotify Connect device
+    # discovery uses mDNS zeroconf, and multicast packets don't
+    # traverse the default Docker bridge cleanly. Sharing the host
+    # netns puts the announcements straight on the LAN.
+    #
+    # Gotcha: the host `audio` GID differs between distros (Debian 13
+    # = 29, Arch = 996). Set LIBRESPOT_AUDIO_GID in .env to whatever
     #   getent group audio | cut -d: -f3
+    # reports on the host — group_add injects that GID supplementarily
+    # so the in-container process can open /dev/snd.
     build:
-      context: ./services/mopidy
-    container_name: mopidy
-    ports:
-      - "6680:6680"
-    volumes:
-      - ./services/mopidy/config/mopidy.conf:/etc/mopidy/mopidy.conf:ro
-      # Named volume (not bind mount) for Mopidy's internal state
-      # (cache, local-library sqlite, playlists). Docker copies the
-      # image's /var/lib/mopidy ownership (mopidy:audio, UID 105) into
-      # the volume on first start, so the in-container user can actually
-      # write to it. Bind-mounting a host dir here gives a root-owned
-      # directory the mopidy user can't touch.
-      - mopidy-data:/var/lib/mopidy
-      - ${MEDIA_PATH:-/mnt/storage/media}/music:/var/lib/mopidy/media:ro
+      context: ./services/librespot
+    container_name: librespot
+    network_mode: host
     devices:
       - /dev/snd:/dev/snd
     group_add:
-      - "${MOPIDY_AUDIO_GID:-29}"
-    environment:
-      # Spotify Premium is required for Mopidy-Spotify to play tracks.
-      - SPOTIFY_USERNAME=${SPOTIFY_USERNAME:-}
-      - SPOTIFY_PASSWORD=${SPOTIFY_PASSWORD:-}
-      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
-      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
-      # ALSA output device — defaults to the Focusrite Scarlett 2i2
-      # (card name "USB" via class-compliant USB audio). Override in .env
-      # if `aplay -l` on the host shows a different card name.
-      - MOPIDY_ALSA_DEVICE=${MOPIDY_ALSA_DEVICE:-plughw:CARD=USB,DEV=0}
+      - "${LIBRESPOT_AUDIO_GID:-29}"
+    command: >
+      --name ${LIBRESPOT_NAME:-Homeserver}
+      --backend alsa
+      --device ${LIBRESPOT_ALSA_DEVICE:-plughw:CARD=USB,DEV=0}
+      --bitrate 320
+      --initial-volume 80
+      --enable-volume-normalisation
     restart: unless-stopped
 
   caddy:
     # Reverse proxy fronting the home server on :80. Pairs with the
     # host's avahi-daemon (see install_avahi() in bootstrap.sh) so
-    # `http://music.local` resolves on the LAN and routes to Mopidy/Iris.
-    # Plain HTTP only — `.local` mDNS names can't get Let's Encrypt
-    # certs, and we don't want to ship a custom CA to every client.
+    # mDNS names like `music.local` resolve on the LAN. Plain HTTP
+    # only — `.local` names can't get Let's Encrypt certs, and we
+    # don't want to ship a custom CA to every client.
     image: caddy:2-alpine
     container_name: caddy
     ports:
@@ -129,8 +122,6 @@ services:
       - ./services/caddy/welcome:/srv/welcome:ro
       - ./services/caddy/data:/data
       - ./services/caddy/config:/config
-    depends_on:
-      - mopidy
     restart: unless-stopped
 
   tailscale:
@@ -151,4 +142,3 @@ services:
 
 volumes:
   tailscale-state:
-  mopidy-data:

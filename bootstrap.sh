@@ -976,7 +976,7 @@ main() {
     echo ""
 
     info "Services:"
-    echo "  - Music (Mopidy): http://music.local        (LAN mDNS via Caddy)"
+    echo "  - Music:          Spotify app → device picker → 'Homeserver' (librespot Connect)"
     echo "  - OpenClaw:       http://localhost:18789"
     echo "  - Home Assistant: http://localhost:8123"
     echo "  - Jellyfin:       http://localhost:8096"

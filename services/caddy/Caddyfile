@@ -1,28 +1,22 @@
 # Caddy reverse proxy for the home server.
 #
-# music.local is published over mDNS by avahi on the host (see
-# install_avahi() in bootstrap.sh), so any client on the LAN that can
-# resolve `.local` names (macOS, Linux, Android with apps, Windows with
-# Bonjour Print Services installed) will reach this vhost.
-#
-# We deliberately serve plain HTTP on :80 — `.local` names cannot get a
-# public Let's Encrypt cert, and Caddy's internal CA would require every
+# Plain HTTP only on :80 — `.local` mDNS names cannot get a public
+# Let's Encrypt cert, and Caddy's internal CA would require every
 # client to trust a custom root. HTTP on the LAN is fine for now;
 # revisit if/when we add real DNS + TLS.
+#
+# Note: there's no music vhost anymore. Spotify playback is handled
+# by librespot as a Spotify Connect target (see docker-compose.yml),
+# and the user controls it from the Spotify app — no browser UI to
+# proxy. Requests to music.local fall through to the catch-all below
+# and land on the welcome page.
 {
 	# Disable the on-by-default automatic HTTPS for the whole server.
-	# We're terminating only HTTP for `.local` hosts.
 	auto_https off
 }
 
-# Primary virtual host: music.local -> Mopidy/Iris
-http://music.local {
-	encode gzip
-	reverse_proxy mopidy:6680
-}
-
-# Fallback: anything else hitting the box on :80 (bare IP, Tailscale IP,
-# homeserver.local) gets a friendly directory of what's available.
+# Catch-all on :80: bare IP, Tailscale IP, *.local names — everything
+# lands on the welcome page describing what's available on the box.
 :80 {
 	encode gzip
 	root * /srv/welcome
