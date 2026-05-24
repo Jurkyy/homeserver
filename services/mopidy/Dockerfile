@@ -37,12 +37,13 @@ RUN apt-get update \
 # --break-system-packages because Debian's system Python is PEP 668
 # externally-managed; safe to override inside a single-purpose container.
 #
-# setuptools is explicit because Python 3.13 no longer ships pkg_resources
-# implicitly, and both Mopidy-Iris and Mopidy-YouTube still `import
-# pkg_resources` (setuptools is what provides it). Without this, both
-# extensions ModuleNotFoundError on load.
+# setuptools<81 because Mopidy-Iris and Mopidy-YouTube still `import
+# pkg_resources` on load. pkg_resources was deprecated and *removed*
+# from setuptools 81 (2025-08), so an unpinned install lands on a
+# version that ModuleNotFoundErrors both extensions immediately.
+# Pin until upstream extensions migrate to importlib.metadata.
 RUN python3 -m pip install --no-cache-dir --break-system-packages \
-        setuptools \
+        'setuptools<81' \
         Mopidy \
         Mopidy-Iris \
         Mopidy-Spotify \
