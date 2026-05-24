@@ -36,7 +36,13 @@ RUN apt-get update \
 
 # --break-system-packages because Debian's system Python is PEP 668
 # externally-managed; safe to override inside a single-purpose container.
+#
+# setuptools is explicit because Python 3.13 no longer ships pkg_resources
+# implicitly, and both Mopidy-Iris and Mopidy-YouTube still `import
+# pkg_resources` (setuptools is what provides it). Without this, both
+# extensions ModuleNotFoundError on load.
 RUN python3 -m pip install --no-cache-dir --break-system-packages \
+        setuptools \
         Mopidy \
         Mopidy-Iris \
         Mopidy-Spotify \
