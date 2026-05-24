@@ -37,14 +37,18 @@ RUN apt-get update \
 # --break-system-packages because Debian's system Python is PEP 668
 # externally-managed; safe to override inside a single-purpose container.
 #
-# setuptools<81 because Mopidy-Iris and Mopidy-YouTube still `import
-# pkg_resources` on load. pkg_resources was deprecated and *removed*
-# from setuptools 81 (2025-08), so an unpinned install lands on a
-# version that ModuleNotFoundErrors both extensions immediately.
-# Pin until upstream extensions migrate to importlib.metadata.
+# Version pins, both of which we'd love to drop once upstream catches up:
+#
+#  - setuptools<81: Mopidy-Iris and Mopidy-YouTube still `import
+#    pkg_resources` on load. pkg_resources was removed from setuptools
+#    81 (2025-08), so an unpinned install ModuleNotFoundErrors both
+#    extensions immediately.
+#  - Mopidy<4: Mopidy 4 dropped `mopidy.models.serialize.ModelJSONEncoder`
+#    which Iris imports at startup. Iris (jaedb/Iris) hasn't shipped a
+#    Mopidy-4-compatible release; 3.x is the last working line.
 RUN python3 -m pip install --no-cache-dir --break-system-packages \
         'setuptools<81' \
-        Mopidy \
+        'Mopidy<4' \
         Mopidy-Iris \
         Mopidy-Spotify \
         Mopidy-Local \
