@@ -89,7 +89,13 @@ services:
       - "6680:6680"
     volumes:
       - ./services/mopidy/config/mopidy.conf:/etc/mopidy/mopidy.conf:ro
-      - ./services/mopidy/data:/var/lib/mopidy
+      # Named volume (not bind mount) for Mopidy's internal state
+      # (cache, local-library sqlite, playlists). Docker copies the
+      # image's /var/lib/mopidy ownership (mopidy:audio, UID 105) into
+      # the volume on first start, so the in-container user can actually
+      # write to it. Bind-mounting a host dir here gives a root-owned
+      # directory the mopidy user can't touch.
+      - mopidy-data:/var/lib/mopidy
       - ${MEDIA_PATH:-/mnt/storage/media}/music:/var/lib/mopidy/media:ro
     devices:
       - /dev/snd:/dev/snd
@@ -145,3 +151,4 @@ services:
 
 volumes:
   tailscale-state:
+  mopidy-data:
