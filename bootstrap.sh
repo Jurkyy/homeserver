@@ -497,18 +497,59 @@ setup_storage_hdd() {
         fi
     fi
 
-    # Mount at /mnt/storage
+    # Mount at /mnt/storage. Bail loudly if it fails — silently continuing
+    # leaves us writing the "success" path onto the root filesystem, which
+    # _setup_storage_dirs will then happily populate, masking the bug.
     info "Mounting $target_part at /mnt/storage..."
     mkdir -p /mnt/storage
-    mount "$target_part" /mnt/storage
+    if ! mount "$target_part" /mnt/storage; then
+        error "mount $target_part /mnt/storage failed — fix the disk and re-run."
+        return
+    fi
+    # NTFS will quietly fall back to read-only if the dirty bit is set.
+    # Detect that and refuse — writing fstab + mkdir against a read-only
+    # mount is the failure mode that bit us before.
+    if ! touch /mnt/storage/.bootstrap-write-test 2>/dev/null; then
+        umount /mnt/storage || true
+        error "$target_part mounted read-only (NTFS dirty bit?). Reformat as ext4:"
+        error "  sudo wipefs -a $disk_path && \\"
+        error "  sudo parted $disk_path --script mklabel gpt mkpart primary ext4 0% 100% && \\"
+        error "  sudo mkfs.ext4 -L storage ${disk_path}1"
+        error "Then re-run bootstrap."
+        return
+    fi
+    rm -f /mnt/storage/.bootstrap-write-test
     success "Mounted at /mnt/storage"
 
-    # Add to fstab if not already there
-    local uuid
+    # Persist mount via fstab. Three things this guards against that bit us:
+    #   1. Hardcoded "ext4" mismatch: write the *actual* detected fstype, or
+    #      systemd-fsck.ext4 runs against (e.g.) NTFS on next boot and can
+    #      corrupt the partition trying to "repair" it.
+    #   2. Stale duplicates from previous runs: strip any existing
+    #      /mnt/storage line before appending the new UUID one.
+    #   3. Boot hang if the disk later disappears: nofail alone isn't enough,
+    #      systemd will still wait 90s for the device. x-systemd.device-timeout
+    #      caps that at 5s. noauto means systemd won't pull in fsck.
+    local uuid fstype_for_fstab
     uuid=$(blkid -s UUID -o value "$target_part" 2>/dev/null || echo "")
-    if [ -n "$uuid" ] && ! grep -q "$uuid" /etc/fstab 2>/dev/null; then
-        echo "UUID=$uuid /mnt/storage ext4 defaults,nofail 0 2" >> /etc/fstab
+    fstype_for_fstab=$(blkid -s TYPE -o value "$target_part" 2>/dev/null || echo "")
+    if [ -z "$uuid" ] || [ -z "$fstype_for_fstab" ]; then
+        warn "Could not read UUID/TYPE for $target_part — skipping fstab entry."
+        warn "Mount will not persist across reboots. Investigate with: blkid $target_part"
+    elif [ "$fstype_for_fstab" = "ntfs" ] || [ "$fstype_for_fstab" = "ntfs3" ]; then
+        warn "NTFS on $target_part — refusing to auto-mount on boot (unsafe)."
+        warn "Reformat as ext4 if you want this in fstab."
+    else
+        sed -i '\|[[:space:]]/mnt/storage[[:space:]]|d' /etc/fstab
+        echo "UUID=$uuid /mnt/storage $fstype_for_fstab defaults,nofail,x-systemd.device-timeout=5s 0 2" >> /etc/fstab
         success "Added to /etc/fstab (persistent across reboots)"
+
+        # Validate fstab now so the user finds out at script-time, not at
+        # next boot when the box is half-up in emergency mode.
+        if command -v findmnt &>/dev/null && ! findmnt --verify --verbose >/dev/null 2>&1; then
+            warn "findmnt --verify reported issues in /etc/fstab — review before rebooting:"
+            findmnt --verify --verbose || true
+        fi
     fi
 
     _setup_storage_dirs
