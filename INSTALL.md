@@ -184,6 +184,15 @@ Services or add `<lan-ip> music.local` to `C:\Windows\System32\drivers\etc\hosts
 
 ## Common gotchas
 
+- **"<user> is not in the sudoers file."** You set a root password during
+  install — that path skips the auto-add to the `sudo` group. Fix:
+  ```bash
+  su -                              # root password from installer
+  /usr/sbin/usermod -aG sudo <user>
+  exit && exit                      # full SSH logout
+  # ssh back in, then `sudo -v` to confirm
+  ```
+  (Leaving the root password blank during install avoids this entirely.)
 - **NordVPN kills LAN access.** If clients can't reach the homeserver after
   bootstrap, the LAN allowlist auto-detection failed for an unusual subnet
   (anything other than /24 or /16). Add manually:
