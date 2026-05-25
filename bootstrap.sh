@@ -112,6 +112,93 @@ install_ssh() {
     success "SSH server installed and running"
 }
 
+# Idle power tuning — the cautious subset.
+#
+# We tried `powertop --auto-tune` and it broke the Focusrite Scarlett
+# (USB-audio class doesn't recover cleanly from autosuspend even
+# with a per-device udev exception), so the whole autotune step is
+# left off. What's here is the audio-safe subset:
+#
+#   1. snd_hda_intel.power_save=1 — auto-suspends the onboard HDA
+#      codecs (ALC1150 + GPU HDMI) after a second of silence. Does
+#      NOT touch snd_usb_audio, so Scarlett is unaffected.
+#   2. kernel.nmi_watchdog=0 — turns off the NMI watchdog timer (a
+#      hard-hang debug feature firing on every CPU at ~5Hz). Saves
+#      ~0.5–1W on this 8-thread Haswell.
+#   3. SATA ALPM med_power_with_dipm via udev — drops the SATA link
+#      to Partial/Slumber when idle. Avoiding min_power deliberately
+#      (known to drop links on some SSDs).
+#   4. Per-disk spindown via /etc/hdparm.conf — a spinning 1TB drive
+#      that nothing touches pulls ~6W. Template added; operator fills
+#      in the by-id path of each rotational drive (`ls /dev/disk/by-id/`).
+#
+# Combined effective savings on this box: ~5–8W (~€13–20/year at
+# €0.30/kWh) on top of HDD spindown. Hardware replacement (i7-4770K
+# → modern low-TDP CPU) saves far more, ~€130/year.
+install_power_tuning() {
+    info "Installing idle power tuning (HDA suspend, NMI watchdog off, SATA ALPM, disk spindown)..."
+
+    if [[ $DISTRO_FAMILY == "debian" ]]; then
+        install_packages hdparm
+    elif [[ $DISTRO_FAMILY == "arch" ]]; then
+        install_packages hdparm
+    fi
+
+    # 1. Onboard HDA codec auto-suspend. Module option, takes effect
+    # on next snd_hda_intel load (reboot or reload).
+    cat > /etc/modprobe.d/snd-hda-power.conf <<'EOF'
+# Auto-suspend the onboard HDA codecs after 1 second of silence.
+# Affects Intel ALC1150 + NVIDIA HDMI audio on the GTX 970, NOT
+# snd_usb_audio (so the Focusrite Scarlett 2i2 is unaffected).
+options snd_hda_intel power_save=1 power_save_controller=Y
+EOF
+
+    # 2. NMI watchdog off.
+    cat > /etc/sysctl.d/99-nmi-watchdog.conf <<'EOF'
+# Disable the NMI watchdog (kernel hard-hang detector firing on
+# every CPU at ~5Hz). Pure overhead on a healthy server.
+kernel.nmi_watchdog = 0
+EOF
+    sysctl -q -p /etc/sysctl.d/99-nmi-watchdog.conf
+
+    # 3. SATA ALPM via udev — fires on every scsi_host that supports
+    # it (Asmedia and similar third-party controllers will silently
+    # stay on keep_firmware_settings; that's fine).
+    cat > /etc/udev/rules.d/50-sata-alpm.rules <<'EOF'
+# Drop SATA links to Partial/Slumber when idle. med_power_with_dipm
+# is the safe aggressive setting; min_power has caused link drops
+# on some SSDs in the wild.
+ACTION=="add", SUBSYSTEM=="scsi_host", KERNEL=="host*", ATTR{link_power_management_policy}="med_power_with_dipm"
+EOF
+    udevadm control --reload-rules
+    udevadm trigger --subsystem-match=scsi_host
+
+    # 4. Per-disk spindown template — operator fills in by-id paths.
+    if ! grep -q '# >>> homeserver: idle spindown' /etc/hdparm.conf 2>/dev/null; then
+        cat >> /etc/hdparm.conf <<'EOF'
+
+# >>> homeserver: idle spindown
+# For each rotational drive that should park when idle, add a block
+# like the one below. Reference by /dev/disk/by-id/<id> (NOT /dev/sda)
+# so re-enumeration can't silently target the wrong device. Find IDs
+# with: ls /dev/disk/by-id/
+#
+# spindown_time values are in 5-second units for 1..240 (so 240 =
+# 20 min idle). See `man hdparm` for the full range.
+#
+# Example (uncomment and edit for your hardware):
+# /dev/disk/by-id/ata-WDC_WD10EZEX-00UD2A0_WD-WMC3F2216484 {
+#     spindown_time = 240
+# }
+# <<< homeserver: idle spindown
+EOF
+        info "Added spindown template to /etc/hdparm.conf — uncomment for your drives"
+    fi
+
+    success "Idle power tuning installed"
+    info "Next step: edit /etc/hdparm.conf to enable spindown for your rotational disks, then reboot (or run \`hdparm -S <value> <device>\` to apply now)"
+}
+
 # Install basic tools
 install_basic_tools() {
     info "Installing basic tools..."
@@ -323,11 +410,15 @@ install_mdns_carveout() {
 
     cat > /usr/local/sbin/nordvpn-mdns-carveout <<'CARVEOUT'
 #!/usr/bin/env bash
-# Idempotent. Detects the LAN interface (default-route iface, with a
+# Idempotent carve-outs in NordVPN's kill-switch for mDNS multicast
+# on the LAN interface — both IPv4 (224.0.0.0/4) and IPv6 (ff00::/8,
+# which covers the link-local mDNS group ff02::fb). Without these,
+# libmdns gets EPERM on every multicast send attempt.
+#
+# Detects the LAN interface as the default-route iface, with a
 # fallback for the case where nordlynx already owns the default
-# route), then adds an `ip rule` keeping 224.0.0.0/4 in the main
-# table and a mangle POSTROUTING ACCEPT for outbound multicast on
-# the LAN iface.
+# route. Then adds ip rules keeping multicast in the main table and
+# mangle POSTROUTING ACCEPTs for outbound multicast on the LAN iface.
 set -euo pipefail
 
 LAN_IFACE=$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5; exit}')
@@ -335,25 +426,28 @@ if [ -z "$LAN_IFACE" ] || [ "$LAN_IFACE" = "nordlynx" ]; then
     LAN_IFACE=$(ip -4 -o addr show scope global 2>/dev/null \
         | awk '$2 != "lo" && $2 != "nordlynx" && $2 !~ /^docker/ && $2 !~ /^br-/ && $2 != "tailscale0" {print $2; exit}')
 fi
-if [ -z "$LAN_IFACE" ]; then
-    echo "nordvpn-mdns-carveout: could not detect LAN interface" >&2
-    exit 1
-fi
+[ -n "$LAN_IFACE" ] || { echo "nordvpn-mdns-carveout: no LAN iface" >&2; exit 1; }
 
-# Pref 32761 sits just above NordVPN's tailscale/LAN carve-outs
+# IPv4. Pref 32761 sits just above NordVPN's tailscale/LAN carve-outs
 # (32762/32763) so it's evaluated before the catch-all at 32765
 # that diverts to table 205.
-if ! ip rule show | grep -q "to 224.0.0.0/4 lookup main"; then
-    ip rule add to 224.0.0.0/4 lookup main pref 32761
-fi
-
-if ! iptables -t mangle -C POSTROUTING -o "$LAN_IFACE" -d 224.0.0.0/4 \
-        -m comment --comment "mdns-multicast" -j ACCEPT 2>/dev/null; then
-    iptables -t mangle -I POSTROUTING 1 -o "$LAN_IFACE" -d 224.0.0.0/4 \
+ip rule show | grep -q "to 224.0.0.0/4 lookup main" \
+    || ip rule add to 224.0.0.0/4 lookup main pref 32761
+iptables -t mangle -C POSTROUTING -o "$LAN_IFACE" -d 224.0.0.0/4 \
+        -m comment --comment "mdns-multicast" -j ACCEPT 2>/dev/null \
+    || iptables -t mangle -I POSTROUTING 1 -o "$LAN_IFACE" -d 224.0.0.0/4 \
         -m comment --comment "mdns-multicast" -j ACCEPT
-fi
 
-echo "nordvpn-mdns-carveout: applied (LAN iface: $LAN_IFACE)"
+# IPv6. ff00::/8 is the all-multicast prefix; we accept the lot
+# rather than only ff02::fb so SSDP/etc. also flow if added later.
+ip -6 rule show 2>/dev/null | grep -q "to ff00::/8 lookup main" \
+    || ip -6 rule add to ff00::/8 lookup main pref 32761
+ip6tables -t mangle -C POSTROUTING -o "$LAN_IFACE" -d ff00::/8 \
+        -m comment --comment "mdns-multicast-v6" -j ACCEPT 2>/dev/null \
+    || ip6tables -t mangle -I POSTROUTING 1 -o "$LAN_IFACE" -d ff00::/8 \
+        -m comment --comment "mdns-multicast-v6" -j ACCEPT
+
+echo "nordvpn-mdns-carveout: applied v4+v6 on $LAN_IFACE"
 CARVEOUT
     chmod 0755 /usr/local/sbin/nordvpn-mdns-carveout
 
@@ -992,6 +1086,8 @@ main() {
     echo ""
     install_nordvpn
     install_mdns_carveout
+
+    install_power_tuning
 
     start_services
 
