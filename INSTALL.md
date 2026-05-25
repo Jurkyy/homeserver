@@ -138,8 +138,11 @@ The script will run through, in order:
 10. Install mDNS multicast carve-out (systemd unit that punches a hole in
     NordVPN's kill-switch so librespot can announce Spotify Connect on
     the LAN)
-11. `docker compose up -d` → Home Assistant, Jellyfin, Navidrome, librespot,
-    Caddy, OpenClaw, Mosquitto
+11. Install projector session (lightdm autologin, Firefox ESR + uBlock +
+    SponsorBlock policies, mediacast-host systemd --user unit, DPMS idle
+    timeout, auto-generate `MEDIACAST_TOKEN`)
+12. `docker compose up -d` → Home Assistant, Jellyfin, Navidrome, librespot,
+    Caddy, OpenClaw, Mosquitto, mediacast
 
 ---
 
@@ -193,6 +196,27 @@ And from the Spotify app (mobile/desktop/web) on any device logged into
 your account on the same LAN:
 
 - Device picker → **Homeserver** → press play → audio out the Scarlett.
+
+Projector cast — test that the mediacast pipeline reaches Firefox on
+the projector:
+
+```bash
+# Bring the projector + HDMI up by sending a real URL.
+TOKEN=$(grep ^MEDIACAST_TOKEN= ~/homeserver/.env | cut -d= -f2)
+curl -X POST http://<lan-ip>:8765/cast \
+    -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d '{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}'
+# Expect: {"status":"ok"} and the video playing on the projector
+# within ~2s. uBlock should silence the pre-roll, SponsorBlock should
+# skip the sponsor segment.
+
+# Host helper alive? (run as the bootstrap user, not root)
+systemctl --user status mediacast-host
+
+# Then set up the Android side per docs/projector-cast.md — HTTP
+# Shortcuts share-menu target that fires the same POST.
+```
 
 ---
 

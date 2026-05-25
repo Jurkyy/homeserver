@@ -43,6 +43,7 @@ That's it. One script does everything.
 | Jellyfin       | 8096  | http://localhost:8096        | Media streaming interface      |
 | Navidrome      | 4533  | http://localhost:4533        | Local music streaming          |
 | librespot      | n/a   | (Spotify app device picker)  | Spotify Connect target → Scarlett 2i2  |
+| mediacast      | 8765  | POST http://&lt;lan-ip&gt;:8765/cast | Phone → projector URL cast (Android Firefox share) |
 | Caddy (proxy)  | 80    | http://&lt;lan-ip&gt;/         | LAN welcome page                       |
 
 ## Project Structure
@@ -75,6 +76,22 @@ homeserver/
 
 - **Backup configs**: `./scripts/backup.sh`
 - **Update services**: `./scripts/update.sh` (use `--force` to force recreate)
+
+## Projector: cast URLs from your phone
+
+The host's HDMI drives a projector. The `mediacast` container exposes
+a tiny endpoint at `:8765/cast` that takes a URL + bearer token,
+wakes the projector display, and opens the URL in a pre-launched
+Firefox (with uBlock Origin + SponsorBlock) on the auto-logged-in
+Xfce session.
+
+Use case: from Android Firefox, share button → "Cast to projector" →
+the video plays on the wall. No keyboard on the projector screen
+needed for everyday casts; an attached USB keyboard/mouse covers
+streaming-site logins and other one-off clicks.
+
+Setup (Android side, ~3 min) and troubleshooting:
+[docs/projector-cast.md](docs/projector-cast.md).
 
 ## Music: Spotify Connect via librespot
 

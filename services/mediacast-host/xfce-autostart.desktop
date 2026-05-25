@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Mediacast Firefox prelaunch
+Comment=Keep a Firefox instance running so mediacast --new-tab is fast and the window is always available for cast wakes.
+Exec=firefox-esr
+Terminal=false
+X-GNOME-Autostart-enabled=true
+NoDisplay=false

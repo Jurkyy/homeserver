@@ -32,3 +32,7 @@ services/jellyfin/cache/*
 
 # macOS
 .DS_Store
+
+# Python bytecode (e.g. from syntax-check runs against mediacast services)
+__pycache__/
+*.pyc

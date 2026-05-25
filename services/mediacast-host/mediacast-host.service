@@ -1,0 +1,42 @@
+# Systemd --user unit for mediacast-host.
+#
+# Installed into ~/.config/systemd/user/ by bootstrap.sh's
+# install_projector_session(). The user has linger enabled
+# (loginctl enable-linger), so the service runs across SSH
+# disconnects and is up by the time the mediacast Docker container
+# tries to forward to it.
+#
+# DISPLAY=:0 / XAUTHORITY hard-code the single-display Xfce
+# auto-login on tty1 expected on this box. If the layout ever
+# changes (multi-head, Wayland), this is the one knob to revisit.
+#
+# EnvironmentFile carries MEDIACAST_TOKEN over from the repo .env —
+# same file the docker-compose stack reads — so both sides of the
+# pipeline agree on the secret without a second source of truth.
+
+[Unit]
+Description=mediacast host helper (X11/Firefox driver for projector cast)
+# graphical-session.target is the right thing to wait on but isn't
+# always reached by Xfce sessions under systemd-user. After= with a
+# short Restart= window covers both: if X comes up later, restarts
+# eventually succeed.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/homeserver/.env
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=%h/.Xauthority
+# python3 lives in /usr/bin on Debian 13 — no venv, stdlib only.
+ExecStart=/usr/bin/python3 %h/homeserver/services/mediacast-host/mediacast-host.py
+Restart=on-failure
+RestartSec=2s
+# Cap log noise from a wedged X session or a wedged Firefox.
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Install]
+# default.target for --user units = the user's "logged in / linger"
+# state; pairs with `loginctl enable-linger <user>`.
+WantedBy=default.target

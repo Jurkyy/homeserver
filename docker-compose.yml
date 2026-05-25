@@ -125,6 +125,32 @@ services:
       - ./services/caddy/config:/config
     restart: unless-stopped
 
+  mediacast:
+    # Phone-facing endpoint for "open this URL on the projector". The
+    # user shares a URL from Android Firefox → HTTP Shortcuts app
+    # POSTs it here with a bearer token. We forward to the host-side
+    # helper (mediacast-host.py, systemd --user unit) at port 8766,
+    # which owns the X11/Firefox side — running that from inside a
+    # container needs xauth + fonts + GL + audio passthrough and isn't
+    # worth the complexity for one tiny script.
+    #
+    # extra_hosts maps host.docker.internal to the docker bridge
+    # gateway (the host's IP on this compose network), so the
+    # container can reach the host helper without hardcoding the
+    # bridge subnet. The host helper binds 0.0.0.0; the token is the
+    # trust boundary (see services/mediacast-host/mediacast-host.py).
+    build:
+      context: ./services/mediacast
+    container_name: mediacast
+    ports:
+      - "8765:8765"
+    environment:
+      - MEDIACAST_TOKEN=${MEDIACAST_TOKEN}
+      - MEDIACAST_HOST_URL=http://host.docker.internal:8766/open
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
   tailscale:
     image: tailscale/tailscale:latest
     container_name: tailscale

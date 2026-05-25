@@ -199,6 +199,156 @@ EOF
     info "Next step: edit /etc/hdparm.conf to enable spindown for your rotational disks, then reboot (or run \`hdparm -S <value> <device>\` to apply now)"
 }
 
+# Projector / browser cast session.
+#
+# Sets up the host side of the mediacast pipeline (see
+# services/mediacast{,-host}/ and the mediacast container in
+# docker-compose.yml). End state:
+#
+#   - lightdm auto-logs the bootstrap user into Xfce on boot, so the
+#     X session on tty1 owns the projector HDMI.
+#   - Firefox ESR is installed with a system-wide Mozilla policies.json
+#     that pre-installs uBlock Origin + SponsorBlock on first launch
+#     and disables telemetry/Pocket churn.
+#   - An autostart .desktop in ~/.config/autostart/ keeps a Firefox
+#     instance running so `firefox --new-tab` from the helper is
+#     instant (no cold start while the projector wakes).
+#   - mediacast-host runs as a systemd --user unit (`loginctl
+#     enable-linger`) and listens on :8766. The mediacast container
+#     forwards the user's phone POSTs to it.
+#   - ~/.xprofile sets DPMS idle to 10 min so the HDMI output blanks
+#     when nothing's playing, and the projector's no-signal timer
+#     puts it to sleep on its own.
+#   - MEDIACAST_TOKEN auto-generated into .env if missing (the trust
+#     boundary for both hops of the cast pipeline).
+#
+# Idempotent — safe to re-run as part of a normal bootstrap.
+install_projector_session() {
+    if [ -z "$SUDO_USER" ]; then
+        warn "No SUDO_USER — skipping projector session setup"
+        return
+    fi
+
+    info "Installing projector / browser cast session..."
+
+    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local env_file="$script_dir/.env"
+    local user_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    local host_helper_dir="$script_dir/services/mediacast-host"
+
+    # 1. Packages. firefox-esr is Debian's ESR package (no snap); on
+    # Arch it's plain `firefox`. xdotool + wmctrl are window-control
+    # tools the helper calls; x11-xserver-utils ships xset for DPMS.
+    if [[ $DISTRO_FAMILY == "debian" ]]; then
+        install_packages firefox-esr xdotool wmctrl x11-xserver-utils lightdm
+    elif [[ $DISTRO_FAMILY == "arch" ]]; then
+        install_packages firefox xdotool wmctrl xorg-xset lightdm
+    fi
+
+    # 2. lightdm auto-login. The drop-in goes in conf.d/ so we don't
+    # fight the distro's main lightdm.conf.
+    mkdir -p /etc/lightdm/lightdm.conf.d
+    cat > /etc/lightdm/lightdm.conf.d/12-autologin.conf <<EOF
+# Auto-login the homeserver user into Xfce on boot so the projector
+# HDMI gets driven without anyone touching the box. Installed by
+# bootstrap.sh's install_projector_session().
+[Seat:*]
+autologin-user=$SUDO_USER
+autologin-session=xfce
+autologin-user-timeout=0
+EOF
+    # autologin requires the user to be in the `autologin` group on
+    # Debian (PAM check in /etc/pam.d/lightdm-autologin).
+    if getent group autologin >/dev/null 2>&1; then
+        usermod -aG autologin "$SUDO_USER"
+    fi
+
+    # 3. Firefox enterprise policies (uBlock + SponsorBlock + no
+    # telemetry). On Debian 13 firefox-esr reads
+    # /etc/firefox-esr/policies/policies.json; on Arch firefox reads
+    # /etc/firefox/policies/policies.json. We drop into whichever
+    # exists (or both, harmless).
+    for ff_policy_dir in /etc/firefox-esr/policies /etc/firefox/policies; do
+        if [ -d "$(dirname "$ff_policy_dir")" ]; then
+            mkdir -p "$ff_policy_dir"
+            install -m 0644 "$host_helper_dir/firefox-policies.json" "$ff_policy_dir/policies.json"
+        fi
+    done
+
+    # 4. Generate MEDIACAST_TOKEN if blank. Same token gates both the
+    # container (LAN-facing) and the host helper (re-checks on the
+    # internal hop).
+    if [ -f "$env_file" ]; then
+        local current_token=$(grep -E '^MEDIACAST_TOKEN=' "$env_file" | cut -d= -f2-)
+        if [ -z "$current_token" ]; then
+            local new_token=$(openssl rand -hex 32)
+            if grep -q '^MEDIACAST_TOKEN=' "$env_file"; then
+                sed -i "s|^MEDIACAST_TOKEN=.*|MEDIACAST_TOKEN=$new_token|" "$env_file"
+            else
+                echo "MEDIACAST_TOKEN=$new_token" >> "$env_file"
+            fi
+            success "Generated MEDIACAST_TOKEN into .env"
+        else
+            success "MEDIACAST_TOKEN already set in .env"
+        fi
+    fi
+
+    # 5. Autostart .desktop — runs at the start of every Xfce
+    # session, pre-launches Firefox so the helper's --new-tab is
+    # instant. .desktop file lives in the repo; we install a
+    # user-owned copy into ~/.config/autostart/.
+    sudo -u "$SUDO_USER" mkdir -p "$user_home/.config/autostart"
+    sudo -u "$SUDO_USER" install -m 0644 \
+        "$host_helper_dir/xfce-autostart.desktop" \
+        "$user_home/.config/autostart/mediacast-firefox.desktop"
+    # On Arch the binary is `firefox`, not `firefox-esr`. Patch the
+    # autostart file in place to match what's installed.
+    if [[ $DISTRO_FAMILY == "arch" ]]; then
+        sed -i 's|^Exec=firefox-esr$|Exec=firefox|' \
+            "$user_home/.config/autostart/mediacast-firefox.desktop"
+    fi
+
+    # 6. DPMS idle timeout via ~/.xprofile. lightdm sources this at
+    # session start; we re-apply on every login. 600s = 10 min screen
+    # blank, which trips the projector's no-signal sleep timer.
+    local xprofile="$user_home/.xprofile"
+    if ! grep -q '# >>> homeserver: mediacast DPMS' "$xprofile" 2>/dev/null; then
+        sudo -u "$SUDO_USER" tee -a "$xprofile" >/dev/null <<'EOF'
+
+# >>> homeserver: mediacast DPMS
+# Blank the HDMI output after 10 min idle. Projector auto-sleeps on
+# no signal; mediacast-host wakes it via `xset dpms force on` when a
+# URL arrives. Managed by bootstrap.sh — edit cautiously.
+xset s 600 600
+xset dpms 600 600 600
+# <<< homeserver: mediacast DPMS
+EOF
+    fi
+
+    # 7. Systemd --user unit for the host helper, plus linger so it
+    # runs across SSH disconnects (and starts on boot once the user
+    # session exists).
+    sudo -u "$SUDO_USER" mkdir -p "$user_home/.config/systemd/user"
+    sudo -u "$SUDO_USER" install -m 0644 \
+        "$host_helper_dir/mediacast-host.service" \
+        "$user_home/.config/systemd/user/mediacast-host.service"
+    if [[ $DISTRO_FAMILY == "arch" ]]; then
+        # Arch firefox binary
+        sed -i 's|^Environment=MEDIACAST_FIREFOX_BIN=.*|Environment=MEDIACAST_FIREFOX_BIN=firefox|' \
+            "$user_home/.config/systemd/user/mediacast-host.service" 2>/dev/null || true
+    fi
+    loginctl enable-linger "$SUDO_USER"
+    sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$SUDO_USER")" \
+        systemctl --user daemon-reload || true
+    sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$SUDO_USER")" \
+        systemctl --user enable --now mediacast-host.service || \
+        warn "mediacast-host enable failed — likely no user-bus yet; will start on next login"
+
+    success "Projector session installed"
+    info "First reboot will land you in auto-logged-in Xfce on the projector"
+    info "Cast endpoint: POST http://<lan-ip>:8765/cast with bearer MEDIACAST_TOKEN"
+}
+
 # Install basic tools
 install_basic_tools() {
     info "Installing basic tools..."
@@ -1089,6 +1239,8 @@ main() {
 
     install_power_tuning
 
+    install_projector_session
+
     start_services
 
     echo ""
@@ -1102,6 +1254,7 @@ main() {
     echo "  - OpenClaw:       http://localhost:18789"
     echo "  - Home Assistant: http://localhost:8123"
     echo "  - Jellyfin:       http://localhost:8096"
+    echo "  - Mediacast:      POST http://<lan-ip>:8765/cast (phone → projector)"
     echo ""
     if mountpoint -q /mnt/storage 2>/dev/null; then
         info "Storage: /mnt/storage ($(df -h /mnt/storage | tail -1 | awk '{print $2}') total, $(df -h /mnt/storage | tail -1 | awk '{print $4}') free)"
