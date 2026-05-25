@@ -101,6 +101,7 @@ services:
       --name ${LIBRESPOT_NAME:-Homeserver}
       --backend alsa
       --device ${LIBRESPOT_ALSA_DEVICE:-plughw:CARD=USB,DEV=0}
+      --zeroconf-interface ${LIBRESPOT_LAN_IP:-192.168.0.22}
       --bitrate 320
       --initial-volume 80
       --enable-volume-normalisation
