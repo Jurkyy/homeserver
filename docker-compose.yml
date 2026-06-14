@@ -174,6 +174,13 @@ services:
     container_name: mediacast
     ports:
       - "8765:8765"
+    # YouTube "Subscriptions" grid reads its channel list from this
+    # read-only mount (services/mediacast/config/yt-channels.txt). The
+    # file is bind-mounted, not baked into the image, so editing the
+    # list takes effect on the next feed refresh without a rebuild. The
+    # whole section hides itself if the file is missing/empty.
+    volumes:
+      - ./services/mediacast/config:/config:ro
     environment:
       - MEDIACAST_TOKEN=${MEDIACAST_TOKEN}
       - MEDIACAST_HOST_URL=http://host.docker.internal:8766/open

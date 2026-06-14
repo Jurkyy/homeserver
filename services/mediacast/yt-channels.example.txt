@@ -1,0 +1,21 @@
+# YouTube subscriptions for the cast portal's "Subscriptions" grid.
+#
+# Activate by creating  services/mediacast/config/yt-channels.txt
+# (that whole config/ dir is gitignored, so it stays personal). The
+# file is bind-mounted read-only into the container; edits take effect
+# on the next feed refresh, no rebuild.
+#
+# One channel per line. Easiest path: export your subs from Google
+# Takeout (takeout.google.com -> "YouTube and YouTube Music" ->
+# subscriptions) and save the resulting subscriptions.csv AS
+# config/yt-channels.txt. Its rows look like:
+#     UCxxxxxxxxxxxxxxxxxxxxxx,http://www.youtube.com/channel/UCxxxx...,Channel Title
+# and the portal pulls the UC... id out of each row automatically.
+#
+# You can also paste bare channel ids or channel URLs, one per line.
+# Inline "# ..." notes and blank lines are ignored. Channels are polled
+# over their PUBLIC RSS feed — no login, no API key, no quota.
+#
+# Examples:
+UCBJycsmduvYEL83R_U4JriQ                                   # Marques Brownlee
+https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA   # Veritasium

@@ -20,7 +20,10 @@ import asyncio
 import hmac
 import logging
 import os
+import re
+import time
 from urllib.parse import urlparse
+from xml.etree import ElementTree as ET
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -40,6 +43,23 @@ HOST_TIMEOUT = float(os.environ.get("MEDIACAST_HOST_TIMEOUT", "5.0"))
 # resolution never trips a spurious "host unreachable" in the UI. The
 # control path keeps the snappy HOST_TIMEOUT.
 CAST_TIMEOUT = float(os.environ.get("MEDIACAST_CAST_TIMEOUT", "60.0"))
+
+# YouTube subscriptions feed. Optional, like mrpflix: if the channel
+# list file is missing/empty the section hides itself and the endpoint
+# 404s. We read a newline-separated list of channels (a Google Takeout
+# subscriptions.csv works as-is — we pull the UC… id out of each row),
+# poll each channel's PUBLIC RSS feed (no account, no API key, no
+# quota), merge by publish date, and show the newest uploads as a grid.
+# Clicking a card casts the watch URL through the normal YouTube path
+# (host helper → anti-throttle proxy → mpv), so playback rides NVDEC.
+YT_CHANNELS_FILE = os.environ.get("YT_CHANNELS_FILE", "/config/yt-channels.txt")
+YT_FEED_TTL = float(os.environ.get("YT_FEED_TTL", "600"))      # cache 10 min
+YT_FEED_LIMIT = int(os.environ.get("YT_FEED_LIMIT", "48"))     # cards shown
+YT_PER_CHANNEL = int(os.environ.get("YT_PER_CHANNEL", "6"))    # recent per channel
+YT_FETCH_CONCURRENCY = int(os.environ.get("YT_FETCH_CONCURRENCY", "12"))
+_YT_UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+# A YouTube channel id: "UC" + 22 url-safe base64 chars.
+_UC_RE = re.compile(r"UC[0-9A-Za-z_-]{22}")
 
 # Jellyfin ("mrpflix") integration. Optional: if MRPFLIX_URL is unset
 # the catalog section is simply hidden and the endpoints 404. We log in
@@ -418,6 +438,113 @@ async def jellyfin_play(req: JellyfinPlayRequest, request: Request) -> dict[str,
     return {"status": "ok"}
 
 
+# ---------------------------------------------------------------------------
+# YouTube subscriptions feed (public per-channel RSS, no account/API)
+# ---------------------------------------------------------------------------
+
+_ATOM = "{http://www.w3.org/2005/Atom}"
+_YTNS = "{http://www.youtube.com/xml/schemas/2015}"
+_feed_cache: dict = {"ts": 0.0, "items": []}
+_feed_lock = asyncio.Lock()
+
+
+def _load_channel_ids() -> list[str]:
+    """Channel ids from the list file, order-preserving and de-duped.
+
+    Each non-comment line may be a bare UC… id, a Takeout CSV row
+    (Channel Id,Channel Url,Channel Title), or a channel URL — we just
+    pull the first UC… token out of the line. Handles (@name) carry no
+    UC id and are skipped (Takeout gives ids, which is the supported
+    path). Missing file → empty list → the section hides itself.
+    """
+    try:
+        with open(YT_CHANNELS_FILE, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    ids: list[str] = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        m = _UC_RE.search(ln)
+        if m and m.group(0) not in ids:
+            ids.append(m.group(0))
+    return ids
+
+
+def _parse_channel_rss(xml: str) -> list[dict]:
+    """Newest uploads from one channel's RSS as card dicts."""
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return []
+    channel = root.findtext(f"{_ATOM}title") or ""
+    out: list[dict] = []
+    for e in root.findall(f"{_ATOM}entry")[:YT_PER_CHANNEL]:
+        vid = e.findtext(f"{_YTNS}videoId")
+        if not vid:
+            continue
+        out.append({
+            "id": vid,
+            "title": e.findtext(f"{_ATOM}title") or "(untitled)",
+            "channel": channel,
+            "published": e.findtext(f"{_ATOM}published") or "",
+            # Public thumbnail CDN (https loads fine on the http portal).
+            "image": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
+            "url": f"https://www.youtube.com/watch?v={vid}",
+        })
+    return out
+
+
+async def _build_feed() -> list[dict]:
+    ids = _load_channel_ids()
+    if not ids:
+        return []
+    sem = asyncio.Semaphore(YT_FETCH_CONCURRENCY)
+
+    async def fetch(client: httpx.AsyncClient, cid: str) -> list[dict]:
+        url = f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
+        async with sem:
+            try:
+                r = await client.get(url, headers={"User-Agent": _YT_UA})
+            except httpx.HTTPError as exc:
+                logger.warning("yt rss fetch failed for %s: %s", cid, exc)
+                return []
+        return _parse_channel_rss(r.text) if r.status_code < 400 else []
+
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        results = await asyncio.gather(*(fetch(client, c) for c in ids))
+    items = [v for chan in results for v in chan]
+    # ISO-8601 timestamps share the same offset, so a plain string sort
+    # is chronological. Newest first.
+    items.sort(key=lambda v: v["published"], reverse=True)
+    return items[:YT_FEED_LIMIT]
+
+
+async def _get_feed(force: bool = False) -> list[dict]:
+    async with _feed_lock:
+        fresh = (time.time() - _feed_cache["ts"]) < YT_FEED_TTL
+        if not force and fresh and _feed_cache["items"]:
+            return _feed_cache["items"]
+        items = await _build_feed()
+        if items:  # keep the last good feed if a refresh comes back empty
+            _feed_cache["items"] = items
+            _feed_cache["ts"] = time.time()
+            return items
+        return _feed_cache["items"]
+
+
+@app.get("/ui-youtube/feed")
+async def youtube_feed(refresh: int = 0) -> dict:
+    # LAN-trust, same model as /ui-jellyfin and /ui-cast. 404 when no
+    # channel list is configured so the UI hides the whole section.
+    if not _load_channel_ids():
+        raise HTTPException(status_code=404, detail="youtube feed not configured")
+    items = await _get_feed(force=bool(refresh))
+    return {"items": items}
+
+
 _INDEX_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -477,6 +604,17 @@ _INDEX_HTML = """<!doctype html>
   .nowtitle { font-size: 1.05rem; font-weight: 600; margin: .2rem 0 .6rem;
               line-height: 1.3; word-break: break-word; }
   .nowtitle.muted { font-weight: 400; }
+  /* YouTube subscriptions grid — wider cards, 16:9 thumbnails. */
+  .ytgrid { display: grid; gap: .8rem; margin: .6rem 0 1rem;
+            grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr)); }
+  .ytcard img, .ytcard .ph { aspect-ratio: 16/9; }
+  .ytcard .t { -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical;
+               display: -webkit-box; overflow: hidden; }
+  .secbar { display: flex; align-items: center; gap: .6rem; margin-top: 2rem; }
+  .secbar h2 { margin: 0; }
+  .secbar .refresh { margin-left: auto; padding: .3rem .7rem; font-size: .85rem;
+            cursor: pointer; border: 1px solid currentColor; border-radius: .35rem;
+            background: transparent; color: inherit; }
 </style>
 </head>
 <body>
@@ -506,6 +644,14 @@ _INDEX_HTML = """<!doctype html>
   <input type="url" id="url" placeholder="https://..." required autofocus>
   <button type="submit">Cast</button>
 </form>
+
+<section id="yt-section" style="display:none">
+  <div class="secbar">
+    <h2>📺 Subscriptions</h2>
+    <button class="refresh" id="yt-refresh" type="button" title="Reload feed">↻ Refresh</button>
+  </div>
+  <div class="grid ytgrid" id="yt-grid"></div>
+</section>
 
 <section id="jf-section" style="display:none">
   <h2>🎬 mrpflix</h2>
@@ -724,6 +870,49 @@ async function jfPlay(it) {
 }
 
 jfLoad(null);  // initial top-level load (hides itself if not configured)
+
+// YouTube subscriptions feed. Newest uploads from the configured
+// channels (merged from public RSS server-side). Click a card → cast
+// the video via the same YouTube pipeline as a pasted link. The whole
+// section stays hidden if no channel list is configured (feed 404s).
+const ytSection = document.getElementById('yt-section');
+const ytGrid = document.getElementById('yt-grid');
+const ytRefresh = document.getElementById('yt-refresh');
+
+function ago(iso) {
+  const t = Date.parse(iso); if (isNaN(t)) return '';
+  const d = Math.max(0, (Date.now() - t) / 1000);
+  if (d < 3600)      return Math.floor(d / 60) + 'm ago';
+  if (d < 86400)     return Math.floor(d / 3600) + 'h ago';
+  if (d < 86400 * 7) return Math.floor(d / 86400) + 'd ago';
+  return Math.floor(d / (86400 * 7)) + 'w ago';
+}
+
+async function ytLoad(refresh) {
+  ytGrid.innerHTML = '<span class="muted">loading…</span>';
+  try {
+    const r = await fetch('/ui-youtube/feed' + (refresh ? '?refresh=1' : ''));
+    if (!r.ok) { ytSection.style.display = 'none'; return; }   // not configured
+    ytSection.style.display = '';
+    const items = (await r.json()).items || [];
+    ytGrid.innerHTML = '';
+    if (!items.length) { ytGrid.innerHTML = '<span class="muted">no recent videos</span>'; return; }
+    for (const it of items) {
+      const card = document.createElement('button');
+      card.className = 'card ytcard'; card.type = 'button';
+      const meta = [esc(it.channel || ''), ago(it.published)].filter(Boolean).join(' · ');
+      card.innerHTML =
+        '<img loading="lazy" alt="" src="' + it.image +
+        '" onerror="this.outerHTML=\\'<div class=ph>📺</div>\\'">' +
+        '<div class="t">' + esc(it.title) + '</div>' +
+        '<div class="st">' + meta + '</div>';
+      card.addEventListener('click', () => cast(it.url));
+      ytGrid.appendChild(card);
+    }
+  } catch (e) { ytSection.style.display = 'none'; }
+}
+ytRefresh.addEventListener('click', () => ytLoad(true));
+ytLoad(false);
 
 // Bookmarklet: open the UI in a new tab with ?url=<current>&auto=1.
 // This dodges mixed-content (HTTPS page → HTTP API) because the new
