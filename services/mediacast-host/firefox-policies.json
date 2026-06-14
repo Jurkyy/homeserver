@@ -9,6 +9,10 @@
       "sponsorBlocker@ajay.app": {
         "installation_mode": "force_installed",
         "install_url": "https://addons.mozilla.org/firefox/downloads/latest/sponsorblock/latest.xpi"
+      },
+      "gdpr@cavi.au.dk": {
+        "installation_mode": "force_installed",
+        "install_url": "https://addons.mozilla.org/firefox/downloads/latest/consent-o-matic/latest.xpi"
       }
     },
     "DisableTelemetry": true,
@@ -27,6 +31,17 @@
     "OverrideFirstRunPage": "",
     "OverridePostUpdatePage": "",
     "PasswordManagerEnabled": false,
-    "PromptForDownloadLocation": false
+    "PromptForDownloadLocation": false,
+    "Permissions": {
+      "Autoplay": {
+        "Default": "allow-audio-video"
+      }
+    },
+    "Preferences": {
+      "media.autoplay.default": { "Value": 0, "Status": "locked" },
+      "media.autoplay.blocking_policy": { "Value": 0, "Status": "locked" },
+      "network.dns.disableIPv6": { "Value": true, "Status": "locked" },
+      "full-screen-api.warning.timeout": { "Value": 0, "Status": "locked" }
+    }
   }
 }

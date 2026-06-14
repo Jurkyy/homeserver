@@ -119,9 +119,16 @@ install_ssh() {
 # with a per-device udev exception), so the whole autotune step is
 # left off. What's here is the audio-safe subset:
 #
-#   1. snd_hda_intel.power_save=1 — auto-suspends the onboard HDA
-#      codecs (ALC1150 + GPU HDMI) after a second of silence. Does
-#      NOT touch snd_usb_audio, so Scarlett is unaffected.
+#   1. snd_hda_intel.power_save=0 — pinned OFF. Tried =1 originally
+#      to auto-suspend the onboard HDA codecs (ALC1150 + GTX 970
+#      HDMI audio); on this box the HDMI-audio codec going to D3hot
+#      dragged the display engine with it, so after the 10-min DPMS
+#      idle the HDMI output stopped and `xset dpms force on` /
+#      `xrandr --output HDMI-1 --auto` (CRTC config failed) couldn't
+#      recover — only a full lightdm restart did. The savings were
+#      <1W; not worth losing the projector. Keeping the modprobe
+#      file in place so the kernel default doesn't silently flip
+#      back on a future snd_hda_intel change.
 #   2. kernel.nmi_watchdog=0 — turns off the NMI watchdog timer (a
 #      hard-hang debug feature firing on every CPU at ~5Hz). Saves
 #      ~0.5–1W on this 8-thread Haswell.
@@ -144,13 +151,21 @@ install_power_tuning() {
         install_packages hdparm
     fi
 
-    # 1. Onboard HDA codec auto-suspend. Module option, takes effect
-    # on next snd_hda_intel load (reboot or reload).
+    # 1. HDA codec power management — DISABLED on purpose.
+    # power_save=1 (was tried originally) auto-suspends the GTX 970's
+    # HDMI audio codec after 1s of silence; on this box that drags
+    # the display engine into a stuck state where HDMI output stops
+    # and neither `xset dpms force on` nor `xrandr --output HDMI-1
+    # --auto` (CRTC config fails) can recover it — only a full
+    # lightdm restart does. The savings were <1W; not worth the
+    # projector outage. Keep the file in place with power_save=0 so
+    # the kernel default doesn't silently flip back on a future
+    # snd_hda_intel update.
     cat > /etc/modprobe.d/snd-hda-power.conf <<'EOF'
-# Auto-suspend the onboard HDA codecs after 1 second of silence.
-# Affects Intel ALC1150 + NVIDIA HDMI audio on the GTX 970, NOT
-# snd_usb_audio (so the Focusrite Scarlett 2i2 is unaffected).
-options snd_hda_intel power_save=1 power_save_controller=Y
+# snd_hda_intel runtime power management is disabled on this box.
+# See bootstrap.sh::install_power_tuning for the projector-HDMI
+# stuck-DPMS story.
+options snd_hda_intel power_save=0
 EOF
 
     # 2. NMI watchdog off.
@@ -216,9 +231,10 @@ EOF
 #   - mediacast-host runs as a systemd --user unit (`loginctl
 #     enable-linger`) and listens on :8766. The mediacast container
 #     forwards the user's phone POSTs to it.
-#   - ~/.xprofile sets DPMS idle to 10 min so the HDMI output blanks
+#   - ~/.xprofile sets DPMS idle to 1 hour so the HDMI output blanks
 #     when nothing's playing, and the projector's no-signal timer
-#     puts it to sleep on its own.
+#     puts it to sleep on its own. light-locker is disabled so the
+#     session blanks but never locks (a lock would break casting).
 #   - MEDIACAST_TOKEN auto-generated into .env if missing (the trust
 #     boundary for both hops of the cast pipeline).
 #
@@ -239,11 +255,27 @@ install_projector_session() {
     # 1. Packages. firefox-esr is Debian's ESR package (no snap); on
     # Arch it's plain `firefox`. xdotool + wmctrl are window-control
     # tools the helper calls; x11-xserver-utils ships xset for DPMS.
+    # dbus-x11 supplies dbus-launch so `firefox-esr --new-tab URL`
+    # finds the running Firefox instance via D-Bus instead of cold-
+    # starting a parallel one and timing out. mpv is the player for
+    # video URLs (YouTube etc.) — Firefox can't reliably autoplay or
+    # fullscreen them and many videos refuse embed entirely.
     if [[ $DISTRO_FAMILY == "debian" ]]; then
-        install_packages firefox-esr xdotool wmctrl x11-xserver-utils lightdm
+        install_packages firefox-esr xdotool wmctrl x11-xserver-utils lightdm \
+                         dbus-x11 mpv pipx
     elif [[ $DISTRO_FAMILY == "arch" ]]; then
-        install_packages firefox xdotool wmctrl xorg-xset lightdm
+        install_packages firefox xdotool wmctrl xorg-xset lightdm \
+                         mpv python-pipx
     fi
+
+    # Latest yt-dlp via pipx — apt's package lags ~12 months and
+    # YouTube's anti-bot signatures iterate weekly, so the apt
+    # version dies on "Sign in to confirm you're not a bot" for most
+    # videos. pipx installs into ~/.local/bin/yt-dlp; mpv's
+    # ytdl_hook is pointed at that path explicitly by the host
+    # helper (MEDIACAST_YTDLP_BIN).
+    sudo -u "$SUDO_USER" pipx install yt-dlp 2>&1 | tail -3 || \
+        sudo -u "$SUDO_USER" pipx upgrade yt-dlp || true
 
     # 2. lightdm auto-login. The drop-in goes in conf.d/ so we don't
     # fight the distro's main lightdm.conf.
@@ -293,37 +325,62 @@ EOF
         fi
     fi
 
-    # 5. Autostart .desktop — runs at the start of every Xfce
-    # session, pre-launches Firefox so the helper's --new-tab is
-    # instant. .desktop file lives in the repo; we install a
-    # user-owned copy into ~/.config/autostart/.
-    sudo -u "$SUDO_USER" mkdir -p "$user_home/.config/autostart"
-    sudo -u "$SUDO_USER" install -m 0644 \
-        "$host_helper_dir/xfce-autostart.desktop" \
+    # 5. Firefox systemd --user unit — keeps a Firefox instance up so
+    # the helper's --new-tab is instant. Replaces an older
+    # autostart .desktop file: that only fired once at session start,
+    # so any Firefox crash (or stray pkill during debugging) left the
+    # projector dark and forced the next cast to cold-start Firefox
+    # (~10s, beyond the host helper's subprocess timeout). systemd's
+    # Restart=on-failure respawns it cleanly. Remove the legacy
+    # .desktop if present from a previous run.
+    sudo -u "$SUDO_USER" rm -f \
         "$user_home/.config/autostart/mediacast-firefox.desktop"
-    # On Arch the binary is `firefox`, not `firefox-esr`. Patch the
-    # autostart file in place to match what's installed.
+    sudo -u "$SUDO_USER" mkdir -p "$user_home/.config/systemd/user"
+    sudo -u "$SUDO_USER" install -m 0644 \
+        "$host_helper_dir/mediacast-firefox.service" \
+        "$user_home/.config/systemd/user/mediacast-firefox.service"
     if [[ $DISTRO_FAMILY == "arch" ]]; then
-        sed -i 's|^Exec=firefox-esr$|Exec=firefox|' \
-            "$user_home/.config/autostart/mediacast-firefox.desktop"
+        # Arch firefox binary
+        sed -i 's|/usr/bin/firefox-esr|/usr/bin/firefox|' \
+            "$user_home/.config/systemd/user/mediacast-firefox.service"
     fi
 
     # 6. DPMS idle timeout via ~/.xprofile. lightdm sources this at
-    # session start; we re-apply on every login. 600s = 10 min screen
-    # blank, which trips the projector's no-signal sleep timer.
+    # session start; we re-apply on every login. 3600s = 1 hour screen
+    # blank, after which the projector's no-signal sleep timer trips.
     local xprofile="$user_home/.xprofile"
     if ! grep -q '# >>> homeserver: mediacast DPMS' "$xprofile" 2>/dev/null; then
         sudo -u "$SUDO_USER" tee -a "$xprofile" >/dev/null <<'EOF'
 
 # >>> homeserver: mediacast DPMS
-# Blank the HDMI output after 10 min idle. Projector auto-sleeps on
+# Blank the HDMI output after 1 hour idle. Projector auto-sleeps on
 # no signal; mediacast-host wakes it via `xset dpms force on` when a
-# URL arrives. Managed by bootstrap.sh — edit cautiously.
-xset s 600 600
-xset dpms 600 600 600
+# URL arrives. The screen never *locks* (light-locker disabled below) so
+# a cast always wakes it without a password. Managed by bootstrap.sh.
+xset s 3600 3600
+xset dpms 3600 3600 3600
 # <<< homeserver: mediacast DPMS
 EOF
     fi
+
+    # 6b. Disable light-locker. This is an auto-login projector kiosk: a
+    # password lock is pointless and actively harmful — when the session
+    # locks, a cast plays *behind* the lock screen (invisible) and you'd
+    # have to walk to the box and type a password. lightdm pulls in
+    # light-locker and autostarts it from /etc/xdg/autostart; we shadow
+    # that with a user override marked Hidden=true so it never launches.
+    # The screen still blanks via DPMS above; it just never locks.
+    sudo -u "$SUDO_USER" mkdir -p "$user_home/.config/autostart"
+    sudo -u "$SUDO_USER" tee "$user_home/.config/autostart/light-locker.desktop" >/dev/null <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=light-locker
+Comment=Disabled by homeserver: projector box must never lock (breaks casting)
+Exec=light-locker
+Hidden=true
+X-GNOME-Autostart-enabled=false
+EOF
+    pkill -x -u "$SUDO_USER" light-locker 2>/dev/null || true
 
     # 7. Systemd --user unit for the host helper, plus linger so it
     # runs across SSH disconnects (and starts on boot once the user
@@ -340,9 +397,11 @@ EOF
     loginctl enable-linger "$SUDO_USER"
     sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$SUDO_USER")" \
         systemctl --user daemon-reload || true
-    sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$SUDO_USER")" \
-        systemctl --user enable --now mediacast-host.service || \
-        warn "mediacast-host enable failed — likely no user-bus yet; will start on next login"
+    for unit in mediacast-host.service mediacast-firefox.service; do
+        sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$SUDO_USER")" \
+            systemctl --user enable --now "$unit" || \
+            warn "$unit enable failed — likely no user-bus yet; will start on next login"
+    done
 
     success "Projector session installed"
     info "First reboot will land you in auto-logged-in Xfce on the projector"
@@ -550,11 +609,13 @@ install_tailscale() {
 # next reapply fixes the wipe). PartOf=nordvpnd.service in the unit
 # handles the latter.
 #
-# This replaces the old install_avahi() that ran avahi-daemon for a
-# `music.local` CNAME alias — avahi can't coexist with librespot's
-# built-in libmdns responder (both bind UDP 5353 and race for replies)
-# and refused to publish on our wlp4s0 wifi interface anyway. Users
-# can still reach the Caddy welcome page at http://<lan-ip>/.
+# avahi-daemon is back — it now owns UDP 5353 alone (librespot was
+# rebuilt with the with-avahi feature and publishes through the
+# host's avahi-daemon over D-Bus instead of running its own
+# libmdns responder). This carve-out covers avahi's outbound
+# multicast on the LAN iface; install_avahi() (below) handles
+# package + interface-pin + start. Net effect: LAN clients can
+# resolve homeserver.local without any router config.
 install_mdns_carveout() {
     info "Installing mDNS multicast carve-out for NordVPN kill-switch..."
 
@@ -622,6 +683,34 @@ UNIT
     systemctl daemon-reload
     systemctl enable --now nordvpn-mdns-carveout.service
     success "mDNS multicast carve-out installed and active"
+}
+
+# Avahi mDNS responder — publishes <hostname>.local on the LAN so
+# clients can reach http://homeserver.local/ without any router
+# config. librespot's avahi backend also publishes the Spotify
+# Connect record through this daemon (one process owning UDP 5353,
+# no race). Pinned to the LAN interface so the Docker bridges /
+# NordVPN tunnel don't end up in the announcement.
+install_avahi() {
+    info "Installing avahi-daemon..."
+    if [[ $DISTRO_FAMILY == "debian" ]]; then
+        install_packages avahi-daemon avahi-utils libnss-mdns
+    elif [[ $DISTRO_FAMILY == "arch" ]]; then
+        install_packages avahi nss-mdns
+    fi
+
+    # Default config lets avahi bind every interface — include the
+    # Docker bridges, which would announce 172.17.0.1 as the address
+    # for homeserver.local and break LAN resolution. Pin to wlp4s0.
+    if ! grep -q '^allow-interfaces=wlp4s0' /etc/avahi/avahi-daemon.conf; then
+        sed -i 's|^#\?allow-interfaces=.*|allow-interfaces=wlp4s0|' \
+            /etc/avahi/avahi-daemon.conf
+        grep -q '^allow-interfaces=' /etc/avahi/avahi-daemon.conf \
+            || echo 'allow-interfaces=wlp4s0' >> /etc/avahi/avahi-daemon.conf
+    fi
+
+    systemctl enable --now avahi-daemon
+    success "avahi-daemon enabled — http://$(hostname).local/ is now resolvable on the LAN"
 }
 
 # Set Tailscale hostname (requires tailscale to be logged in)
@@ -1236,6 +1325,7 @@ main() {
     echo ""
     install_nordvpn
     install_mdns_carveout
+    install_avahi
 
     install_power_tuning
 

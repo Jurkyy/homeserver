@@ -43,7 +43,7 @@ That's it. One script does everything.
 | Jellyfin       | 8096  | http://localhost:8096        | Media streaming interface      |
 | Navidrome      | 4533  | http://localhost:4533        | Local music streaming          |
 | librespot      | n/a   | (Spotify app device picker)  | Spotify Connect target → Scarlett 2i2  |
-| mediacast      | 8765  | POST http://&lt;lan-ip&gt;:8765/cast | Phone → projector URL cast (Android Firefox share) |
+| mediacast      | 8765  | http://homeserver.local/ | Phone/PC → projector URL cast (web UI + bookmarklet + share-menu) |
 | Caddy (proxy)  | 80    | http://&lt;lan-ip&gt;/         | LAN welcome page                       |
 
 ## Project Structure
@@ -79,19 +79,27 @@ homeserver/
 
 ## Projector: cast URLs from your phone
 
-The host's HDMI drives a projector. The `mediacast` container exposes
-a tiny endpoint at `:8765/cast` that takes a URL + bearer token,
-wakes the projector display, and opens the URL in a pre-launched
+The host's HDMI drives a projector. The `mediacast` container wakes
+the projector display and opens any URL you give it in a pre-launched
 Firefox (with uBlock Origin + SponsorBlock) on the auto-logged-in
 Xfce session.
 
-Use case: from Android Firefox, share button → "Cast to projector" →
-the video plays on the wall. No keyboard on the projector screen
-needed for everyday casts; an attached USB keyboard/mouse covers
-streaming-site logins and other one-off clicks.
+Three ways to send a URL, all hitting the same backend:
 
-Setup (Android side, ~3 min) and troubleshooting:
-[docs/projector-cast.md](docs/projector-cast.md).
+- **Web UI**: open `http://homeserver.local/` in any browser (PC or phone,
+  Kiwi/Chrome/Safari/Firefox), paste, hit Cast. LAN-only, no login —
+  great for guests. Comes with a drag-to-bookmarks "Cast" bookmarklet
+  that posts the current tab's URL in one tap. (Resolved via mDNS by
+  avahi-daemon — every modern OS supports `.local` names without
+  extra config. The bare LAN IP works too as a fallback.)
+- **Android share menu**: install HTTP Shortcuts once, then any app's
+  share button gets a "Cast to projector" option.
+- **Scripts / WAN**: `POST :8765/cast` with a bearer token from `.env`.
+
+No keyboard on the projector screen needed for everyday casts; an
+attached USB keyboard/mouse covers streaming-site logins.
+
+Setup and troubleshooting: [docs/projector-cast.md](docs/projector-cast.md).
 
 ## Music: Spotify Connect via librespot
 

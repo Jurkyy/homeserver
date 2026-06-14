@@ -14,9 +14,12 @@ FROM rust:alpine AS builder
 # alsa-lib-dev provides the libasound headers librespot links against
 # for the --features alsa-backend code path; musl-dev + pkgconfig
 # are what the cargo build script expects to find a C compiler /
-# linker.
+# linker. avahi-dev brings libavahi-client headers for the with-dns-sd
+# feature (librespot calls into the host's avahi-daemon over the
+# unix bus instead of binding UDP 5353 itself).
 RUN apk add --no-cache \
         alsa-lib-dev \
+        avahi-dev \
         musl-dev \
         pkgconfig
 
@@ -33,20 +36,17 @@ ENV RUSTFLAGS="-C target-feature=-crt-static"
 #
 #   alsa-backend             — audio out through libasound to the
 #                              Focusrite Scarlett 2i2.
-#   with-libmdns             — pure-Rust mDNS responder so the
-#                              Spotify app on the LAN can discover
-#                              the device. We deliberately don't
-#                              run avahi-daemon on the host alongside
-#                              this: two mDNS responders racing on
-#                              UDP 5353 means neither answers
-#                              _spotify-connect._tcp queries
-#                              reliably, and avahi refused to publish
-#                              on our wlp4s0 wifi interface anyway
-#                              (operstate DORMANT trips its filter).
-#                              See bootstrap.sh — install_avahi has
-#                              been removed and a route carve-out
-#                              for multicast on the LAN interface
-#                              keeps NordVPN from swallowing it.
+#   with-avahi               — publish _spotify-connect._tcp via the
+#                              host's avahi-daemon over D-Bus instead
+#                              of librespot binding UDP 5353 itself.
+#                              Letting avahi own 5353 means we can
+#                              ALSO advertise the box's hostname.local
+#                              via mDNS so LAN clients reach
+#                              `http://homeserver.local/`. Earlier
+#                              builds used with-libmdns (pure-Rust)
+#                              and that race for 5353 forced us to
+#                              remove avahi-daemon entirely — fixed
+#                              now that one process owns the port.
 #   rustls-tls-webpki-roots  — TLS for the Spotify control channel,
 #                              backed by Rust's rustls plus the
 #                              bundled webpki root certs. Picked
@@ -64,7 +64,7 @@ ENV RUSTFLAGS="-C target-feature=-crt-static"
 RUN cargo install librespot \
         --locked \
         --no-default-features \
-        --features alsa-backend,with-libmdns,rustls-tls-webpki-roots
+        --features alsa-backend,with-avahi,rustls-tls-webpki-roots
 
 
 FROM alpine:3.20
@@ -79,11 +79,24 @@ FROM alpine:3.20
 RUN apk add --no-cache \
         alsa-lib \
         alsa-utils \
+        avahi-libs \
         ca-certificates \
+        dbus-libs \
         libgcc \
     && adduser -D -u 1000 librespot
 
 COPY --from=builder /usr/local/cargo/bin/librespot /usr/local/bin/librespot
+
+# Entrypoint wrapper keeps the OS egress path warm with a periodic
+# outbound probe so librespot's first user-triggered connect after a
+# long zeroconf-idle isn't a cold start. See entrypoint.sh for the
+# why; in short, librespot 0.8.0's reqwest client has been seen to
+# fail its first spirc init with "Service unavailable" after the
+# process has been idle, exiting and triggering a docker restart
+# that the user perceives as a hung "Connecting..." in their Spotify
+# app. The keepalive sidesteps that.
+COPY entrypoint.sh /usr/local/bin/librespot-entrypoint.sh
+RUN chmod +x /usr/local/bin/librespot-entrypoint.sh
 
 # Access to /dev/snd comes from the host audio GID injected at runtime
 # via docker-compose's group_add (default 29 on Debian). The librespot
@@ -92,4 +105,4 @@ COPY --from=builder /usr/local/cargo/bin/librespot /usr/local/bin/librespot
 # different audio GIDs.
 USER librespot
 
-ENTRYPOINT ["/usr/local/bin/librespot"]
+ENTRYPOINT ["/usr/local/bin/librespot-entrypoint.sh"]

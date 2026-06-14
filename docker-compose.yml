@@ -89,6 +89,19 @@ services:
     #   getent group audio | cut -d: -f3
     # reports on the host — group_add injects that GID supplementarily
     # so the in-container process can open /dev/snd.
+    #
+    # Entrypoint (services/librespot/entrypoint.sh) runs a 4-minute
+    # outbound TCP keepalive to apresolve.spotify.com so librespot's
+    # first user-triggered connect after long idle isn't a cold start
+    # (see entrypoint.sh for the failure mode it works around).
+    #
+    # dns: pins the container's resolvers to NordVPN's. Docker
+    # snapshots /etc/resolv.conf at container-create time; if that
+    # happens before NordVPN finishes swapping the host resolver,
+    # the container is left pointing at the LAN router (192.168.0.1)
+    # which the killswitch then blocks for UDP 53. Symptom: librespot
+    # cannot resolve Spotify endpoints, spirc init fails on first
+    # connect after a reboot, "stuck on Connecting…" in the app.
     build:
       context: ./services/librespot
     container_name: librespot
@@ -97,22 +110,40 @@ services:
       - /dev/snd:/dev/snd
     group_add:
       - "${LIBRESPOT_AUDIO_GID:-29}"
+    # avahi-daemon on the host owns UDP 5353 and the dns_sd registrar.
+    # Bind-mount its sockets so libavahi-client inside the container
+    # can publish _spotify-connect._tcp through the host daemon
+    # instead of trying to bind 5353 itself. avahi-daemon advertises
+    # the box as homeserver.local on the LAN at the same time, which
+    # is how http://homeserver.local/ resolves for LAN clients.
+    volumes:
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+      - /run/avahi-daemon/socket:/run/avahi-daemon/socket
+    dns:
+      - 103.86.96.100
+      - 103.86.99.100
+    # --zeroconf-port pins the inbound port libmdns announces. Without
+    # it the port is fresh-ephemeral on every restart, and a Spotify
+    # app that cached the previous announcement keeps trying the dead
+    # old port — the "Homeserver shows up but tapping it hangs on
+    # Connecting" symptom that survives reboots. Fixed port = stable
+    # cache.
     command: >
       --name ${LIBRESPOT_NAME:-Homeserver}
       --backend alsa
       --device ${LIBRESPOT_ALSA_DEVICE:-plughw:CARD=USB,DEV=0}
       --zeroconf-interface ${LIBRESPOT_LAN_IP:-192.168.0.22}
+      --zeroconf-port ${LIBRESPOT_ZEROCONF_PORT:-36421}
       --bitrate 320
       --initial-volume 80
       --enable-volume-normalisation
     restart: unless-stopped
 
   caddy:
-    # Reverse proxy fronting the home server on :80. Pairs with the
-    # host's avahi-daemon (see install_avahi() in bootstrap.sh) so
-    # mDNS names like `music.local` resolve on the LAN. Plain HTTP
-    # only — `.local` names can't get Let's Encrypt certs, and we
-    # don't want to ship a custom CA to every client.
+    # Reverse proxy fronting the home server on :80. The catch-all
+    # proxies everything to mediacast so `http://homeserver/` (the
+    # Tailscale hostname) lands on the cast UI. Plain HTTP only —
+    # Tailscale-MagicDNS / LAN names can't get Let's Encrypt certs.
     image: caddy:2-alpine
     container_name: caddy
     ports:
@@ -120,7 +151,6 @@ services:
       - "443:443"
     volumes:
       - ./services/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./services/caddy/welcome:/srv/welcome:ro
       - ./services/caddy/data:/data
       - ./services/caddy/config:/config
     restart: unless-stopped
@@ -147,6 +177,21 @@ services:
     environment:
       - MEDIACAST_TOKEN=${MEDIACAST_TOKEN}
       - MEDIACAST_HOST_URL=http://host.docker.internal:8766/open
+      # mrpflix (Jellyfin) catalog in the cast UI — optional. A blank
+      # MRPFLIX_URL hides the section. See .env.example.
+      - MRPFLIX_URL=${MRPFLIX_URL:-}
+      - MRPFLIX_USER=${MRPFLIX_USER:-}
+      - MRPFLIX_PASS=${MRPFLIX_PASS:-}
+    # Pin a public resolver. When NordVPN is connected on the host it
+    # rewrites the host's DNS and blocks Docker's embedded resolver from
+    # forwarding to the LAN router (192.168.0.1) — so container name
+    # lookups (e.g. jf.mrplink.com for the mrpflix catalog) fail with
+    # EAI_AGAIN even though egress through the tunnel works. Cloudflare
+    # is reachable through the tunnel and survives VPN reconnects, unlike
+    # the nordvpn allowlist which resets.
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

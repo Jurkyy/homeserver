@@ -1,24 +1,20 @@
 # Caddy reverse proxy for the home server.
 #
-# Plain HTTP only on :80 — `.local` mDNS names cannot get a public
-# Let's Encrypt cert, and Caddy's internal CA would require every
-# client to trust a custom root. HTTP on the LAN is fine for now;
-# revisit if/when we add real DNS + TLS.
+# Plain HTTP only on :80 — Tailscale-MagicDNS names (`homeserver`)
+# and any router-DHCP-published LAN names can't get a public Let's
+# Encrypt cert, and Caddy's internal CA would require every client
+# to trust a custom root. LAN + tailnet traffic only.
 #
-# Note: there's no music vhost anymore. Spotify playback is handled
-# by librespot as a Spotify Connect target (see docker-compose.yml),
-# and the user controls it from the Spotify app — no browser UI to
-# proxy. Requests to music.local fall through to the catch-all below
-# and land on the welcome page.
+# The catch-all proxies everything to the mediacast container, so
+# `http://homeserver/` and `http://<lan-ip>/` both land directly on
+# the cast UI — the box's most-used surface. Direct access on
+# :8765 is still published (HTTP Shortcuts on Android targets it,
+# and curl tests in INSTALL.md use it).
 {
-	# Disable the on-by-default automatic HTTPS for the whole server.
 	auto_https off
 }
 
-# Catch-all on :80: bare IP, Tailscale IP, *.local names — everything
-# lands on the welcome page describing what's available on the box.
 :80 {
 	encode gzip
-	root * /srv/welcome
-	file_server
+	reverse_proxy mediacast:8765
 }

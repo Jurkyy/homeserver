@@ -1,23 +1,26 @@
 # Projector / Browser Cast (mediacast)
 
-Send any URL from your Android phone's Firefox share menu and it opens
-on the projector. No keyboard on the projector screen, no Spotify-style
-"app must be the controller" — just share, watch.
+Send any URL to the projector. Three ways in, all hitting the same
+backend: web UI in any browser, a one-tap bookmarklet, or an Android
+share-menu shortcut. No keyboard on the projector — just send, watch.
 
 ## Pipeline
 
 ```
-Android Firefox  → share menu → HTTP Shortcuts  → POST :8765/cast
-                                                       │
-                                       (mediacast container, FastAPI)
-                                       checks bearer token + URL
-                                                       │
-                                            forwards to :8766/open
-                                                       │
-                                       (mediacast-host, systemd --user)
-                                       xset dpms force on  → projector wakes
-                                       firefox-esr --new-tab <url>
-                                       wmctrl -a Firefox   → raise/focus
+   web UI form  ─┐
+   bookmarklet  ─┼─→ POST :8765/ui-cast (LAN, no token)  ─┐
+                                                          │
+   HTTP Shortcuts ──→ POST :8765/cast (bearer token)    ──┤
+   curl / scripts ──→ POST :8765/cast (bearer token)    ──┤
+                                                          ▼
+                                          (mediacast container, FastAPI)
+                                                          │
+                                              forwards to :8766/open
+                                                          │
+                                          (mediacast-host, systemd --user)
+                                          xset dpms force on  → projector wakes
+                                          firefox-esr --new-tab <url>
+                                          wmctrl -a Firefox   → raise/focus
 ```
 
 The auto-logged-in Xfce session on tty1 owns the HDMI. Firefox is
@@ -25,7 +28,46 @@ pre-launched at session start (autostart .desktop) so the cast is
 instant. uBlock Origin and SponsorBlock come pre-installed via a
 system-wide Mozilla policies.json.
 
-## Phone setup (one time, ~3 min)
+## Web UI (PC, phone, guests — no setup)
+
+Open `http://homeserver.local/` in any browser. Paste a URL, hit
+**Cast**. That's the whole flow. Works on Kiwi, Chrome, Safari,
+Firefox, anything.
+
+> `homeserver.local` is published via mDNS by the host's avahi-daemon
+> (pinned to the LAN interface). Any LAN client with mDNS — modern
+> Windows, macOS, iOS, Android, Linux all qualify — resolves it
+> automatically; no router config or per-device hosts file. The plain
+> `http://homeserver/` (no `.local`) only works for devices in your
+> Tailscale tailnet via MagicDNS; for guests on the LAN, prefer the
+> `.local` form. Either way Caddy proxies port 80 to the mediacast
+> container so the `:8765` port number is no longer in the URL.
+
+This endpoint is **token-less** — the trust boundary is "you're on the
+LAN" (the page is never exposed publicly; the WAN side stays
+token-protected via `/cast`). Great for guests: stick the URL or a
+QR code near the projector and they're done.
+
+### One-tap bookmarklet
+
+The same page shows a draggable "Cast to projector" bookmarklet. On PC,
+drag it to the bookmarks bar; on mobile, save the page as a bookmark
+and edit its URL to paste the `javascript:…` code shown under "show
+bookmarklet code". Tapping it from any page POSTs the current tab's
+URL — no app needed.
+
+Why it opens a new tab instead of casting silently: HTTPS pages can't
+fetch an HTTP API directly (mixed-content block). The bookmarklet
+sidesteps that by opening the mediacast UI in a new HTTP tab, which
+then casts same-origin and shows you `✓` or the error. Close the tab
+when you're done.
+
+## Android share-menu shortcut (optional, for any browser)
+
+If you want **share button → Cast** instead of "open the UI in a tab",
+set up HTTP Shortcuts. It hooks into Android's system share menu, so
+it works from Firefox, Kiwi, Chrome, YouTube, Reddit — any app with a
+share button.
 
 1. Install **HTTP Shortcuts** — Android, F-Droid or Play Store. Free
    and open-source: <https://http-shortcuts.rmy.ch/>.
@@ -33,8 +75,10 @@ system-wide Mozilla policies.json.
 3. Fill in:
    - **Name**: `Cast to projector`
    - **Method**: `POST`
-   - **URL**: `http://<homeserver-lan-ip>:8765/cast` (or the Tailscale
-     IP if you want it to work off the home LAN too)
+   - **URL**: `http://homeserver/cast` (works on Tailscale; on a phone
+     not in the tailnet, fall back to `http://<homeserver-lan-ip>/cast`
+     or `http://<homeserver-lan-ip>:8765/cast` — Caddy proxies port 80
+     to the same endpoint)
    - **Body type** → **Custom text** → content:
      ```json
      {"url": "{{shared_text}}"}
@@ -48,9 +92,41 @@ system-wide Mozilla policies.json.
    Optional: enable a toast on success/failure.
 5. Save.
 
-Now in Firefox Android: share button (top right or in URL bar menu) →
-**Cast to projector** → URL fires at the server, projector wakes,
-video plays.
+Now in any browser: share button → **Cast to projector** → URL fires
+at the server, projector wakes, video plays.
+
+## mrpflix (Jellyfin catalog)
+
+If `MRPFLIX_URL` / `MRPFLIX_USER` / `MRPFLIX_PASS` are set in `.env`, the
+cast page grows a **🎬 mrpflix** section: a browsable poster grid of a
+Jellyfin server's library. Click a movie (or drill into a series →
+season → episode) and it plays fullscreen on the projector through the
+same mpv path as YouTube — so the existing pause / seek / stop / volume
+controls work on it too. Leave `MRPFLIX_URL` blank and the section
+simply doesn't appear.
+
+How it hangs together:
+
+- The mediacast **container** logs into Jellyfin with the configured
+  (non-admin is fine) credentials and mints a session token on demand.
+  The credentials and token **never reach the browser** — the page only
+  talks to the container's `/ui-jellyfin/*` proxy (catalog, poster
+  images, play), same LAN-trust model as `/ui-cast`.
+- On play, the container asks Jellyfin's `PlaybackInfo` for a stream
+  using a device profile that advertises **H.264 only**. Jellyfin
+  direct-streams when the source is already H.264, otherwise transcodes
+  to an H.264 HLS stream. Either way the GTX 970 hardware-decodes it
+  (NVDEC) — see `docs/`/memory on the GPU. The resolved URL is handed to
+  the host helper with `backend=mpv`, which plays it with `--no-ytdl`.
+
+Quick check from the box:
+
+```bash
+curl -s http://localhost:8765/ui-jellyfin/items | head -c 300   # catalog JSON
+```
+
+If the section is missing, confirm the three `MRPFLIX_*` vars are set
+and the container was recreated (`docker compose up -d mediacast`).
 
 ## Audio
 
@@ -88,8 +164,13 @@ curl http://localhost:8766/health                     # host helper (ssh'd in)
 
 ## Idle / wake behaviour
 
-- DPMS blanks the HDMI output after 10 min of no input (set in
+- DPMS blanks the HDMI output after 1 hour of no input (set in
   `~/.xprofile` by `install_projector_session`).
+- The session **never locks**: `light-locker` is disabled (a user
+  `~/.config/autostart/light-locker.desktop` with `Hidden=true`). On an
+  auto-login kiosk a password lock just breaks casting — when locked, a
+  cast plays behind the lock screen where you can't see it. The screen
+  still blanks for power saving; it just doesn't ask for a password.
 - Most projectors auto-sleep on no-signal after their own timeout
   (1–10 min depending on model).
 - A cast request runs `xset dpms force on` before launching Firefox,

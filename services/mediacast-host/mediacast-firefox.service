@@ -1,0 +1,42 @@
+# Systemd --user unit that keeps a Firefox ESR instance running in
+# the auto-logged-in Xfce session for the projector cast.
+#
+# Replaces the older xfce-autostart.desktop approach: the .desktop
+# file only fired once at session start, so any Firefox crash (or
+# stray pkill, looking at you, debug sessions) left the projector
+# with a black screen and the next cast had to cold-start Firefox
+# from scratch (~10s, beyond the host helper's subprocess timeout).
+# A systemd unit with Restart=on-failure respawns it automatically.
+#
+# Installed by bootstrap.sh's install_projector_session() into
+# ~/.config/systemd/user/. linger keeps it up across SSH logouts.
+
+[Unit]
+Description=Firefox ESR (projector cast browser)
+# Wait for the user's graphical session so DISPLAY is meaningful.
+# Xfce doesn't always reach graphical-session.target reliably under
+# systemd-user, so we don't hard-require it.
+After=graphical-session.target
+PartOf=graphical-session.target
+# Cap restart-loop noise if the X session itself is broken.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=%h/.Xauthority
+# Plain firefox-esr (not --kiosk) — we want a regular window the host
+# helper can `--new-tab` URLs into, then promote to fullscreen via
+# wmctrl. --kiosk would also work but hides the URL bar permanently,
+# making manual debugging painful.
+ExecStart=/usr/bin/firefox-esr
+# Restart=always so a clean SIGTERM (debug session, accidental pkill,
+# Firefox's own "quit" menu) also brings it back. With on-failure
+# only, status=0 exits would leave the projector with no browser to
+# fall back to for non-video casts.
+Restart=always
+RestartSec=3s
+
+[Install]
+WantedBy=default.target
