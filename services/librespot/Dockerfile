@@ -16,12 +16,17 @@ FROM rust:alpine AS builder
 # are what the cargo build script expects to find a C compiler /
 # linker. avahi-dev brings libavahi-client headers for the with-dns-sd
 # feature (librespot calls into the host's avahi-daemon over the
-# unix bus instead of binding UDP 5353 itself).
+# unix bus instead of binding UDP 5353 itself). pulseaudio-dev provides
+# the libpulse-simple headers + pkgconfig the pulseaudio-backend links
+# against — output now goes through the host PulseAudio server (which
+# owns the Scarlett 2i2) so it can mix with other PA streams (e.g. the
+# turntable loopback) instead of grabbing the ALSA card exclusively.
 RUN apk add --no-cache \
         alsa-lib-dev \
         avahi-dev \
         musl-dev \
-        pkgconfig
+        pkgconfig \
+        pulseaudio-dev
 
 # Rust on the musl target defaults to producing a fully static-pie
 # binary, which then expects libasound.a — but Alpine doesn't ship
@@ -30,12 +35,22 @@ RUN apk add --no-cache \
 # runtime stage).
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 
-# --no-default-features strips the pulseaudio / rodio / portaudio /
-# jackaudio backends we don't use (and the extra system deps they
-# would drag in). Then we add back the features we *do* need:
+# --no-default-features strips the rodio / portaudio / jackaudio
+# backends we don't use (and the extra system deps they would drag
+# in). Then we add back the features we *do* need:
 #
-#   alsa-backend             — audio out through libasound to the
-#                              Focusrite Scarlett 2i2.
+#   pulseaudio-backend       — audio out through libpulse to the host
+#                              PulseAudio server. This is the backend
+#                              we actually run (--backend pulseaudio in
+#                              compose): PA owns the Scarlett 2i2 and
+#                              mixes Spotify with other PA streams (the
+#                              turntable loopback) instead of the raw
+#                              ALSA card being held exclusively by one
+#                              source at a time.
+#   alsa-backend             — kept as a fallback path (audio out
+#                              through libasound directly to the card);
+#                              not used while --backend pulseaudio is
+#                              set, but cheap to retain.
 #   with-avahi               — publish _spotify-connect._tcp via the
 #                              host's avahi-daemon over D-Bus instead
 #                              of librespot binding UDP 5353 itself.
@@ -64,7 +79,7 @@ ENV RUSTFLAGS="-C target-feature=-crt-static"
 RUN cargo install librespot \
         --locked \
         --no-default-features \
-        --features alsa-backend,with-avahi,rustls-tls-webpki-roots
+        --features alsa-backend,pulseaudio-backend,with-avahi,rustls-tls-webpki-roots
 
 
 FROM alpine:3.20
@@ -76,6 +91,9 @@ FROM alpine:3.20
 # libgcc: provides libgcc_s.so.1 — Rust's panic-unwind path links
 #   against it. Without this the binary fails to load with
 #   "Error relocating ... _Unwind_*: symbol not found".
+# libpulse: runtime shared lib (libpulse-simple.so / libpulse.so) for
+#   the pulseaudio backend — the client that talks to the host's
+#   PulseAudio server over the bind-mounted unix socket.
 RUN apk add --no-cache \
         alsa-lib \
         alsa-utils \
@@ -83,6 +101,7 @@ RUN apk add --no-cache \
         ca-certificates \
         dbus-libs \
         libgcc \
+        libpulse \
     && adduser -D -u 1000 librespot
 
 COPY --from=builder /usr/local/cargo/bin/librespot /usr/local/bin/librespot

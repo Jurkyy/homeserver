@@ -77,7 +77,12 @@ services:
     # Spotify Connect target. The user controls playback from any
     # Spotify app on the LAN — the container shows up in the device
     # picker (named via LIBRESPOT_NAME) and streams audio out the
-    # Focusrite Scarlett 2i2 over ALSA.
+    # Focusrite Scarlett 2i2 via the host PulseAudio server. Using the
+    # pulseaudio backend (rather than raw ALSA) lets PulseAudio own the
+    # card and MIX Spotify with other PA streams — notably the turntable
+    # loopback (module-loopback from the USB LP codec into the same
+    # Scarlett sink) — so vinyl and Spotify can share the speakers
+    # instead of fighting over exclusive ALSA access to the card.
     #
     # network_mode: host is load-bearing: Spotify Connect device
     # discovery uses mDNS zeroconf, and multicast packets don't
@@ -95,13 +100,11 @@ services:
     # first user-triggered connect after long idle isn't a cold start
     # (see entrypoint.sh for the failure mode it works around).
     #
-    # dns: pins the container's resolvers to NordVPN's. Docker
-    # snapshots /etc/resolv.conf at container-create time; if that
-    # happens before NordVPN finishes swapping the host resolver,
-    # the container is left pointing at the LAN router (192.168.0.1)
-    # which the killswitch then blocks for UDP 53. Symptom: librespot
-    # cannot resolve Spotify endpoints, spirc init fails on first
-    # connect after a reboot, "stuck on Connecting…" in the app.
+    # No dns: override — this is network_mode: host, so it uses the host
+    # resolver (the LAN router). (It used to pin NordVPN's resolvers to
+    # survive the kill switch; NordVPN was dropped, and those resolvers
+    # are only reachable through the tunnel, so pinning them now breaks
+    # DNS.)
     build:
       context: ./services/librespot
     container_name: librespot
@@ -116,12 +119,23 @@ services:
     # instead of trying to bind 5353 itself. avahi-daemon advertises
     # the box as homeserver.local on the LAN at the same time, which
     # is how http://homeserver.local/ resolves for LAN clients.
+    #
+    # PulseAudio plumbing: bind-mount the host user's PA unix socket and
+    # auth cookie so the pulseaudio-backend client inside the container
+    # can reach the server. This is network_mode: host with no userns
+    # remap, so the container's librespot user (uid 1000) is the same
+    # uid as the host session that owns the PA daemon — PulseAudio's
+    # SO_PEERCRED same-user check auto-authenticates it, and the mounted
+    # cookie is a belt-and-suspenders fallback. PULSE_SERVER points at
+    # the mounted socket; PULSE_COOKIE at the mounted cookie.
+    environment:
+      - PULSE_SERVER=unix:/run/pulse/native
+      - PULSE_COOKIE=/run/pulse/cookie
     volumes:
       - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
       - /run/avahi-daemon/socket:/run/avahi-daemon/socket
-    dns:
-      - 103.86.96.100
-      - 103.86.99.100
+      - ${LIBRESPOT_PULSE_SOCKET:-/run/user/1000/pulse/native}:/run/pulse/native
+      - ${LIBRESPOT_PULSE_COOKIE:-/home/wolf/.config/pulse/cookie}:/run/pulse/cookie:ro
     # --zeroconf-port pins the inbound port libmdns announces. Without
     # it the port is fresh-ephemeral on every restart, and a Spotify
     # app that cached the previous announcement keeps trying the dead
@@ -130,8 +144,8 @@ services:
     # cache.
     command: >
       --name ${LIBRESPOT_NAME:-Homeserver}
-      --backend alsa
-      --device ${LIBRESPOT_ALSA_DEVICE:-plughw:CARD=USB,DEV=0}
+      --backend pulseaudio
+      --device ${LIBRESPOT_PULSE_SINK:-alsa_output.usb-Focusrite_Scarlett_2i2_USB_P5NR63K9807022-00.HiFi__Line1__sink}
       --zeroconf-interface ${LIBRESPOT_LAN_IP:-192.168.0.22}
       --zeroconf-port ${LIBRESPOT_ZEROCONF_PORT:-36421}
       --bitrate 320
@@ -189,16 +203,10 @@ services:
       - MRPFLIX_URL=${MRPFLIX_URL:-}
       - MRPFLIX_USER=${MRPFLIX_USER:-}
       - MRPFLIX_PASS=${MRPFLIX_PASS:-}
-    # Pin a public resolver. When NordVPN is connected on the host it
-    # rewrites the host's DNS and blocks Docker's embedded resolver from
-    # forwarding to the LAN router (192.168.0.1) — so container name
-    # lookups (e.g. jf.mrplink.com for the mrpflix catalog) fail with
-    # EAI_AGAIN even though egress through the tunnel works. Cloudflare
-    # is reachable through the tunnel and survives VPN reconnects, unlike
-    # the nordvpn allowlist which resets.
-    dns:
-      - 1.1.1.1
-      - 1.0.0.1
+    # No dns: override — Docker's embedded resolver forwards to the host
+    # resolver (the LAN router), which resolves jf.mrplink.com etc. fine.
+    # (Used to pin Cloudflare to dodge NordVPN breaking container DNS;
+    # NordVPN was dropped.)
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
