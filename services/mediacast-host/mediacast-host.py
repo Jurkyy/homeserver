@@ -193,7 +193,7 @@ PROXY_UA = (
 SCREENSAVER_THEMES: dict[str, tuple[str, str]] = {
     "woods": ("🌲 Woods", os.environ.get(
         "MEDIACAST_SCREENSAVER_WOODS_URL",
-        "https://www.youtube.com/watch?v=vgqQSVFch44")),
+        "https://www.youtube.com/watch?v=NveAIUhEi3M")),
     "waterfall": ("💧 Waterfall", os.environ.get(
         "MEDIACAST_SCREENSAVER_WATERFALL_URL",
         "https://www.youtube.com/watch?v=wX2L28WZwHo")),
@@ -670,6 +670,15 @@ def _playerctl(*args: str, timeout: float = 4.0) -> tuple[int, str]:
 
 CDP_PORT = int(os.environ.get("MEDIACAST_CDP_PORT", "9222"))
 CDP_BASE = f"http://127.0.0.1:{CDP_PORT}"
+# _cdp_eval opens a brand-new WebSocket connection per call. Two threads
+# doing that at once — the portal's ~1Hz status poll and
+# youtube_go_fullscreen's own ~3Hz settle-loop polling right after a cast
+# — measurably contend with each other (observed: normally ~0.1s calls
+# stretching to 1.5-2s during that overlap, which is what made the portal
+# feel like it hung right after casting). Serializing all CDP access
+# behind one lock keeps calls to one at a time instead of two connections
+# fighting over Firefox's single debugger session.
+_cdp_lock = threading.Lock()
 # Read currentTime/duration/paused + a cleaned title in one round-trip.
 _CDP_STATE_JS = (
     "(()=>{const v=document.querySelector('video');return v?"
@@ -811,92 +820,96 @@ def _cdp_eval(expr: str, timeout: float = 3.0, prefer: str | None = None):
     if not ws_url:
         return None
     s = None
-    try:
-        u = urlparse(ws_url)
-        s = _sock.create_connection((u.hostname, u.port), timeout=timeout)
-        s.settimeout(timeout)
-        key = base64.b64encode(os.urandom(16)).decode()
-        path = u.path + (("?" + u.query) if u.query else "")
-        s.sendall((
-            f"GET {path} HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\n"
-            f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
-        ).encode())
-        buf = b""
-        while b"\r\n\r\n" not in buf:
-            chunk = s.recv(1)
-            if not chunk:
+    # Serialized (see _cdp_lock) so this is always the only CDP call in
+    # flight — a status poll now waits a beat instead of racing a second
+    # connection against Firefox's debugger session.
+    with _cdp_lock:
+        try:
+            u = urlparse(ws_url)
+            s = _sock.create_connection((u.hostname, u.port), timeout=timeout)
+            s.settimeout(timeout)
+            key = base64.b64encode(os.urandom(16)).decode()
+            path = u.path + (("?" + u.query) if u.query else "")
+            s.sendall((
+                f"GET {path} HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\n"
+                f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            ).encode())
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = s.recv(1)
+                if not chunk:
+                    return None
+                buf += chunk
+            if b" 101 " not in buf.split(b"\r\n", 1)[0]:
                 return None
-            buf += chunk
-        if b" 101 " not in buf.split(b"\r\n", 1)[0]:
+
+            def send(text: str) -> None:
+                payload = text.encode()
+                mask = os.urandom(4)
+                n = len(payload)
+                hdr = bytearray([0x81])
+                if n < 126:
+                    hdr.append(0x80 | n)
+                elif n < 65536:
+                    hdr.append(0x80 | 126); hdr += _struct.pack(">H", n)
+                else:
+                    hdr.append(0x80 | 127); hdr += _struct.pack(">Q", n)
+                hdr += mask
+                s.sendall(bytes(hdr) + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+            def rx(n: int) -> bytes:
+                data = b""
+                while len(data) < n:
+                    part = s.recv(n - len(data))
+                    if not part:
+                        raise OSError("ws closed")
+                    data += part
+                return data
+
+            def recv() -> dict:
+                h = rx(2)
+                n = h[1] & 0x7f
+                if n == 126:
+                    n = _struct.unpack(">H", rx(2))[0]
+                elif n == 127:
+                    n = _struct.unpack(">Q", rx(8))[0]
+                return json.loads(rx(n).decode("utf-8", "replace"))
+
+            # Firefox CDP needs Runtime.enable to create the page's execution
+            # context before evaluate works ("context is null" otherwise). Wait
+            # for the executionContextCreated event, then evaluate in it.
+            send(json.dumps({"id": 1, "method": "Runtime.enable"}))
+            for _ in range(25):
+                msg = recv()
+                if msg.get("method") == "Runtime.executionContextCreated":
+                    break
+                if msg.get("id") == 1:
+                    # enable acked; context event should follow imminently
+                    continue
+            send(json.dumps({
+                "id": 2, "method": "Runtime.evaluate",
+                "params": {"expression": expr, "returnByValue": True, "awaitPromise": True},
+            }))
+            for _ in range(25):
+                msg = recv()
+                if msg.get("id") == 2:
+                    return (msg.get("result", {}).get("result", {}) or {}).get("value")
             return None
-
-        def send(text: str) -> None:
-            payload = text.encode()
-            mask = os.urandom(4)
-            n = len(payload)
-            hdr = bytearray([0x81])
-            if n < 126:
-                hdr.append(0x80 | n)
-            elif n < 65536:
-                hdr.append(0x80 | 126); hdr += _struct.pack(">H", n)
-            else:
-                hdr.append(0x80 | 127); hdr += _struct.pack(">Q", n)
-            hdr += mask
-            s.sendall(bytes(hdr) + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
-
-        def rx(n: int) -> bytes:
-            data = b""
-            while len(data) < n:
-                part = s.recv(n - len(data))
-                if not part:
-                    raise OSError("ws closed")
-                data += part
-            return data
-
-        def recv() -> dict:
-            h = rx(2)
-            n = h[1] & 0x7f
-            if n == 126:
-                n = _struct.unpack(">H", rx(2))[0]
-            elif n == 127:
-                n = _struct.unpack(">Q", rx(8))[0]
-            return json.loads(rx(n).decode("utf-8", "replace"))
-
-        # Firefox CDP needs Runtime.enable to create the page's execution
-        # context before evaluate works ("context is null" otherwise). Wait
-        # for the executionContextCreated event, then evaluate in it.
-        send(json.dumps({"id": 1, "method": "Runtime.enable"}))
-        for _ in range(25):
-            msg = recv()
-            if msg.get("method") == "Runtime.executionContextCreated":
-                break
-            if msg.get("id") == 1:
-                # enable acked; context event should follow imminently
-                continue
-        send(json.dumps({
-            "id": 2, "method": "Runtime.evaluate",
-            "params": {"expression": expr, "returnByValue": True, "awaitPromise": True},
-        }))
-        for _ in range(25):
-            msg = recv()
-            if msg.get("id") == 2:
-                return (msg.get("result", {}).get("result", {}) or {}).get("value")
-        return None
-    except (OSError, ValueError, KeyError, IndexError) as exc:
-        # ws_url was found (a real target existed), so this is a genuine
-        # failure mid-connection/eval — e.g. Firefox's CDP port wedged.
-        # Worth a log line: this is the quiet failure mode behind past
-        # portal hangs, where nothing else recorded that CDP had stopped
-        # answering.
-        LOG.warning("cdp eval failed (%s): %s", type(exc).__name__, exc)
-        return None
-    finally:
-        if s is not None:
-            try:
-                s.close()
-            except OSError:
-                pass
+        except (OSError, ValueError, KeyError, IndexError) as exc:
+            # ws_url was found (a real target existed), so this is a genuine
+            # failure mid-connection/eval — e.g. Firefox's CDP port wedged.
+            # Worth a log line: this is the quiet failure mode behind past
+            # portal hangs, where nothing else recorded that CDP had stopped
+            # answering.
+            LOG.warning("cdp eval failed (%s): %s", type(exc).__name__, exc)
+            return None
+        finally:
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
 
 
 def firefox_cdp_state() -> dict | None:
@@ -1189,12 +1202,24 @@ def youtube_go_fullscreen(url: str = "") -> str:
     page itself is ready in ~3s. We poll CDP — pinned to this cast's own
     tab — until the <video> has metadata (duration known), close any other
     YouTube tabs (one video, no leaked background audio), throw the window
-    fullscreen, then actively start it: press the 'k' hotkey (a real
-    gesture — YouTube ignores a JS-triggered playVideo() from an unstarted
-    state). Finally 'f' for video-fullscreen. Every step before the
-    "ready" point is gated on CDP confirming this exact tab, not just
-    "the first page found" — see mediacast-host bug notes in
-    docs/projector-cast.md for why that matters.
+    fullscreen, then start playback and fullscreen the video.
+
+    Playback is driven by a direct CDP call to video.play() — no OS focus
+    or keystroke involved at all, so it can't land on the wrong tab.
+    Works because Firefox's enterprise Autoplay permission (see
+    firefox-policies.json) allows programmatic play with no real gesture
+    required. Video-fullscreen still needs the 'f' keystroke, though:
+    verified empirically that Firefox's Fullscreen API rejects a
+    CDP-triggered requestFullscreen() ("Fullscreen request denied") with
+    no prior real input event, and Firefox's CDP doesn't implement
+    Input.dispatchKeyEvent to synthesize one scoped to a specific tab
+    (confirmed — the command just times out, unanswered). So 'f' is a
+    real X11 keystroke via _firefox_key, same OS-focus caveat as before —
+    but by this point in the function every other stale tab has already
+    been closed and CDP has confirmed *this* tab is the ready one, so the
+    window this lands on should always be correct in practice. See
+    docs/projector-cast.md for the "wrong video played" bug history this
+    is all mitigating.
     """
     vid = _yt_video_id(url)
     deadline = time.time() + YT_FULLSCREEN_WAIT
@@ -1246,19 +1271,26 @@ def youtube_go_fullscreen(url: str = "") -> str:
                          "return p&&p.getPlayerState?p.getPlayerState():null})()",
                          prefer=vid)
 
-    # 1) Ensure playing. YouTube usually won't autoplay and ignores the
-    # API playVideo() from an unstarted state, so press the 'k' hotkey
-    # (a real gesture) until the player reports playing(1)/buffering(3).
+    # 1) Ensure playing: call video.play() directly in the target tab
+    # until the player reports playing(1)/buffering(3). No OS focus or
+    # window activation involved — this can't hit the wrong tab.
     for _ in range(8):
         if player_state() in (1, 3):
             break
-        focus_firefox()
-        time.sleep(0.15)
-        _firefox_key("k")
-        time.sleep(0.6)
-    # 2) Fullscreen. Send 'f' and verify via the Fullscreen API, retrying
-    # — a single 'f' often misses if the player isn't focused yet. We only
-    # press when NOT already fullscreen, so we never toggle back out.
+        _cdp_eval(
+            "(()=>{const v=document.querySelector('video');"
+            "if(v)v.play().catch(()=>{});return null})()",
+            prefer=vid,
+        )
+        time.sleep(0.5)
+    # 2) Fullscreen. A CDP-triggered requestFullscreen() is rejected with
+    # no prior real input event (verified — see the docstring), so this
+    # still needs the 'f' keystroke (a real gesture). By this point every
+    # stale tab is already closed and CDP has confirmed *this* tab is the
+    # ready one, so OS focus should reliably be on the right window.
+    # Retried since a single 'f' often misses if the player isn't focused
+    # yet; only sent while NOT already fullscreen, so it never toggles
+    # back out.
     fs = False
     for _ in range(5):
         if _cdp_eval("!!document.fullscreenElement", prefer=vid) is True:
