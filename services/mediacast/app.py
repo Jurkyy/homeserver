@@ -1406,10 +1406,10 @@ setInterval(ssRefresh, 5000);  // picks up the idle-triggered auto-start too
 // trust boundary every other action already relies on.
 document.getElementById('poweroff-btn').addEventListener('click', async () => {
   const sure = confirm(
-    'Power off the WHOLE home server?\n\n' +
+    'Power off the WHOLE home server?\\n\\n' +
     'This shuts down everything on the box — Jellyfin, Home Assistant, ' +
     'music, this portal, all of it — not just the projector. It can ' +
-    'only be turned back on by physically pressing the power button.\n\n' +
+    'only be turned back on by physically pressing the power button.\\n\\n' +
     'Continue?'
   );
   if (!sure) return;
