@@ -154,10 +154,12 @@ services:
     restart: unless-stopped
 
   caddy:
-    # Reverse proxy fronting the home server on :80. The catch-all
+    # Reverse proxy fronting the home server. The catch-all on :80
     # proxies everything to mediacast so `http://homeserver/` (the
-    # Tailscale hostname) lands on the cast UI. Plain HTTP only —
-    # Tailscale-MagicDNS / LAN names can't get Let's Encrypt certs.
+    # Tailscale hostname) and `http://<lan-ip>/` land on the cast UI.
+    # https://home is also served, using Caddy's internal CA (see
+    # services/caddy/Caddyfile and docs/https-home-setup.md) — no
+    # public CA can be issued for a bare name with no dot/TLD.
     image: caddy:2-alpine
     container_name: caddy
     ports:
@@ -167,6 +169,7 @@ services:
       - ./services/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./services/caddy/data:/data
       - ./services/caddy/config:/config
+      - ./services/caddy/ca:/ca:ro
     restart: unless-stopped
 
   mediacast:

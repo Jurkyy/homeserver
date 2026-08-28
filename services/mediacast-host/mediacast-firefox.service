@@ -30,7 +30,15 @@ Environment=XAUTHORITY=%h/.Xauthority
 # helper can `--new-tab` URLs into, then promote to fullscreen via
 # wmctrl. --kiosk would also work but hides the URL bar permanently,
 # making manual debugging painful.
-ExecStart=/usr/bin/firefox-esr
+#
+# --remote-debugging-port exposes the CDP endpoint (loopback only via
+# --remote-allow-hosts=localhost) the host helper uses to read the
+# YouTube player's currentTime/duration and to seek — Firefox publishes
+# no usable MPRIS position for YouTube, so CDP is what drives the portal
+# scrub bar. CDP is gated on by remote.active-protocols=3 in the profile
+# user.js (FF140 defaults to BiDi-only). The token-gated portal is the
+# only local client; same trust model as mpv's IPC socket.
+ExecStart=/usr/bin/firefox-esr --remote-debugging-port=9222 --remote-allow-hosts=localhost
 # Restart=always so a clean SIGTERM (debug session, accidental pkill,
 # Firefox's own "quit" menu) also brings it back. With on-failure
 # only, status=0 exits would leave the projector with no browser to

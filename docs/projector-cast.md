@@ -180,17 +180,115 @@ curl http://localhost:8766/health                     # host helper (ssh'd in)
   to the wake path (or use a Pulse-Eight USB-CEC adapter — see
   `docs/smart-home-hardware-guide.md`).
 
+## Screensaver
+
+The bottom of the portal page has a screensaver picker (🌲 Woods, 💧
+Waterfall, 🔥 Fire by default) and a "⏻ Screen off" button.
+
+- Picking a theme casts a long (8–12h) looping ambient video through the
+  normal cast pipeline — it shows up in "Now playing" with the usual
+  pause/seek/stop controls, same as any other cast.
+- "Screen off" stops whatever's playing and blanks the display (`xset
+  dpms force off`). It turns back on the moment anything is cast — a
+  link, a screensaver theme, a Jellyfin title — since that already wakes
+  the display (see *Idle / wake behaviour* above).
+- If nothing's been actively playing for `MEDIACAST_SCREENSAVER_IDLE_TIMEOUT`
+  (default 15 min), the default theme starts on its own — this runs as a
+  background watchdog on the **host helper**, not the portal page, so it
+  fires whether or not anyone has the portal open. It never overrides an
+  explicit "Screen off".
+- All of this is configurable (idle timeout, default theme, the three
+  theme URLs — any http(s) URL the normal cast path can play, not just
+  YouTube) via `MEDIACAST_SCREENSAVER_*` in `.env` — see `.env.example`.
+  Nothing needs to be set for the defaults to work.
+- State (which theme's showing / screen-off) lives entirely on the host
+  helper (`GET /state` on :8766, proxied through the container as
+  `/ui-screensaver-state`) — restarting the container doesn't lose it,
+  restarting `mediacast-host` does (resets to "nothing showing").
+
 ## Troubleshooting
 
 | Symptom | Check |
 |---|---|
 | `401 bad token` | The bearer header doesn't match `MEDIACAST_TOKEN` in `.env`. Re-copy from `grep ^MEDIACAST_TOKEN ~/homeserver/.env`. |
 | `502 host helper unreachable` | Host helper isn't running. `systemctl --user status mediacast-host` (as the bootstrap user). Check logs: `journalctl --user -u mediacast-host -e`. |
+| Container-side cast/feed/Jellyfin activity | `docker compose logs -f mediacast`. Needs a rebuild if your container predates the `logging.basicConfig` fix in `app.py` — before that, `logger.info()` calls (cast requests, feed refreshes, Jellyfin auth) were silently dropped and only bare WARNINGs reached the log. |
+| Cast plays a different YouTube video than the one sent, within seconds of casting | Was a real bug, now fixed. `stop_active_playback()` closes the previous cast's tab before each new one — but guards against closing the *last remaining* tab (closing Firefox's only tab kills the window). In the common one-tab steady state that guard kept the old tab alive; it just got paused. Left alone between casts, that old tab could autoplay ("Up Next") to something unrelated while sitting there paused. The next cast opened a second tab for the new video, but the old code threw the browser fullscreen *immediately* after firing `--new-tab`, before confirming Firefox had switched to the new tab — so the 'k'/'f' keystrokes could land on the still-visible old tab, unpausing and fullscreening whatever it had autoplayed to instead of the cast. Fixed: the old tab is now closed the moment the new one appears in Firefox's tab list (before its content even loads), and the window fullscreen + all playback keystrokes are deferred until CDP confirms the *new* tab specifically has a ready player. If it recurs, check `journalctl --user -u mediacast-host -e \| grep youtube_go_fullscreen` for a `never became ready` warning. |
+| Portal hangs/unresponsive for a while, recovers after a page reload | Check `journalctl --user -u mediacast-host -e \| grep "status poll slow"` — a wedged Firefox CDP connection (`--remote-debugging-port=9222`) is the leading suspect; each 1s status poll can then block, and piled-up threads used to also stall a clean restart (fixed via `daemon_threads`). `curl -s http://127.0.0.1:9222/json/version` should answer fast if CDP is healthy. |
 | `502 firefox failed` | Firefox isn't running or the binary path is wrong. Verify `pgrep -a firefox-esr` returns something. If not, the autostart .desktop didn't fire — log in graphically once to bootstrap it. |
 | Cast says OK, projector stays dark | The DPMS wake worked but the projector lost signal sync. Confirm with `xset q` (should show `Monitor is On`). If yes, it's the projector — check its no-signal timer and HDMI cable. |
+| YouTube cast opens but shows "Sign in to confirm you're not a bot" | The projector's Firefox ESR isn't logged into a YouTube account (its session is what clears the wall — this IP is flagged). Sign in once (see *YouTube — browser playback + login*). |
+| YouTube plays but stutters at 1080p60 | enhanced-h264ify isn't active, so YouTube is serving VP9/AV1 (software-decoded on the GTX 970). Check `ls ~/.mozilla/firefox/*.default-esr/extensions/ \| grep 9a41dee2` and that it's enabled; re-run bootstrap to re-seed. |
+| YouTube scrub bar missing / seek broken | The CDP endpoint is down — check `curl -s http://127.0.0.1:9222/json/version`. Needs `--remote-debugging-port=9222` in `mediacast-firefox.service` **and** `remote.active-protocols=3` in the profile `user.js` (FF140 is BiDi-only by default). Without CDP it falls back to MPRIS pause + keystroke seek (no scrub bar). |
+| YouTube pause/now-playing don't work at all | Even the MPRIS fallback is down. Verify `playerctl -p firefox status` returns `Playing`/`Paused`; "No players found" means playback never started (bot wall / autoplay blocked). |
+| Subscriptions grid empty after login | The account scrape failed. Check `journalctl --user -u mediacast-host -e \| grep subscriptions` and test `yt-dlp --flat-playlist --cookies-from-browser firefox:$(ls -d ~/.mozilla/firefox/*.default-esr) --print "%(channel_id)s" https://www.youtube.com/feed/channels`. |
 | New tab opens but URL doesn't play | Probably a paywall/login screen. Use the attached USB keyboard/mouse to sign in once; the cookie persists in the profile. |
 | uBlock / SponsorBlock not installed | Policies are applied on first Firefox launch. If Firefox was already running when policies were installed, restart it: `pkill firefox-esr; firefox-esr &`. |
 | 8765 unreachable from LAN | NordVPN allowlist usually covers LAN already (`nordvpn allowlist`). If your LAN isn't a /24 or /16, add it manually: `sudo nordvpn allowlist add subnet 192.168.x.0/24`. |
+
+## YouTube (browser playback + login)
+
+YouTube now gates this host's IP behind *"Sign in to confirm you're not a
+bot"* — and not just for yt-dlp: the **logged-out web player hits the
+same wall** (verified on-screen). Anonymous extraction (every yt-dlp
+`player_client` — tv, web_safari, mweb) is fully refused, so the old
+mpv + yt-dlp resolve/proxy path dead-ends on a black screen.
+
+So YouTube plays in **Firefox** instead of mpv (`MEDIACAST_YOUTUBE_BACKEND`,
+default `firefox`). The always-on Firefox ESR, signed into a YouTube
+account, plays from its own session — no yt-dlp, no bot wall — and we send
+YouTube's `f` for true video fullscreen (autoplay is on via policy). Set
+`MEDIACAST_YOUTUBE_BACKEND=mpv` to revert to the resolve/proxy path (still
+present, used only if you flip it back).
+
+The GTX 970 can't hardware-decode YouTube's default VP9/AV1 (Maxwell has
+no VP9/AV1 block), so the **enhanced-h264ify** extension forces H.264,
+which decodes smoothly. It's seeded into the ESR profile by bootstrap
+(the policy's `force_installed` download proved unreliable here).
+
+**Transport.** Firefox exposes no usable MPRIS *position* for YouTube (it
+sticks at 0), so the portal reads the real `video.currentTime`/`duration`
+over **CDP** (`--remote-debugging-port=9222`, loopback) and seeks by
+setting `currentTime` — giving a live, draggable scrub bar and absolute
+seek, same as mrpflix. Each control has a fallback chain
+(`mediacast-host.py` `control_*`): **mpv** (mrpflix) → **CDP** (browser
+YouTube) → **MPRIS** `playerctl` pause / **keystroke** seek (`j`/`l`) if
+CDP is off. The status `seekable` flag tells the UI when the position is
+live (mpv or CDP) vs the frozen MPRIS fallback, so the scrub bar only
+shows when it actually tracks. Stop closes the tab (`Ctrl+W`); volume
+stays on `pactl` (system sink).
+
+**Startup, fullscreen & tab hygiene.** YouTube usually does **not**
+autoplay the watch page (it sits on the thumbnail), so a background
+thread actively starts it: once the player API (`#movie_player`) is ready
+(~3 s) it closes any other YouTube tabs (one video, no leaked background
+audio), presses the `k` hotkey until the player reports playing, then
+sends `f` and **verifies** fullscreen via the Fullscreen API, retrying if
+it didn't take. End-to-end ~5–7 s (mostly YouTube page load) instead of
+waiting ~15 s on absent autoplay. CDP is gated on by
+`remote.active-protocols=3` in the profile `user.js` (FF140 defaults to
+BiDi-only); the token-gated portal is the only local client — same trust
+model as mpv's IPC socket.
+
+**One-time login:** at the projector (USB keyboard/mouse), in the running
+Firefox ESR, open `youtube.com` and sign in. Because playback is now just
+the browser watching normally, **your own account is fine** — there's no
+yt-dlp in the playback path to risk a ban. The session persists in the
+profile; no restart needed. (The one place yt-dlp still touches the
+account is the subscriptions scrape below — a ~6-hourly page listing,
+negligible risk; disable with `YT_SUBS_FROM_ACCOUNT=0` if you prefer.)
+
+### Subscriptions feed
+
+The portal's subscriptions grid is auto-populated from the logged-in
+account: the host helper's `/yt-subscriptions` runs
+`yt-dlp --flat-playlist --cookies-from-browser …` over the account's
+subscriptions page to list channel ids, and the container renders each
+channel's **public RSS** feed (no per-poll auth). Cached ~6 h
+(`YT_SUBS_TTL`). Falls back to the static `config/yt-channels.txt` if the
+scrape fails (not logged in). Cookie source override:
+`MEDIACAST_YTDLP_COOKIES_FROM_BROWSER` (default: auto-detected
+`*.default-esr` profile).
 
 ## Security notes
 

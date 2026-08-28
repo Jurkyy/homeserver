@@ -257,15 +257,15 @@ install_projector_session() {
     # tools the helper calls; x11-xserver-utils ships xset for DPMS.
     # dbus-x11 supplies dbus-launch so `firefox-esr --new-tab URL`
     # finds the running Firefox instance via D-Bus instead of cold-
-    # starting a parallel one and timing out. mpv is the player for
-    # video URLs (YouTube etc.) — Firefox can't reliably autoplay or
-    # fullscreen them and many videos refuse embed entirely.
+    # starting a parallel one and timing out. playerctl drives Firefox
+    # YouTube transport (pause/seek/stop/status) over MPRIS. mpv is the
+    # player for Jellyfin and other non-YouTube video hosts.
     if [[ $DISTRO_FAMILY == "debian" ]]; then
         install_packages firefox-esr xdotool wmctrl x11-xserver-utils lightdm \
-                         dbus-x11 mpv pipx
+                         dbus-x11 playerctl mpv pipx
     elif [[ $DISTRO_FAMILY == "arch" ]]; then
         install_packages firefox xdotool wmctrl xorg-xset lightdm \
-                         mpv python-pipx
+                         playerctl mpv python-pipx
     fi
 
     # Latest yt-dlp via pipx — apt's package lags ~12 months and
@@ -304,6 +304,38 @@ EOF
         if [ -d "$(dirname "$ff_policy_dir")" ]; then
             mkdir -p "$ff_policy_dir"
             install -m 0644 "$host_helper_dir/firefox-policies.json" "$ff_policy_dir/policies.json"
+        fi
+    done
+
+    # 3b. enhanced-h264ify must be reliably installed: YouTube serves VP9/
+    # AV1 by default, which the GTX 970 can't hardware-decode (Maxwell has
+    # no VP9/AV1 block), so VP9 1080p60 software-decodes and stutters.
+    # h264ify forces H.264, which NVDEC/CPU handle smoothly. The policy's
+    # force_installed download proved flaky on this box (it never fetched
+    # the xpi), so we seed the signed xpi straight into each existing ESR
+    # profile and disable the sideload auto-disable so it stays enabled.
+    # First-run profiles (none yet) get it on the next bootstrap pass once
+    # Firefox has created the profile.
+    local h264_id="{9a41dee2-b924-4161-a971-7fb35c053a4a}"
+    local h264_url="https://addons.mozilla.org/firefox/downloads/latest/enhanced-h264ify/latest.xpi"
+    for prof in "$user_home"/.mozilla/firefox/*.default-esr; do
+        [ -d "$prof" ] || continue
+        sudo -u "$SUDO_USER" mkdir -p "$prof/extensions"
+        sudo -u "$SUDO_USER" curl -fsSL -o "$prof/extensions/$h264_id.xpi" "$h264_url" || \
+            warn "h264ify download failed for $prof"
+        local ujs="$prof/user.js"
+        if ! sudo -u "$SUDO_USER" grep -qs autoDisableScopes "$ujs" 2>/dev/null; then
+            sudo -u "$SUDO_USER" tee -a "$ujs" >/dev/null <<'EOF'
+// Projector kiosk: keep policy/sideload-seeded extensions (h264ify)
+// enabled without an interactive approval prompt.
+user_pref("extensions.autoDisableScopes", 0);
+user_pref("extensions.startupScanScopes", 15);
+// Re-enable CDP (FF140 defaults to BiDi-only) so the host helper can read
+// the YouTube player's currentTime/duration and seek, via the loopback
+// --remote-debugging-port set in mediacast-firefox.service. Drives the
+// portal scrub bar; Firefox exposes no usable MPRIS position for YouTube.
+user_pref("remote.active-protocols", 3);
+EOF
         fi
     done
 
@@ -713,6 +745,39 @@ install_avahi() {
     success "avahi-daemon enabled — http://$(hostname).local/ is now resolvable on the LAN"
 }
 
+# dnsmasq answers a bare "home" A record with this box's static LAN
+# IP, so http(s)://home works from every device — no per-device hosts
+# file, and no reliance on router-side custom-DNS support (consumer/
+# ISP routers, e.g. the "Three" hub this was built against, usually
+# don't have one). It forwards every other query straight to the
+# router unchanged, so normal internet DNS is untouched.
+#
+# This only takes effect once the router's DHCP is set (manually, in
+# its admin portal) to advertise this box as the LAN's DNS server —
+# see docs/https-home-setup.md.
+#
+# Pinned to wlp4s0 (+ lo), same reasoning as avahi's allow-interfaces
+# above: unpinned, dnsmasq binds every interface including the Docker
+# bridges and tailscale0.
+install_home_dns() {
+    info "Installing dnsmasq for the \"home\" LAN DNS record..."
+    install_packages dnsmasq
+
+    local conf=/etc/dnsmasq.d/home-dns.conf
+    cat > "$conf" <<EOF
+interface=lo
+interface=wlp4s0
+bind-interfaces
+no-resolv
+server=192.168.0.1
+address=/home/192.168.0.22
+EOF
+
+    systemctl enable --now dnsmasq
+    systemctl restart dnsmasq
+    success "dnsmasq enabled — \"home\" resolves to 192.168.0.22 once the router's DHCP DNS setting points here"
+}
+
 # Set Tailscale hostname (requires tailscale to be logged in)
 setup_server_hostname() {
     # Skip silently if tailscale isn't authenticated yet — connect_tailscale
@@ -1013,21 +1078,9 @@ prompt_api_keys() {
         update_env_key "TAILSCALE_AUTHKEY" "$tailscale_key"
         success "Saved"
     fi
-
-    echo ""
-    echo "  NordVPN: generate a token at"
-    echo "  https://my.nordaccount.com/dashboard/nordvpn/access-tokens/"
-    read -p "NORDVPN_TOKEN: " nordvpn_token
-    if [ -n "$nordvpn_token" ]; then
-        update_env_key "NORDVPN_TOKEN" "$nordvpn_token"
-        success "Saved"
-    fi
-
-    read -p "NORDVPN_COUNTRY (optional, e.g. Netherlands): " nordvpn_country
-    if [ -n "$nordvpn_country" ]; then
-        update_env_key "NORDVPN_COUNTRY" "$nordvpn_country"
-        success "Saved"
-    fi
+    # NordVPN token/country prompts removed — NordVPN was dropped (it
+    # caused the YouTube bot wall, broke container DNS and blocked
+    # Tailscale, and no service needs VPN'd egress).
 }
 
 # Setup shell config for the user
@@ -1323,9 +1376,14 @@ main() {
     setup_server_hostname
 
     echo ""
-    install_nordvpn
-    install_mdns_carveout
+    # NordVPN was dropped: its datacenter exit IP triggered YouTube's
+    # "confirm you're not a bot" wall, broke container DNS, and its
+    # kill-switch blocked Tailscale + LAN mDNS — none of this box's
+    # services need VPN'd egress. install_nordvpn / install_mdns_carveout
+    # (the kill-switch mDNS carve-out) are intentionally not called; the
+    # functions are kept for reference. Re-add the calls here to restore.
     install_avahi
+    install_home_dns
 
     install_power_tuning
 

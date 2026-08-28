@@ -24,6 +24,10 @@ services/*/config/*
 services/jellyfin/cache/*
 !services/jellyfin/cache/.gitkeep
 
+# Caddy runtime state — includes the internal CA's private key
+services/caddy/data/*
+!services/caddy/data/.gitkeep
+
 # Media mount references
 /mnt/media
 

@@ -1,5 +1,5 @@
 {
-  "//": "Mozilla enterprise policy applied system-wide via /etc/firefox-esr/policies/policies.json. Pre-installs uBlock Origin and SponsorBlock on first launch so the projector browser is ad/sponsor-clean without any manual setup. Schema: https://mozilla.github.io/policy-templates/",
+  "//": "Mozilla enterprise policy applied system-wide via /etc/firefox-esr/policies/policies.json. Pre-installs uBlock Origin, SponsorBlock and enhanced-h264ify on first launch so the projector browser is ad/sponsor-clean and forces YouTube to H.264 (the GTX 970 has no VP9/AV1 hardware decode — VP9 1080p60 would software-decode and stutter). Schema: https://mozilla.github.io/policy-templates/",
   "policies": {
     "ExtensionSettings": {
       "uBlock0@raymondhill.net": {
@@ -9,6 +9,10 @@
       "sponsorBlocker@ajay.app": {
         "installation_mode": "force_installed",
         "install_url": "https://addons.mozilla.org/firefox/downloads/latest/sponsorblock/latest.xpi"
+      },
+      "{9a41dee2-b924-4161-a971-7fb35c053a4a}": {
+        "installation_mode": "force_installed",
+        "install_url": "https://addons.mozilla.org/firefox/downloads/latest/enhanced-h264ify/latest.xpi"
       },
       "gdpr@cavi.au.dk": {
         "installation_mode": "force_installed",

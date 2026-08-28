@@ -1,20 +1,54 @@
 # Caddy reverse proxy for the home server.
 #
-# Plain HTTP only on :80 — Tailscale-MagicDNS names (`homeserver`)
-# and any router-DHCP-published LAN names can't get a public Let's
-# Encrypt cert, and Caddy's internal CA would require every client
-# to trust a custom root. LAN + tailnet traffic only.
+# auto_https is set to disable_redirects, not fully off: Tailscale-
+# MagicDNS names (`homeserver`) and the LAN IP have no hostname on the
+# plain `:80` block below, so they were never eligible for automatic
+# cert provisioning anyway. But `auto_https off` also blocks Caddy's
+# TLS automation *entirely* — including the explicit `tls internal`
+# directive below — so it has to stay off automatic-redirect duty
+# only, via disable_redirects, or `https://home` never gets a cert.
 #
-# The catch-all proxies everything to the mediacast container, so
-# `http://homeserver/` and `http://<lan-ip>/` both land directly on
-# the cast UI — the box's most-used surface. Direct access on
-# :8765 is still published (HTTP Shortcuts on Android targets it,
-# and curl tests in INSTALL.md use it).
+# The `https://` block opts `home` and `homeserver.local` in
+# explicitly with `tls internal`: Caddy's own local CA issues one
+# cert covering both names. That CA's root has to be
+# installed/trusted on each client device once — see
+# docs/https-home-setup.md — which is the accepted tradeoff for
+# getting a bare name like https://home, since no public CA can ever
+# issue a cert for a name with no dot/TLD. `homeserver.local` already
+# resolves LAN-wide via avahi mDNS with no router/DHCP involvement at
+# all (see install_avahi in bootstrap.sh) — it just had no HTTPS
+# until now.
+#
+# Both blocks proxy to the same mediacast container, so
+# `https://home/`, `https://homeserver.local/`, `http://homeserver/`,
+# and `http://<lan-ip>/` all land on the cast UI. Direct access on
+# :8765 is still published (HTTP Shortcuts on Android targets it, and
+# curl tests in INSTALL.md use it).
 {
-	auto_https off
+	auto_https disable_redirects
+}
+
+https://home, https://homeserver.local {
+	tls internal
+	encode gzip
+	reverse_proxy mediacast:8765
 }
 
 :80 {
 	encode gzip
-	reverse_proxy mediacast:8765
+
+	# Lets any device on the LAN grab the internal CA's root cert over
+	# plain HTTP (http://home/ca.crt or http://<lan-ip>/ca.crt) so it
+	# can be installed/trusted once — no chicken-and-egg with the
+	# https://home cert it's needed to validate. Public, non-secret
+	# key material; see docs/https-home-setup.md.
+	handle /ca.crt {
+		root * /ca
+		header Content-Type application/x-x509-ca-cert
+		file_server
+	}
+
+	handle {
+		reverse_proxy mediacast:8765
+	}
 }

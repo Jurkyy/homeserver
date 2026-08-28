@@ -18,6 +18,7 @@ owns the X11/Firefox side and runs outside the container.
 
 import asyncio
 import hmac
+import json
 import logging
 import os
 import re
@@ -31,10 +32,23 @@ from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
 logger = logging.getLogger("mediacast")
+# Without this, "mediacast".info()/.warning() calls below have nowhere to
+# go: uvicorn's own dictConfig only wires up its "uvicorn.*" loggers, not
+# root, so the root logger stays at its no-handler default and every
+# logger.info() here (cast requests, feed refreshes, Jellyfin auth) is
+# silently dropped — only a bare last-resort WARNING+ line reaches
+# `docker logs`. This makes the existing logging calls actually surface.
+logging.basicConfig(
+    level=os.environ.get("MEDIACAST_LOG", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 
 TOKEN = os.environ.get("MEDIACAST_TOKEN", "")
 HOST_URL = os.environ.get("MEDIACAST_HOST_URL", "http://host.docker.internal:8766/open")
 HOST_CONTROL_URL = HOST_URL.rsplit("/", 1)[0] + "/control"
+HOST_SCREENSAVER_URL = HOST_URL.rsplit("/", 1)[0] + "/screensaver"
+HOST_SCREEN_OFF_URL = HOST_URL.rsplit("/", 1)[0] + "/screen-off"
+HOST_STATE_URL = HOST_URL.rsplit("/", 1)[0] + "/state"
 HOST_TIMEOUT = float(os.environ.get("MEDIACAST_HOST_TIMEOUT", "5.0"))
 # Casting a YouTube URL makes the host helper resolve the stream with
 # yt-dlp before it answers (so it can route playback through the local
@@ -53,13 +67,35 @@ CAST_TIMEOUT = float(os.environ.get("MEDIACAST_CAST_TIMEOUT", "60.0"))
 # Clicking a card casts the watch URL through the normal YouTube path
 # (host helper → anti-throttle proxy → mpv), so playback rides NVDEC.
 YT_CHANNELS_FILE = os.environ.get("YT_CHANNELS_FILE", "/config/yt-channels.txt")
+# Auto-populate the channel list from the logged-in YouTube account: the
+# host helper scrapes the account's subscriptions (yt-dlp + the projector
+# Firefox's cookies) and we build the same public per-channel RSS feed
+# from them. Takes over from the static file entirely once it has ids
+# (see _channel_ids) — the file is only a fallback for a cold cache or
+# the scrape failing (not logged in / no cookies). Cached so the
+# feed poll doesn't re-scrape every time.
+HOST_SUBS_URL = HOST_URL.rsplit("/", 1)[0] + "/yt-subscriptions"
+YT_SUBS_FROM_ACCOUNT = os.environ.get("YT_SUBS_FROM_ACCOUNT", "1") not in ("0", "false", "")
+YT_SUBS_TTL = float(os.environ.get("YT_SUBS_TTL", "21600"))    # re-scrape every 6h
+# The host scrape (yt-dlp over the subscriptions page) can take a while;
+# allow for it so the first uncached fetch doesn't time out.
+YT_SUBS_FETCH_TIMEOUT = float(os.environ.get("YT_SUBS_FETCH_TIMEOUT", "100"))
 YT_FEED_TTL = float(os.environ.get("YT_FEED_TTL", "600"))      # cache 10 min
-YT_FEED_LIMIT = int(os.environ.get("YT_FEED_LIMIT", "48"))     # cards shown
-YT_PER_CHANNEL = int(os.environ.get("YT_PER_CHANNEL", "6"))    # recent per channel
+# Fetched and cached server-side; the UI paginates this client-side with
+# a "Load more" button, so these bound how far back "load more" can go
+# rather than how many cards show up front.
+YT_FEED_LIMIT = int(os.environ.get("YT_FEED_LIMIT", "150"))    # cards cached
+YT_PER_CHANNEL = int(os.environ.get("YT_PER_CHANNEL", "15"))   # recent per channel (RSS max)
 YT_FETCH_CONCURRENCY = int(os.environ.get("YT_FETCH_CONCURRENCY", "12"))
 _YT_UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 # A YouTube channel id: "UC" + 22 url-safe base64 chars.
 _UC_RE = re.compile(r"UC[0-9A-Za-z_-]{22}")
+# Last-known-good subscriptions + feed survive a container restart (not a
+# rebuild — this is the container's writable layer, not a bind mount) so
+# the page never opens onto the placeholder yt-channels.txt list while
+# waiting on a fresh ~90s account scrape. Best-effort only: every read/write
+# is wrapped and failures just mean falling back to the in-memory caches.
+YT_STATE_FILE = os.environ.get("YT_STATE_FILE", "/tmp/mediacast-yt-state.json")
 
 # Jellyfin ("mrpflix") integration. Optional: if MRPFLIX_URL is unset
 # the catalog section is simply hidden and the endpoints 404. We log in
@@ -81,28 +117,40 @@ _JF_AUTH_HEADER = (
 # play H.264 (the only codec the projector's GTX 970 decodes in
 # hardware); anything else (HEVC/AV1/VP9) Jellyfin transcodes to an
 # H.264 HLS stream so mpv still rides NVDEC. See projector GPU notes.
-_JF_DEVICE_PROFILE = {
-    "MaxStreamingBitrate": 20_000_000,
-    "DirectPlayProfiles": [
-        {
-            "Container": "mp4,m4v,mkv,mov,webm,ts",
-            "Type": "Video",
-            "VideoCodec": "h264",
-            "AudioCodec": "aac,mp3,ac3,eac3,opus,flac,vorbis",
-        }
-    ],
-    "TranscodingProfiles": [
-        {
-            "Container": "ts",
-            "Type": "Video",
-            "VideoCodec": "h264",
-            "AudioCodec": "aac,mp3,ac3",
-            "Protocol": "hls",
-            "Context": "Streaming",
-            "MaxAudioChannels": "2",
-        }
-    ],
-}
+#
+# MaxStreamingBitrate is the one field the "low quality" toggle varies:
+# the remote mrpflix link is normal-day fine at full bitrate, but its
+# throughput to us is occasionally starved (seen 2026-07-19: ~1Mbps
+# actual vs ~7Mbps the transcode wanted, causing constant rebuffer
+# pauses) with nothing wrong on our end to fix. The toggle re-requests
+# PlaybackInfo at a bitrate that fits within that degraded link.
+_JF_MAX_BITRATE = int(os.environ.get("MRPFLIX_MAX_BITRATE", "20000000"))
+_JF_LOW_BITRATE = int(os.environ.get("MRPFLIX_LOW_BITRATE", "1200000"))
+
+
+def _jf_device_profile(max_bitrate: int) -> dict:
+    return {
+        "MaxStreamingBitrate": max_bitrate,
+        "DirectPlayProfiles": [
+            {
+                "Container": "mp4,m4v,mkv,mov,webm,ts",
+                "Type": "Video",
+                "VideoCodec": "h264",
+                "AudioCodec": "aac,mp3,ac3,eac3,opus,flac,vorbis",
+            }
+        ],
+        "TranscodingProfiles": [
+            {
+                "Container": "ts",
+                "Type": "Video",
+                "VideoCodec": "h264",
+                "AudioCodec": "aac,mp3,ac3",
+                "Protocol": "hls",
+                "Context": "Streaming",
+                "MaxAudioChannels": "2",
+            }
+        ],
+    }
 
 if not TOKEN:
     raise RuntimeError("MEDIACAST_TOKEN is unset — refusing to start with an open endpoint")
@@ -181,12 +229,11 @@ async def cast(req: CastRequest, authorization: str | None = Header(default=None
     return {"status": "ok"}
 
 
-async def _forward_control(action: dict) -> dict:
+async def _forward_post(url: str, payload: dict, timeout: float = HOST_TIMEOUT) -> dict:
     try:
-        async with httpx.AsyncClient(timeout=HOST_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.post(
-                HOST_CONTROL_URL,
-                json=action,
+                url, json=payload,
                 headers={"Authorization": f"Bearer {TOKEN}"},
             )
     except httpx.HTTPError as exc:
@@ -201,9 +248,31 @@ async def _forward_control(action: dict) -> dict:
         # 502 surface for upstream errors.
         raise HTTPException(
             status_code=r.status_code,
-            detail=body.get("detail") or body.get("error") or "control failed",
+            detail=body.get("detail") or body.get("error") or "request failed",
         )
     return body
+
+
+async def _forward_get(url: str) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=HOST_TIMEOUT) as client:
+            r = await client.get(url, headers={"Authorization": f"Bearer {TOKEN}"})
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"host helper unreachable: {exc}")
+    try:
+        body = r.json()
+    except ValueError:
+        body = {"detail": r.text}
+    if r.status_code >= 400:
+        raise HTTPException(
+            status_code=r.status_code,
+            detail=body.get("detail") or body.get("error") or "request failed",
+        )
+    return body
+
+
+async def _forward_control(action: dict) -> dict:
+    return await _forward_post(HOST_CONTROL_URL, action)
 
 
 class ControlRequest(BaseModel):
@@ -228,6 +297,40 @@ async def ui_control(req: ControlRequest, request: Request) -> dict:
     client_host = request.client.host if request.client else "?"
     logger.info("control (ui) from=%s action=%s", client_host, req.action)
     return await _forward_control(req.model_dump(exclude_none=True))
+
+
+# ---------------------------------------------------------------------------
+# Screensaver / screen-off
+# ---------------------------------------------------------------------------
+# All state (which theme, idle auto-trigger) lives host-side — see
+# mediacast-host.py — since it has to keep working even when no one has
+# this page open. This container is just the LAN-trust relay, same model
+# as /ui-cast and /ui-control.
+
+class ScreensaverRequest(BaseModel):
+    theme: str
+
+
+@app.get("/ui-screensaver-state")
+async def ui_screensaver_state() -> dict:
+    return await _forward_get(HOST_STATE_URL)
+
+
+@app.post("/ui-screensaver")
+async def ui_screensaver(req: ScreensaverRequest, request: Request) -> dict:
+    # CAST_TIMEOUT, not the snappy HOST_TIMEOUT — picking a theme goes
+    # through the exact same yt-dlp-resolve / Firefox-cast path as any
+    # other YouTube cast, so it needs the same roomy budget.
+    client_host = request.client.host if request.client else "?"
+    logger.info("screensaver (ui) from=%s theme=%s", client_host, req.theme)
+    return await _forward_post(HOST_SCREENSAVER_URL, {"theme": req.theme}, timeout=CAST_TIMEOUT)
+
+
+@app.post("/ui-screen-off")
+async def ui_screen_off(request: Request) -> dict:
+    client_host = request.client.host if request.client else "?"
+    logger.info("screen off (ui) from=%s", client_host)
+    return await _forward_post(HOST_SCREEN_OFF_URL, {})
 
 
 @app.post("/ui-cast")
@@ -383,9 +486,10 @@ async def jellyfin_image(item_id: str) -> Response:
 class JellyfinPlayRequest(BaseModel):
     itemId: str
     title: str | None = None
+    lowQuality: bool = False
 
 
-async def _jf_resolve_stream(item_id: str) -> str:
+async def _jf_resolve_stream(item_id: str, max_bitrate: int) -> str:
     """Ask Jellyfin how to play an item; return a URL mpv can open.
 
     Direct-stream when the source is already H.264; otherwise Jellyfin
@@ -397,7 +501,7 @@ async def _jf_resolve_stream(item_id: str) -> str:
         "POST",
         f"/Items/{item_id}/PlaybackInfo",
         params={"userId": uid},
-        json={"DeviceProfile": _JF_DEVICE_PROFILE},
+        json={"DeviceProfile": _jf_device_profile(max_bitrate)},
     )
     if r.status_code >= 400:
         raise HTTPException(status_code=502, detail=f"jellyfin playbackinfo error ({r.status_code})")
@@ -432,8 +536,9 @@ async def jellyfin_play(req: JellyfinPlayRequest, request: Request) -> dict[str,
     # host isn't in the helper's video-host list).
     _require_jellyfin()
     client_host = request.client.host if request.client else "?"
-    logger.info("jellyfin play from=%s item=%s", client_host, req.itemId)
-    stream_url = await _jf_resolve_stream(req.itemId)
+    logger.info("jellyfin play from=%s item=%s lowQuality=%s", client_host, req.itemId, req.lowQuality)
+    max_bitrate = _JF_LOW_BITRATE if req.lowQuality else _JF_MAX_BITRATE
+    stream_url = await _jf_resolve_stream(req.itemId, max_bitrate)
     await _forward(stream_url, backend="mpv", title=req.title)
     return {"status": "ok"}
 
@@ -444,8 +549,128 @@ async def jellyfin_play(req: JellyfinPlayRequest, request: Request) -> dict[str,
 
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _YTNS = "{http://www.youtube.com/xml/schemas/2015}"
-_feed_cache: dict = {"ts": 0.0, "items": []}
-_feed_lock = asyncio.Lock()
+_feed_cache: dict = {"ts": 0.0, "items": [], "refreshing": False}
+_subs_cache: dict = {"ts": 0.0, "ids": [], "refreshing": False}
+# Hold strong refs to background refresh tasks: asyncio only keeps a weak
+# reference, so without this they can be GC'd mid-flight and silently die.
+_bg_tasks: set = set()
+
+
+def _spawn(coro) -> None:
+    t = asyncio.create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+
+
+def _load_state() -> None:
+    """Seed the subs/feed caches from the last run's disk snapshot.
+
+    Runs once at import time. Without this, every container restart
+    starts both caches empty, so the very first page load falls back to
+    the placeholder yt-channels.txt list (or an empty feed) until a
+    fresh ~90s account scrape lands — exactly the "wrong subs on
+    startup" gap this avoids for a plain restart (a rebuild still
+    starts cold, since it's the container's own writable layer).
+    """
+    try:
+        with open(YT_STATE_FILE, encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return
+    subs = state.get("subs") or {}
+    if subs.get("ids"):
+        _subs_cache["ids"] = subs["ids"]
+        _subs_cache["ts"] = subs.get("ts", 0.0)
+    feed = state.get("feed") or {}
+    if feed.get("items"):
+        _feed_cache["items"] = feed["items"]
+        _feed_cache["ts"] = feed.get("ts", 0.0)
+
+
+def _save_state() -> None:
+    try:
+        with open(YT_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "subs": {"ids": _subs_cache["ids"], "ts": _subs_cache["ts"]},
+                "feed": {"items": _feed_cache["items"], "ts": _feed_cache["ts"]},
+            }, f)
+    except OSError as exc:
+        logger.warning("yt state save failed: %s", exc)
+
+
+_load_state()
+
+
+async def _refresh_account_subs() -> None:
+    """Scrape the account subscriptions into the cache (background task).
+
+    The host's yt-dlp scrape can take tens of seconds, so this never runs
+    inline — it's fired off by _account_channel_ids and updates the cache
+    for the *next* request. The refreshing flag dedups concurrent scrapes.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=YT_SUBS_FETCH_TIMEOUT) as client:
+            r = await client.get(
+                HOST_SUBS_URL, headers={"Authorization": f"Bearer {TOKEN}"}
+            )
+        if r.status_code == 200:
+            ids = [c for c in r.json().get("channel_ids", []) if _UC_RE.fullmatch(c)]
+            if ids:
+                changed = ids != _subs_cache["ids"]
+                _subs_cache["ids"] = ids
+                _subs_cache["ts"] = time.time()
+                _save_state()
+                logger.info("account subscriptions: %d channels", len(ids))
+                # The subscriber list just changed (including cold-cache →
+                # populated): the cached feed may still be built from the
+                # placeholder file, so rebuild now instead of waiting for
+                # YT_FEED_TTL / a manual "Refresh" click to notice.
+                if changed and not _feed_cache["refreshing"]:
+                    _feed_cache["refreshing"] = True
+                    _spawn(_refresh_feed())
+            else:
+                logger.warning("account subscriptions returned no ids")
+        else:
+            logger.warning("account subscriptions fetch http %s", r.status_code)
+    except httpx.HTTPError as exc:
+        logger.warning("account subscriptions fetch failed: %s", exc)
+    finally:
+        _subs_cache["refreshing"] = False
+
+
+async def _account_channel_ids() -> list[str]:
+    """Cached subscribed channel ids; refreshed in the background.
+
+    Never blocks: returns whatever's cached now and, when that's stale or
+    empty, kicks off a background scrape for next time. So the feed
+    endpoint always answers fast — the static-file channels cover a cold
+    cache until the first scrape lands.
+    """
+    if not YT_SUBS_FROM_ACCOUNT:
+        return []
+    stale = (time.time() - _subs_cache["ts"]) >= YT_SUBS_TTL or not _subs_cache["ids"]
+    if stale and not _subs_cache["refreshing"]:
+        _subs_cache["refreshing"] = True
+        _spawn(_refresh_account_subs())
+    return _subs_cache["ids"]
+
+
+async def _channel_ids() -> list[str]:
+    """Feed channel ids: the account's real subscriptions when we have
+    them, else the static-file list as a fallback for a cold cache with
+    account subs disabled/not yet scraped.
+
+    Deliberately NOT a union of both: once the account scrape has landed
+    even once, static-file entries (the placeholder yt-channels.txt demo
+    list, or anything hand-added there) must stop showing up — otherwise
+    channels the user was never subscribed to keep reappearing in the
+    feed alongside their real subscriptions forever.
+    """
+    if YT_SUBS_FROM_ACCOUNT:
+        ids = await _account_channel_ids()
+        if ids:
+            return ids
+    return _load_channel_ids()
 
 
 def _load_channel_ids() -> list[str]:
@@ -497,8 +722,31 @@ def _parse_channel_rss(xml: str) -> list[dict]:
     return out
 
 
+async def _is_short(client: httpx.AsyncClient, vid: str) -> bool:
+    """Shorts vs. regular uploads aren't distinguished anywhere in the
+    per-channel RSS (no duration, no flag) — but /shorts/<id> answers
+    200 in place for an actual Short, and redirects (303) to /watch for
+    everything else, so a redirect-less HEAD there is a reliable,
+    single-request tell.
+
+    Deliberately spoofs a curl-style User-Agent instead of _YT_UA: a
+    browser-looking UA (or httpx's own default) makes YouTube detour
+    through the /consent cookie-wall page — a 302 for both Shorts and
+    regular videos alike, destroying the signal. Bot-looking UAs skip
+    that gate and get the real 200/303 straight away.
+    """
+    try:
+        r = await client.head(
+            f"https://www.youtube.com/shorts/{vid}",
+            headers={"User-Agent": "curl/8.5.0"}, follow_redirects=False,
+        )
+        return r.status_code == 200
+    except httpx.HTTPError:
+        return False  # fail open: an unknown video stays visible
+
+
 async def _build_feed() -> list[dict]:
-    ids = _load_channel_ids()
+    ids = await _channel_ids()
     if not ids:
         return []
     sem = asyncio.Semaphore(YT_FETCH_CONCURRENCY)
@@ -513,33 +761,57 @@ async def _build_feed() -> list[dict]:
                 return []
         return _parse_channel_rss(r.text) if r.status_code < 400 else []
 
+    async def tag_short(client: httpx.AsyncClient, item: dict) -> None:
+        async with sem:
+            item["short"] = await _is_short(client, item["id"])
+
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         results = await asyncio.gather(*(fetch(client, c) for c in ids))
-    items = [v for chan in results for v in chan]
-    # ISO-8601 timestamps share the same offset, so a plain string sort
-    # is chronological. Newest first.
-    items.sort(key=lambda v: v["published"], reverse=True)
-    return items[:YT_FEED_LIMIT]
+        items = [v for chan in results for v in chan]
+        # ISO-8601 timestamps share the same offset, so a plain string sort
+        # is chronological. Newest first.
+        items.sort(key=lambda v: v["published"], reverse=True)
+        items = items[:YT_FEED_LIMIT]
+        # Tag Shorts only on the page we're actually keeping — checking
+        # every raw per-channel entry before the sort/truncate would be
+        # many times the HTTP requests for entries we'd drop anyway.
+        await asyncio.gather(*(tag_short(client, it) for it in items))
+    return items
+
+
+async def _refresh_feed() -> None:
+    """Rebuild the RSS feed into the cache; keeps the last good feed if a
+    refresh comes back empty. Dedup'd via the refreshing flag."""
+    try:
+        items = await _build_feed()
+        if items:
+            _feed_cache["items"] = items
+            _feed_cache["ts"] = time.time()
+            _save_state()
+    finally:
+        _feed_cache["refreshing"] = False
 
 
 async def _get_feed(force: bool = False) -> list[dict]:
-    async with _feed_lock:
-        fresh = (time.time() - _feed_cache["ts"]) < YT_FEED_TTL
-        if not force and fresh and _feed_cache["items"]:
-            return _feed_cache["items"]
-        items = await _build_feed()
-        if items:  # keep the last good feed if a refresh comes back empty
-            _feed_cache["items"] = items
-            _feed_cache["ts"] = time.time()
-            return items
-        return _feed_cache["items"]
+    # Stale-while-revalidate: serve cached items immediately and refresh
+    # in the background when stale, so a page load never waits on the
+    # (potentially many-channel) RSS rebuild. Only a cold cache or an
+    # explicit refresh builds inline, so the first load still returns data.
+    stale = (time.time() - _feed_cache["ts"]) >= YT_FEED_TTL
+    if force or (stale and not _feed_cache["items"]):
+        await _refresh_feed()
+    elif stale and not _feed_cache["refreshing"]:
+        _feed_cache["refreshing"] = True
+        _spawn(_refresh_feed())
+    return _feed_cache["items"]
 
 
 @app.get("/ui-youtube/feed")
 async def youtube_feed(refresh: int = 0) -> dict:
     # LAN-trust, same model as /ui-jellyfin and /ui-cast. 404 when no
-    # channel list is configured so the UI hides the whole section.
-    if not _load_channel_ids():
+    # channel list is configured (neither account subscriptions nor a
+    # static file) so the UI hides the whole section.
+    if not await _channel_ids():
         raise HTTPException(status_code=404, detail="youtube feed not configured")
     items = await _get_feed(force=bool(refresh))
     return {"items": items}
@@ -559,7 +831,7 @@ _INDEX_HTML = """<!doctype html>
   h2 { margin-top: 2rem; font-size: 1.05rem; }
   p  { margin: .5rem 0; }
   form { display: flex; gap: .5rem; margin: 1rem 0 .5rem; }
-  input[type=url] { flex: 1; padding: .65rem .8rem; font-size: 1rem;
+  input[type=url] { flex: 1; min-width: 0; padding: .65rem .8rem; font-size: 1rem;
                     border: 1px solid #888; border-radius: .35rem;
                     background: transparent; color: inherit; }
   button { padding: .65rem 1.1rem; font-size: 1rem; cursor: pointer;
@@ -615,6 +887,15 @@ _INDEX_HTML = """<!doctype html>
   .secbar .refresh { margin-left: auto; padding: .3rem .7rem; font-size: .85rem;
             cursor: pointer; border: 1px solid currentColor; border-radius: .35rem;
             background: transparent; color: inherit; }
+  .secbar .refresh.active { background: rgba(127,127,127,.25); font-weight: 600; }
+  .ctrl.active { background: rgba(59,130,246,.3); font-weight: 600; }
+  #ss-status { min-height: 1.2em; }
+  .ytshorts { display: block; font-size: .82rem; opacity: .8; margin: -.2rem 0 .5rem; }
+  #yt-more { display: block; margin: 0 auto; }
+  .collapse { padding: .15rem .5rem; font-size: .9rem; line-height: 1; cursor: pointer;
+            border: 1px solid currentColor; border-radius: .35rem;
+            background: transparent; color: inherit; }
+  .hidden { display: none !important; }
 </style>
 </head>
 <body>
@@ -626,9 +907,11 @@ _INDEX_HTML = """<!doctype html>
   <span class="t" id="dur">0:00</span>
 </div>
 <div class="controls">
-  <button class="ctrl" data-action="seek" data-offset="-10" title="Back 10s">⏪ &minus;10s</button>
+  <button class="ctrl" data-action="seek" data-offset="-30" title="Back 30s">⏪ &minus;30s</button>
+  <button class="ctrl" data-action="seek" data-offset="-10" title="Back 10s">&minus;10s</button>
   <button class="ctrl" data-action="pause" title="Pause / resume">⏯</button>
-  <button class="ctrl" data-action="seek" data-offset="10"  title="Forward 10s">+10s ⏩</button>
+  <button class="ctrl" data-action="seek" data-offset="10"  title="Forward 10s">+10s</button>
+  <button class="ctrl" data-action="seek" data-offset="30"  title="Forward 30s">+30s ⏩</button>
   <button class="ctrl" data-action="stop" title="Stop the cast">⏹ Stop</button>
 </div>
 <div class="volrow">
@@ -641,25 +924,38 @@ _INDEX_HTML = """<!doctype html>
 <h2>Cast a link</h2>
 <p><small>Paste a URL to open it on the projector.</small></p>
 <form id="f">
+  <button type="button" id="paste" title="Paste clipboard &amp; cast">📋 Paste</button>
   <input type="url" id="url" placeholder="https://..." required autofocus>
   <button type="submit">Cast</button>
 </form>
 
 <section id="yt-section" style="display:none">
   <div class="secbar">
+    <button class="collapse" type="button" data-collapse="yt-grid" title="Hide / show">▾</button>
     <h2>📺 Subscriptions</h2>
     <button class="refresh" id="yt-refresh" type="button" title="Reload feed">↻ Refresh</button>
   </div>
+  <label class="ytshorts"><input type="checkbox" id="yt-shorts-toggle"> Show Shorts</label>
   <div class="grid ytgrid" id="yt-grid"></div>
+  <button class="refresh" id="yt-more" type="button" style="display:none">Load more</button>
 </section>
 
 <section id="jf-section" style="display:none">
-  <h2>🎬 mrpflix</h2>
-  <div class="jfbar" id="jf-bar" style="display:none">
-    <button class="ctrl" id="jf-back" type="button">← Back</button>
-    <span class="crumb" id="jf-crumb"></span>
+  <div class="secbar">
+    <button class="collapse" type="button" data-collapse="jf-body" title="Hide / show">▾</button>
+    <h2>🎬 mrpflix</h2>
+    <button class="refresh" id="jf-quality" type="button"
+            title="Cap the transcode bitrate for a slow/degraded link to mrpflix">
+      Full quality
+    </button>
   </div>
-  <div class="grid" id="jf-grid"></div>
+  <div id="jf-body">
+    <div class="jfbar" id="jf-bar" style="display:none">
+      <button class="ctrl" id="jf-back" type="button">← Back</button>
+      <span class="crumb" id="jf-crumb"></span>
+    </div>
+    <div class="grid" id="jf-grid"></div>
+  </div>
 </section>
 
 <h2>One-tap from any page</h2>
@@ -670,6 +966,14 @@ _INDEX_HTML = """<!doctype html>
   <summary><small>show bookmarklet code (copy-paste for mobile)</small></summary>
   <pre id="bmcode"></pre>
 </details>
+
+<h2>Screensaver</h2>
+<p><small>Kicks in on its own after a while with nothing playing, or pick one now. "Screen off" blanks the projector until something's cast or a screensaver is picked.</small></p>
+<div class="controls" id="ss-themes"></div>
+<div class="controls">
+  <button class="ctrl" id="ss-off" type="button">⏻ Screen off</button>
+</div>
+<p class="muted" id="ss-status"></p>
 
 <script>
 const HOST = location.host;
@@ -696,6 +1000,25 @@ async function cast(url) {
 }
 f.addEventListener('submit', e => { e.preventDefault(); cast(i.value); });
 if (q.get('auto') === '1' && i.value) cast(i.value);
+
+// Paste-and-cast: read the clipboard and cast it in one tap. The async
+// clipboard API only works in a secure context (https / localhost); over
+// plain http it throws, so we fall back to focusing the field for a
+// manual paste and say why.
+document.getElementById('paste').addEventListener('click', async () => {
+  try {
+    if (!navigator.clipboard || !navigator.clipboard.readText)
+      throw new Error('no clipboard API');
+    const text = ((await navigator.clipboard.readText()) || '').trim();
+    if (!text) { s.className = 'status err'; s.textContent = '✗ clipboard is empty'; return; }
+    i.value = text;
+    cast(text);
+  } catch (e) {
+    i.focus(); i.select();
+    s.className = 'status err';
+    s.textContent = '✗ clipboard blocked on http — paste into the field (long-press / Ctrl+V) then Cast';
+  }
+});
 
 // Control panel: pause/seek/stop buttons + volume slider all go to
 // /ui-control. Same trust model as /ui-cast (LAN-only).
@@ -767,9 +1090,10 @@ seek.addEventListener('change', () => {
   ctrl({ action: 'seek_to', position: Number(seek.value) });
 });
 
-// Poll: refresh seek bar (and sync volume once). The seek row only
-// shows while something with a known duration is playing (mpv = YouTube
-// or mrpflix); a Firefox-only cast or idle screen hides it.
+// Poll: refresh seek bar (and sync volume once). The seek row shows
+// while something with a known duration is playing — mpv (mrpflix) or
+// the Firefox MPRIS player (browser YouTube); an idle screen or a
+// non-video Firefox tab hides it.
 let volSynced = false;
 async function poll() {
   const j = await fetchStatus();
@@ -778,15 +1102,19 @@ async function poll() {
   }
   const playing = j && typeof j.duration === 'number' && j.duration > 0
                     && typeof j.position === 'number';
-  // "Now playing" title — present whenever mpv is alive (YouTube title
-  // from yt-dlp, mrpflix title from the catalog). Falls back to a muted
-  // placeholder when nothing's on mpv.
+  // Show the scrub bar only when the position is live/seekable: mpv
+  // (mrpflix) or YouTube driven via CDP. The MPRIS-only fallback reports
+  // a frozen position, so it sets seekable=false and we hide the bar.
+  const trackable = playing && j.seekable;
+  // "Now playing" title — present whenever a player is active: mpv
+  // (mrpflix, or the legacy YouTube backend) or the Firefox MPRIS player
+  // (browser YouTube). Falls back to a muted placeholder when idle.
   const nowtitle = document.getElementById('nowtitle');
-  const title = j && j.mpv && j.title ? j.title : null;
-  if (title) { nowtitle.textContent = title; nowtitle.classList.remove('muted'); }
+  const title = j && j.active && j.title ? j.title : null;
+  if (title) { nowtitle.textContent = (j.paused ? '⏸ ' : '') + title; nowtitle.classList.remove('muted'); }
   else { nowtitle.textContent = 'Nothing playing'; nowtitle.classList.add('muted'); }
-  seekrow.style.display = playing ? 'flex' : 'none';
-  if (playing && !dragging && Date.now() > suppressUntil) {
+  seekrow.style.display = trackable ? 'flex' : 'none';
+  if (trackable && !dragging && Date.now() > suppressUntil) {
     seek.max = Math.floor(j.duration);
     seek.value = Math.floor(j.position);
     cur.textContent = fmt(j.position);
@@ -844,6 +1172,22 @@ function renderJf(items) {
   }
 }
 
+// Low-quality toggle: caps the transcode bitrate mrpflix is asked for,
+// for nights the link to it is degraded (see /ui-jellyfin/play). Sticks
+// across reloads like the collapse state above.
+const jfQuality = document.getElementById('jf-quality');
+function jfLowQuality() { return localStorage.getItem('jf-low-quality') === '1'; }
+function jfRenderQuality() {
+  const low = jfLowQuality();
+  jfQuality.textContent = low ? '🐢 Low quality' : 'Full quality';
+  jfQuality.classList.toggle('active', low);
+}
+jfQuality.addEventListener('click', () => {
+  localStorage.setItem('jf-low-quality', jfLowQuality() ? '0' : '1');
+  jfRenderQuality();
+});
+jfRenderQuality();
+
 function jfEnter(it) { jfStack.push({ id: it.id, name: it.name }); jfLoad(it.id); }
 jfBack.addEventListener('click', () => {
   jfStack.pop();
@@ -861,7 +1205,7 @@ async function jfPlay(it) {
     const r = await fetch('/ui-jellyfin/play', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ itemId: it.id, title }),
+      body: JSON.stringify({ itemId: it.id, title, lowQuality: jfLowQuality() }),
     });
     const j = await r.json().catch(() => ({}));
     if (r.ok) { s.className = 'status ok';  s.textContent = '✓ playing: ' + it.name; }
@@ -878,6 +1222,11 @@ jfLoad(null);  // initial top-level load (hides itself if not configured)
 const ytSection = document.getElementById('yt-section');
 const ytGrid = document.getElementById('yt-grid');
 const ytRefresh = document.getElementById('yt-refresh');
+const ytMore = document.getElementById('yt-more');
+const ytShortsToggle = document.getElementById('yt-shorts-toggle');
+const YT_PAGE = 24;
+let ytItems = [];   // full set fetched from the server, newest first
+let ytShown = 0;    // how many of the filtered list are currently rendered
 
 function ago(iso) {
   const t = Date.parse(iso); if (isNaN(t)) return '';
@@ -888,31 +1237,75 @@ function ago(iso) {
   return Math.floor(d / (86400 * 7)) + 'w ago';
 }
 
+// Shorts are hidden by default (they drown out regular uploads in the
+// grid); "Show Shorts" is opt-in and remembered like the collapse toggles.
+ytShortsToggle.checked = localStorage.getItem('yt-show-shorts') === '1';
+
+function ytFiltered() {
+  return ytShortsToggle.checked ? ytItems : ytItems.filter(it => !it.short);
+}
+
+function ytCard(it) {
+  const card = document.createElement('button');
+  card.className = 'card ytcard'; card.type = 'button';
+  const meta = [esc(it.channel || ''), ago(it.published)].filter(Boolean).join(' · ');
+  card.innerHTML =
+    '<img loading="lazy" alt="" src="' + it.image +
+    '" onerror="this.outerHTML=\\'<div class=ph>📺</div>\\'">' +
+    '<div class="t">' + esc(it.title) + '</div>' +
+    '<div class="st">' + meta + '</div>';
+  card.addEventListener('click', () => cast(it.url));
+  return card;
+}
+
+// Re-render from the already-fetched ytItems (no network call) — used by
+// both the Shorts toggle and "Load more", so neither re-fetches the feed.
+function ytRender(reset) {
+  const list = ytFiltered();
+  if (reset) { ytGrid.innerHTML = ''; ytShown = 0; }
+  if (!list.length) { ytGrid.innerHTML = '<span class="muted">no recent videos</span>'; }
+  const next = list.slice(ytShown, ytShown + YT_PAGE);
+  for (const it of next) ytGrid.appendChild(ytCard(it));
+  ytShown += next.length;
+  ytMore.style.display = ytShown < list.length ? '' : 'none';
+}
+
 async function ytLoad(refresh) {
   ytGrid.innerHTML = '<span class="muted">loading…</span>';
+  ytMore.style.display = 'none';
   try {
     const r = await fetch('/ui-youtube/feed' + (refresh ? '?refresh=1' : ''));
     if (!r.ok) { ytSection.style.display = 'none'; return; }   // not configured
     ytSection.style.display = '';
-    const items = (await r.json()).items || [];
-    ytGrid.innerHTML = '';
-    if (!items.length) { ytGrid.innerHTML = '<span class="muted">no recent videos</span>'; return; }
-    for (const it of items) {
-      const card = document.createElement('button');
-      card.className = 'card ytcard'; card.type = 'button';
-      const meta = [esc(it.channel || ''), ago(it.published)].filter(Boolean).join(' · ');
-      card.innerHTML =
-        '<img loading="lazy" alt="" src="' + it.image +
-        '" onerror="this.outerHTML=\\'<div class=ph>📺</div>\\'">' +
-        '<div class="t">' + esc(it.title) + '</div>' +
-        '<div class="st">' + meta + '</div>';
-      card.addEventListener('click', () => cast(it.url));
-      ytGrid.appendChild(card);
-    }
+    ytItems = (await r.json()).items || [];
+    ytRender(true);
   } catch (e) { ytSection.style.display = 'none'; }
 }
 ytRefresh.addEventListener('click', () => ytLoad(true));
+ytMore.addEventListener('click', () => ytRender(false));
+ytShortsToggle.addEventListener('change', () => {
+  localStorage.setItem('yt-show-shorts', ytShortsToggle.checked ? '1' : '0');
+  ytRender(true);
+});
 ytLoad(false);
+
+// Collapsible sections (Subscriptions, mrpflix). Toggle the section body
+// and remember the choice in localStorage so it sticks across reloads.
+document.querySelectorAll('button.collapse').forEach(btn => {
+  const body = document.getElementById(btn.dataset.collapse);
+  const key = 'collapse:' + btn.dataset.collapse;
+  const render = () => {
+    // Default to collapsed: only an explicit '0' (user expanded) shows it.
+    const collapsed = (localStorage.getItem(key) ?? '1') === '1';
+    if (body) body.classList.toggle('hidden', collapsed);
+    btn.textContent = collapsed ? '▸' : '▾';
+  };
+  render();
+  btn.addEventListener('click', () => {
+    localStorage.setItem(key, localStorage.getItem(key) === '1' ? '0' : '1');
+    render();
+  });
+});
 
 // Bookmarklet: open the UI in a new tab with ?url=<current>&auto=1.
 // This dodges mixed-content (HTTPS page → HTTP API) because the new
@@ -921,6 +1314,70 @@ const bm = "javascript:void(window.open('http://" + HOST +
            "/?url='+encodeURIComponent(location.href)+'&auto=1','_blank'))";
 document.getElementById('bm').setAttribute('href', bm);
 document.getElementById('bmcode').textContent = bm;
+
+// Screensaver / screen-off. State (which theme's showing, screen-off)
+// lives host-side so it stays right even if this page isn't open when
+// the idle timeout fires — this just reflects and drives it.
+const ssThemes = document.getElementById('ss-themes');
+const ssOff = document.getElementById('ss-off');
+const ssStatus = document.getElementById('ss-status');
+let ssBusy = false;
+
+async function ssRefresh() {
+  try {
+    const r = await fetch('/ui-screensaver-state');
+    if (!r.ok) return;
+    const st = await r.json();
+    const themes = st.themes || {};
+    ssThemes.innerHTML = '';
+    for (const key of Object.keys(themes)) {
+      const b = document.createElement('button');
+      b.className = 'ctrl' + (st.screensaver === key ? ' active' : '');
+      b.type = 'button';
+      b.textContent = themes[key];
+      b.addEventListener('click', () => ssPick(key));
+      ssThemes.appendChild(b);
+    }
+    ssOff.classList.toggle('active', !!st.screen_off);
+    ssStatus.textContent = st.screen_off ? 'Screen is off.'
+      : st.screensaver ? ('Screensaver: ' + (themes[st.screensaver] || st.screensaver))
+      : '';
+  } catch (e) { /* leave the buttons as they were */ }
+}
+
+async function ssPick(theme) {
+  if (ssBusy) return;
+  ssBusy = true;
+  s.className = 'status'; s.textContent = 'starting screensaver…';
+  try {
+    const r = await fetch('/ui-screensaver', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({theme}),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) { s.className = 'status ok'; s.textContent = '✓ screensaver started'; }
+    else      { s.className = 'status err'; s.textContent = '✗ ' + (j.detail || r.statusText); }
+  } catch (e) { s.className = 'status err'; s.textContent = '✗ ' + e; }
+  ssBusy = false;
+  ssRefresh();
+}
+
+ssOff.addEventListener('click', async () => {
+  if (ssBusy) return;
+  ssBusy = true;
+  s.className = 'status'; s.textContent = 'turning screen off…';
+  try {
+    const r = await fetch('/ui-screen-off', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) { s.className = 'status ok'; s.textContent = '✓ screen off'; }
+    else      { s.className = 'status err'; s.textContent = '✗ ' + (j.detail || r.statusText); }
+  } catch (e) { s.className = 'status err'; s.textContent = '✗ ' + e; }
+  ssBusy = false;
+  ssRefresh();
+});
+
+ssRefresh();
+setInterval(ssRefresh, 5000);  // picks up the idle-triggered auto-start too
 </script>
 </body>
 </html>
