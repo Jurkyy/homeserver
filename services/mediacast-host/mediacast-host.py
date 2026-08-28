@@ -41,6 +41,10 @@ LOG = logging.getLogger("mediacast-host")
 
 PORT = int(os.environ.get("MEDIACAST_HOST_PORT", "8766"))
 TOKEN = os.environ.get("MEDIACAST_TOKEN", "")
+# Real path, not the bare command name — sudoers rules match exact paths,
+# and /sbin/poweroff -> systemctl on this box (see install_mediacast_sudo
+# in bootstrap.sh, which grants NOPASSWD for exactly this path).
+POWEROFF_BIN = os.environ.get("MEDIACAST_POWEROFF_BIN", "/sbin/poweroff")
 FIREFOX_BIN = os.environ.get("MEDIACAST_FIREFOX_BIN", "firefox-esr")
 MPV_BIN = os.environ.get("MEDIACAST_MPV_BIN", "/usr/bin/mpv")
 # Unix socket mpv listens on for JSON-IPC. Lets us cycle pause / send
@@ -1691,6 +1695,34 @@ class Handler(BaseHTTPRequestHandler):
                 _state["screensaver"] = None
             LOG.info("screen off (stopped=[%s] xset rc=%s out=%r)", stopped, rc, out)
             self._json(200, {"status": "ok"})
+            return
+        if self.path == "/poweroff":
+            if not _check_auth(self.headers.get("Authorization")):
+                LOG.warning("auth failed from %s", self.client_address[0])
+                self._json(401, {"error": "bad token"})
+                return
+            # WARNING (not INFO) — this is the single most consequential
+            # action the portal can trigger, worth standing out in the
+            # journal as an audit trail on its own.
+            LOG.warning("POWEROFF requested from %s — shutting the host down",
+                        self.client_address[0])
+            # Answer before actually shutting down: the HTTP response has
+            # to make it out (through this container, to the browser)
+            # before the machine starts going away, so the poweroff
+            # itself runs on a short delay in the background rather than
+            # inline before we reply.
+            self._json(200, {"status": "ok", "detail": "powering off"})
+
+            def _do_poweroff() -> None:
+                time.sleep(1.5)
+                # -n: fail fast instead of hanging if the sudoers grant
+                # is somehow missing, rather than silently blocking
+                # forever with no way to observe why nothing happened.
+                rc, out = _run(["sudo", "-n", POWEROFF_BIN], timeout=30)
+                if rc != 0:
+                    LOG.error("poweroff command failed rc=%s: %s", rc, out)
+
+            threading.Thread(target=_do_poweroff, name="poweroff", daemon=True).start()
             return
         if self.path != "/open":
             self._json(404, {"error": "not found"})

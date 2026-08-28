@@ -48,6 +48,7 @@ HOST_URL = os.environ.get("MEDIACAST_HOST_URL", "http://host.docker.internal:876
 HOST_CONTROL_URL = HOST_URL.rsplit("/", 1)[0] + "/control"
 HOST_SCREENSAVER_URL = HOST_URL.rsplit("/", 1)[0] + "/screensaver"
 HOST_SCREEN_OFF_URL = HOST_URL.rsplit("/", 1)[0] + "/screen-off"
+HOST_POWEROFF_URL = HOST_URL.rsplit("/", 1)[0] + "/poweroff"
 HOST_STATE_URL = HOST_URL.rsplit("/", 1)[0] + "/state"
 HOST_TIMEOUT = float(os.environ.get("MEDIACAST_HOST_TIMEOUT", "5.0"))
 # Casting a YouTube URL makes the host helper resolve the stream with
@@ -331,6 +332,17 @@ async def ui_screen_off(request: Request) -> dict:
     client_host = request.client.host if request.client else "?"
     logger.info("screen off (ui) from=%s", client_host)
     return await _forward_post(HOST_SCREEN_OFF_URL, {})
+
+
+@app.post("/ui-poweroff")
+async def ui_poweroff(request: Request) -> dict:
+    # Same LAN-trust model as the rest of /ui-*, but this is the most
+    # consequential button on the page — the portal's own confirm()
+    # dialog is the only speed bump before it fires, so WARNING (not
+    # INFO) for a clear audit trail of who/when.
+    client_host = request.client.host if request.client else "?"
+    logger.warning("POWEROFF requested (ui) from=%s", client_host)
+    return await _forward_post(HOST_POWEROFF_URL, {})
 
 
 @app.post("/ui-cast")
@@ -890,6 +902,9 @@ _INDEX_HTML = """<!doctype html>
   .secbar .refresh.active { background: rgba(127,127,127,.25); font-weight: 600; }
   .ctrl.active { background: rgba(59,130,246,.3); font-weight: 600; }
   #ss-status { min-height: 1.2em; }
+  .danger { margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid rgba(220,38,38,.35); }
+  .ctrl.danger-btn { border-color: #dc2626; color: #dc2626; }
+  .ctrl.danger-btn:hover { background: rgba(220,38,38,.12); }
   .ytshorts { display: block; font-size: .82rem; opacity: .8; margin: -.2rem 0 .5rem; }
   #yt-more { display: block; margin: 0 auto; }
   .collapse { padding: .15rem .5rem; font-size: .9rem; line-height: 1; cursor: pointer;
@@ -974,6 +989,12 @@ _INDEX_HTML = """<!doctype html>
   <button class="ctrl" id="ss-off" type="button">⏻ Screen off</button>
 </div>
 <p class="muted" id="ss-status"></p>
+
+<div class="danger">
+  <h2>⚠️ Danger zone</h2>
+  <p><small>Powers off the whole machine — not just the projector. Everything on it (Jellyfin, Home Assistant, music, this portal) goes down until someone physically presses the power button.</small></p>
+  <button class="ctrl danger-btn" id="poweroff-btn" type="button">⏻ Power off server</button>
+</div>
 
 <script>
 const HOST = location.host;
@@ -1378,6 +1399,28 @@ ssOff.addEventListener('click', async () => {
 
 ssRefresh();
 setInterval(ssRefresh, 5000);  // picks up the idle-triggered auto-start too
+
+// Power off the whole machine. The one destructive action on this page —
+// a plain confirm() dialog is the speed bump against a stray tap; the
+// backend does no further confirmation of its own beyond the bearer/LAN
+// trust boundary every other action already relies on.
+document.getElementById('poweroff-btn').addEventListener('click', async () => {
+  const sure = confirm(
+    'Power off the WHOLE home server?\n\n' +
+    'This shuts down everything on the box — Jellyfin, Home Assistant, ' +
+    'music, this portal, all of it — not just the projector. It can ' +
+    'only be turned back on by physically pressing the power button.\n\n' +
+    'Continue?'
+  );
+  if (!sure) return;
+  s.className = 'status'; s.textContent = 'powering off the server…';
+  try {
+    const r = await fetch('/ui-poweroff', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) { s.className = 'status ok';  s.textContent = '✓ server is powering off — bye!'; }
+    else      { s.className = 'status err'; s.textContent = '✗ ' + (j.detail || r.statusText); }
+  } catch (e) { s.className = 'status err'; s.textContent = '✗ ' + e; }
+});
 </script>
 </body>
 </html>

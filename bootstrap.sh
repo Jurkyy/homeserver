@@ -357,6 +357,31 @@ EOF
         fi
     fi
 
+    # 4b. Grant $SUDO_USER passwordless poweroff for the portal's "Power
+    # off server" button (mediacast-host.py's /poweroff endpoint). The
+    # host helper runs headless via systemd --user with no way to supply
+    # an interactive sudo password, so this has to be passwordless — but
+    # scoped to exactly this one binary/no-args, nothing broader. Safe
+    # to install even if this account already has wider sudo access
+    # (e.g. a personal dev box): an extra, narrower NOPASSWD rule doesn't
+    # loosen anything a broader existing rule already grants.
+    local poweroff_bin
+    poweroff_bin=$(readlink -f /sbin/poweroff 2>/dev/null || echo /sbin/poweroff)
+    local sudoers_file=/etc/sudoers.d/mediacast-poweroff
+    cat > "$sudoers_file" <<EOF
+# Installed by bootstrap.sh (install_projector_session) — lets the
+# mediacast-host helper power off the machine when the portal's "Power
+# off server" button is used. Scoped to exactly this command, no args.
+$SUDO_USER ALL=(root) NOPASSWD: $poweroff_bin
+EOF
+    chmod 440 "$sudoers_file"
+    if visudo -cf "$sudoers_file" >/dev/null 2>&1; then
+        success "poweroff sudo rule installed for $SUDO_USER ($poweroff_bin)"
+    else
+        rm -f "$sudoers_file"
+        warn "poweroff sudoers rule failed validation — not installed; the portal's power-off button won't work until this is fixed"
+    fi
+
     # 5. Firefox systemd --user unit — keeps a Firefox instance up so
     # the helper's --new-tab is instant. Replaces an older
     # autostart .desktop file: that only fired once at session start,

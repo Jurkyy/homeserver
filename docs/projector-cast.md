@@ -206,6 +206,23 @@ Waterfall, 🔥 Fire by default) and a "⏻ Screen off" button.
   `/ui-screensaver-state`) — restarting the container doesn't lose it,
   restarting `mediacast-host` does (resets to "nothing showing").
 
+## Danger zone: power off the server
+
+The very bottom of the portal has a "⏻ Power off server" button, behind
+a JS `confirm()` dialog — this shuts down the whole machine, not just
+the projector. It POSTs to `/ui-poweroff` → the host helper's
+`/poweroff` (bearer-token authenticated, same as `/open`/`/control`) →
+`sudo -n /sbin/poweroff` on the box itself.
+
+Requires the account running `mediacast-host` to have passwordless sudo
+for exactly that binary. `bootstrap.sh`'s `install_projector_session`
+installs a scoped `/etc/sudoers.d/mediacast-poweroff` rule for this
+(`$SUDO_USER ALL=(root) NOPASSWD: <path to poweroff>`) — safe to have
+even alongside a broader existing sudo grant, since a narrower rule
+never revokes a wider one. If the button 502s with a poweroff failure,
+check `journalctl --user -u mediacast-host -e` for `poweroff command
+failed` and confirm that sudoers rule is present (`sudo -n -l`).
+
 ## Troubleshooting
 
 | Symptom | Check |
