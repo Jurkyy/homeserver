@@ -1155,18 +1155,55 @@ def stop_active_playback() -> str:
     return " ".join(notes)
 
 
-def control_volume(*, absolute: int | None = None, delta: int | None = None) -> tuple[int, str]:
-    """Set or nudge the default PulseAudio sink volume.
+# application.process.binary / application.name values PulseAudio tags
+# our own cast backends with — used to find "the stream this portal is
+# currently driving" among whatever else is on the bus (turntable
+# loopback, librespot).
+_CAST_STREAM_BINARIES = {"firefox-esr", "mpv"}
+_CAST_STREAM_APP_NAMES = {"Firefox", "mpv"}
 
-    pactl talks to the user-session PulseAudio (the same instance
-    Firefox + mpv push audio into). It does NOT affect librespot,
-    which writes to ALSA directly — that volume is controlled from
-    the Spotify app and is intentionally separate.
 
-    `set-sink-volume @DEFAULT_SINK@` is a single source of truth:
-    whatever sink the user has selected (typically the Scarlett) is
-    the one that moves.
+def _active_cast_sink_input() -> dict | None:
+    """Return the PulseAudio sink-input dict for the currently playing
+    cast (Firefox or mpv), or None if neither has an active stream.
+
+    Deliberately does NOT touch @DEFAULT_SINK@ (the shared hardware
+    sink). Since librespot switched to the pulseaudio backend (see
+    docker-compose.yml), Spotify and the turntable loopback mix into
+    that same sink — moving its volume from here would take them down
+    with the video-cast audio, which is exactly the bug that made
+    Spotify go quiet after a reboot once. Targeting the Firefox/mpv
+    sink-input's own per-stream volume instead means only the cast
+    audio moves. PulseAudio persists per-app stream volume across
+    restarts on its own (module-stream-restore, keyed by application
+    name), so this survives reboots with no extra plumbing.
     """
+    proc = subprocess.run(
+        ["pactl", "-f", "json", "list", "sink-inputs"],
+        capture_output=True,
+        text=True,
+        timeout=SUBPROC_TIMEOUT,
+        check=False,
+    )
+    try:
+        inputs = json.loads(proc.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    for si in inputs:
+        props = si.get("properties", {})
+        binary = props.get("application.process.binary", "")
+        name = props.get("application.name", "")
+        if binary in _CAST_STREAM_BINARIES or name in _CAST_STREAM_APP_NAMES:
+            return si
+    return None
+
+
+def control_volume(*, absolute: int | None = None, delta: int | None = None) -> tuple[int, str]:
+    """Set or nudge the active cast stream's own PulseAudio volume."""
+    si = _active_cast_sink_input()
+    if si is None:
+        return 1, "no active cast stream (nothing playing)"
+    idx = si["index"]
     if absolute is not None:
         absolute = max(0, min(100, int(absolute)))
         arg = f"{absolute}%"
@@ -1175,25 +1212,28 @@ def control_volume(*, absolute: int | None = None, delta: int | None = None) -> 
         arg = f"{sign}{abs(int(delta))}%"
     else:
         return 1, "neither set nor delta provided"
-    rc, out = _run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", arg])
+    rc, out = _run(["pactl", "set-sink-input-volume", str(idx), arg])
     if rc != 0:
         return rc, f"pactl: {out!r}"
-    # Read back the volume so the UI can render the new value.
-    rc2, out2 = _run(["pactl", "get-sink-volume", "@DEFAULT_SINK@"])
-    # Output looks like "Volume: front-left: 39322 / 60% / -13.36 dB, ..."
-    import re
-    m = re.search(r"(\d+)\s*%", out2)
-    pct = int(m.group(1)) if m else -1
+    si = _active_cast_sink_input()
+    pct = _sink_input_volume_pct(si) if si is not None else -1
     return 0, f"{arg} -> {pct}%"
 
 
 def control_volume_get() -> tuple[int, int]:
-    rc, out = _run(["pactl", "get-sink-volume", "@DEFAULT_SINK@"])
-    if rc != 0:
-        return rc, -1
-    import re
-    m = re.search(r"(\d+)\s*%", out)
-    return 0, (int(m.group(1)) if m else -1)
+    si = _active_cast_sink_input()
+    if si is None:
+        return 1, -1
+    return 0, _sink_input_volume_pct(si)
+
+
+def _sink_input_volume_pct(si: dict) -> int:
+    # "volume": {"front-left": {"value_percent": "84%", ...}, ...}
+    try:
+        pct = si["volume"]["front-left"]["value_percent"]
+        return int(pct.rstrip("%"))
+    except (KeyError, ValueError):
+        return -1
 
 
 def youtube_go_fullscreen(url: str = "") -> str:
