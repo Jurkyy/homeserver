@@ -30,6 +30,8 @@ import json
 import logging
 import os
 import re
+import socket
+import struct
 import subprocess
 import threading
 import time
@@ -306,6 +308,11 @@ def open_in_mpv(
         "--cache=yes",
         "--demuxer-max-bytes=150MiB",
         "--demuxer-readahead-secs=60",
+        # Start at the portal's last-set volume, not mpv's own 100%
+        # default — see _desired_volume. A freshly-spawned process here
+        # (every cast kills the old one and starts a new one) has nothing
+        # to restore from otherwise.
+        f"--volume={_desired_volume}",
     ]
     if title:
         # Drives the UI's "Now playing" label (read back as mpv's
@@ -674,23 +681,46 @@ def _playerctl(*args: str, timeout: float = 4.0) -> tuple[int, str]:
 
 CDP_PORT = int(os.environ.get("MEDIACAST_CDP_PORT", "9222"))
 CDP_BASE = f"http://127.0.0.1:{CDP_PORT}"
-# _cdp_eval opens a brand-new WebSocket connection per call. Two threads
-# doing that at once — the portal's ~1Hz status poll and
-# youtube_go_fullscreen's own ~3Hz settle-loop polling right after a cast
-# — measurably contend with each other (observed: normally ~0.1s calls
-# stretching to 1.5-2s during that overlap, which is what made the portal
-# feel like it hung right after casting). Serializing all CDP access
-# behind one lock keeps calls to one at a time instead of two connections
-# fighting over Firefox's single debugger session.
+# _cdp_eval used to open a brand-new WebSocket connection (+ a fresh
+# Runtime.enable handshake) per call. Two threads doing that at once — the
+# portal's ~1Hz status poll and youtube_go_fullscreen's own ~3Hz settle-loop
+# polling right after a cast — measurably contended with each other
+# (observed: normally ~0.1s calls stretching to 1.5-2s during that overlap,
+# and up to 20s+ once the settle loop's dozens of reconnect-and-enable
+# round trips piled up behind the lock — this is the "cast takes forever
+# to load/fullscreen" slowness). Serializing all CDP access behind one
+# lock stops two connections fighting over Firefox's single debugger
+# session; keeping one persistent connection per tab (_cdp_conns) on top
+# of that removes the reconnect+enable cost from every call after the
+# first, so a lock holder's turn is a single send/recv instead of a full
+# handshake.
 _cdp_lock = threading.Lock()
-# Read currentTime/duration/paused + a cleaned title in one round-trip.
-_CDP_STATE_JS = (
-    "(()=>{const v=document.querySelector('video');return v?"
-    "{t:v.currentTime,d:v.duration,p:v.paused,"
-    # Strip YouTube's "(3) " unread-count prefix and " - YouTube" suffix.
-    "title:(document.title||'').replace(/^\\(\\d+\\)\\s*/,'').replace(/ - YouTube$/,'')}"
-    ":null})()"
-)
+# ws_url -> {"sock": socket, "next_id": int}. Torn down whenever we close
+# tabs (the cached tab may no longer exist) — see _cdp_reset_conns.
+_cdp_conns: dict[str, dict] = {}
+def _cdp_state_js() -> str:
+    """JS for the ~1Hz status poll: currentTime/duration/paused + a cleaned
+    title in one round-trip. Also self-heals a *fresh* <video> element —
+    not just the one our own cast flow (youtube_go_fullscreen) creates,
+    but one YouTube's own "autoplay next video" swaps in on its own, with
+    no /open call and no CDP hook of ours involved. That element starts
+    at its own 100% default with nothing to reset it, which is exactly
+    the "volume randomly jumps back to max" report once the initial-cast
+    fix (youtube_go_fullscreen) stopped covering every case. Every poll
+    checks the live <video> for our __mcInit marker and, the first time
+    it's missing, zeroes currentTime and applies the portal's remembered
+    volume — same correction, just running continuously instead of only
+    right after a cast.
+    """
+    return (
+        "(()=>{const v=document.querySelector('video');if(!v)return null;"
+        "if(!v.__mcInit){v.__mcInit=1;v.currentTime=0;"
+        f"v.volume=Math.max(0,Math.min(1,{_desired_volume}/100));}}"
+        "return {t:v.currentTime,d:v.duration,p:v.paused,"
+        # Strip YouTube's "(3) " unread-count prefix and " - YouTube" suffix.
+        "title:(document.title||'').replace(/^\\(\\d+\\)\\s*/,'').replace(/ - YouTube$/,'')}"
+        "})()"
+    )
 
 
 def _cdp_target_ws(prefer: str | None = None) -> str | None:
@@ -765,6 +795,8 @@ def _cdp_close_other_tabs(keep_vid: str) -> int:
             closed += 1
         except (OSError, ValueError, KeyError):
             pass
+    if closed:
+        _cdp_reset_conns()
     return closed
 
 
@@ -803,123 +835,172 @@ def _cdp_close_media_tabs() -> int:
             remaining -= 1
         except (OSError, ValueError, KeyError):
             pass
+    if closed:
+        _cdp_reset_conns()
     return closed
+
+
+def _cdp_ws_send(s: socket.socket, text: str) -> None:
+    payload = text.encode()
+    mask = os.urandom(4)
+    n = len(payload)
+    hdr = bytearray([0x81])
+    if n < 126:
+        hdr.append(0x80 | n)
+    elif n < 65536:
+        hdr.append(0x80 | 126); hdr += struct.pack(">H", n)
+    else:
+        hdr.append(0x80 | 127); hdr += struct.pack(">Q", n)
+    hdr += mask
+    s.sendall(bytes(hdr) + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+
+def _cdp_ws_recv(s: socket.socket) -> dict:
+    def rx(n: int) -> bytes:
+        data = b""
+        while len(data) < n:
+            part = s.recv(n - len(data))
+            if not part:
+                raise OSError("ws closed")
+            data += part
+        return data
+
+    h = rx(2)
+    opcode = h[0] & 0x0f
+    n = h[1] & 0x7f
+    if n == 126:
+        n = struct.unpack(">H", rx(2))[0]
+    elif n == 127:
+        n = struct.unpack(">Q", rx(8))[0]
+    body = rx(n) if n else b""
+    if opcode == 0x8:
+        raise OSError("ws closed (close frame)")
+    return json.loads(body.decode("utf-8", "replace")) if body else {}
+
+
+def _cdp_connect(ws_url: str, timeout: float) -> dict | None:
+    """Open a new CDP WebSocket to ws_url and enable the Runtime domain.
+
+    Returns {"sock", "next_id"} cached by the caller in _cdp_conns and
+    reused across calls — see _cdp_eval for why reconnecting+re-enabling
+    on every call was the main source of cast/poll latency.
+    """
+    u = urlparse(ws_url)
+    s = socket.create_connection((u.hostname, u.port), timeout=timeout)
+    s.settimeout(timeout)
+    key = base64.b64encode(os.urandom(16)).decode()
+    path = u.path + (("?" + u.query) if u.query else "")
+    s.sendall((
+        f"GET {path} HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\n"
+        f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    ).encode())
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = s.recv(1)
+        if not chunk:
+            s.close()
+            return None
+        buf += chunk
+    if b" 101 " not in buf.split(b"\r\n", 1)[0]:
+        s.close()
+        return None
+    # Firefox CDP needs Runtime.enable to create the page's execution
+    # context before evaluate works ("context is null" otherwise). Wait
+    # for the executionContextCreated event, then evaluate in it. Only
+    # paid once per connection now, not once per call.
+    _cdp_ws_send(s, json.dumps({"id": 1, "method": "Runtime.enable"}))
+    for _ in range(25):
+        msg = _cdp_ws_recv(s)
+        if msg.get("method") == "Runtime.executionContextCreated":
+            break
+    return {"sock": s, "next_id": 1}
+
+
+def _cdp_evaluate(entry: dict, expr: str) -> object:
+    entry["next_id"] += 1
+    mid = entry["next_id"]
+    _cdp_ws_send(entry["sock"], json.dumps({
+        "id": mid, "method": "Runtime.evaluate",
+        "params": {"expression": expr, "returnByValue": True, "awaitPromise": True},
+    }))
+    for _ in range(25):
+        msg = _cdp_ws_recv(entry["sock"])
+        if msg.get("id") == mid:
+            return (msg.get("result", {}).get("result", {}) or {}).get("value")
+    return None
+
+
+def _cdp_reset_conns() -> None:
+    """Drop all cached CDP connections. Call whenever tabs are closed —
+    a cached connection for a now-closed tab is dead weight (and its
+    socket eventually errors anyway), so this just reclaims it eagerly."""
+    with _cdp_lock:
+        for entry in _cdp_conns.values():
+            try:
+                entry["sock"].close()
+            except OSError:
+                pass
+        _cdp_conns.clear()
 
 
 def _cdp_eval(expr: str, timeout: float = 3.0, prefer: str | None = None):
     """Runtime.evaluate `expr` in the cast Firefox page; return its value.
 
-    Minimal stdlib WebSocket client, one short-lived connection per call —
-    simple and robust at the portal's ~1 Hz poll. returnByValue gives JSON
-    back. Returns None on any failure (no CDP, no <video>, JS error).
+    Keeps one persistent WebSocket per tab (_cdp_conns), reused across
+    calls — the portal's ~1Hz status poll and youtube_go_fullscreen's
+    settle-loop polling both hit this, and re-handshaking (TCP connect +
+    WS upgrade + Runtime.enable) on every single call was the main cost
+    behind multi-second "status poll slow" stalls and slow-feeling casts.
+    returnByValue gives JSON back. Returns None on any failure (no CDP,
+    no <video>, JS error, dead connection after one reconnect attempt).
 
     `prefer` narrows the target to a specific tab (see _cdp_target_ws) —
     None here just means "no matching tab (yet)", not an error, so it's
     the quiet early-return above, not logged.
     """
-    import socket as _sock
-    import struct as _struct
-
     ws_url = _cdp_target_ws(prefer)
     if not ws_url:
         return None
-    s = None
     # Serialized (see _cdp_lock) so this is always the only CDP call in
     # flight — a status poll now waits a beat instead of racing a second
     # connection against Firefox's debugger session.
     with _cdp_lock:
-        try:
-            u = urlparse(ws_url)
-            s = _sock.create_connection((u.hostname, u.port), timeout=timeout)
-            s.settimeout(timeout)
-            key = base64.b64encode(os.urandom(16)).decode()
-            path = u.path + (("?" + u.query) if u.query else "")
-            s.sendall((
-                f"GET {path} HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\n"
-                f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
-                f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
-            ).encode())
-            buf = b""
-            while b"\r\n\r\n" not in buf:
-                chunk = s.recv(1)
-                if not chunk:
-                    return None
-                buf += chunk
-            if b" 101 " not in buf.split(b"\r\n", 1)[0]:
-                return None
-
-            def send(text: str) -> None:
-                payload = text.encode()
-                mask = os.urandom(4)
-                n = len(payload)
-                hdr = bytearray([0x81])
-                if n < 126:
-                    hdr.append(0x80 | n)
-                elif n < 65536:
-                    hdr.append(0x80 | 126); hdr += _struct.pack(">H", n)
-                else:
-                    hdr.append(0x80 | 127); hdr += _struct.pack(">Q", n)
-                hdr += mask
-                s.sendall(bytes(hdr) + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
-
-            def rx(n: int) -> bytes:
-                data = b""
-                while len(data) < n:
-                    part = s.recv(n - len(data))
-                    if not part:
-                        raise OSError("ws closed")
-                    data += part
-                return data
-
-            def recv() -> dict:
-                h = rx(2)
-                n = h[1] & 0x7f
-                if n == 126:
-                    n = _struct.unpack(">H", rx(2))[0]
-                elif n == 127:
-                    n = _struct.unpack(">Q", rx(8))[0]
-                return json.loads(rx(n).decode("utf-8", "replace"))
-
-            # Firefox CDP needs Runtime.enable to create the page's execution
-            # context before evaluate works ("context is null" otherwise). Wait
-            # for the executionContextCreated event, then evaluate in it.
-            send(json.dumps({"id": 1, "method": "Runtime.enable"}))
-            for _ in range(25):
-                msg = recv()
-                if msg.get("method") == "Runtime.executionContextCreated":
-                    break
-                if msg.get("id") == 1:
-                    # enable acked; context event should follow imminently
-                    continue
-            send(json.dumps({
-                "id": 2, "method": "Runtime.evaluate",
-                "params": {"expression": expr, "returnByValue": True, "awaitPromise": True},
-            }))
-            for _ in range(25):
-                msg = recv()
-                if msg.get("id") == 2:
-                    return (msg.get("result", {}).get("result", {}) or {}).get("value")
-            return None
-        except (OSError, ValueError, KeyError, IndexError) as exc:
-            # ws_url was found (a real target existed), so this is a genuine
-            # failure mid-connection/eval — e.g. Firefox's CDP port wedged.
-            # Worth a log line: this is the quiet failure mode behind past
-            # portal hangs, where nothing else recorded that CDP had stopped
-            # answering.
-            LOG.warning("cdp eval failed (%s): %s", type(exc).__name__, exc)
-            return None
-        finally:
-            if s is not None:
+        entry = _cdp_conns.get(ws_url)
+        for attempt in range(2):
+            if entry is None:
                 try:
-                    s.close()
+                    entry = _cdp_connect(ws_url, timeout)
+                except (OSError, ValueError) as exc:
+                    LOG.warning("cdp connect failed (%s): %s", type(exc).__name__, exc)
+                    return None
+                if entry is None:
+                    return None
+                _cdp_conns[ws_url] = entry
+            entry["sock"].settimeout(timeout)
+            try:
+                return _cdp_evaluate(entry, expr)
+            except (OSError, ValueError, KeyError, IndexError) as exc:
+                # The cached connection is dead (tab closed/navigated,
+                # Firefox's CDP port wedged) — drop it and retry once
+                # with a fresh connection before giving up.
+                if attempt == 0:
+                    LOG.debug("cdp conn stale (%s): %s — reconnecting", type(exc).__name__, exc)
+                else:
+                    LOG.warning("cdp eval failed (%s): %s", type(exc).__name__, exc)
+                try:
+                    entry["sock"].close()
                 except OSError:
                     pass
+                _cdp_conns.pop(ws_url, None)
+                entry = None
+        return None
 
 
 def firefox_cdp_state() -> dict | None:
     """{position, duration, paused, title} from the YouTube <video> via CDP,
     or None when CDP/the video isn't available (caller falls back to MPRIS)."""
-    v = _cdp_eval(_CDP_STATE_JS)
+    v = _cdp_eval(_cdp_state_js())
     if not isinstance(v, dict):
         return None
     pos, dur = v.get("t"), v.get("d")
@@ -1155,85 +1236,116 @@ def stop_active_playback() -> str:
     return " ".join(notes)
 
 
-# application.process.binary / application.name values PulseAudio tags
-# our own cast backends with — used to find "the stream this portal is
-# currently driving" among whatever else is on the bus (turntable
-# loopback, librespot).
-_CAST_STREAM_BINARIES = {"firefox-esr", "mpv"}
-_CAST_STREAM_APP_NAMES = {"Firefox", "mpv"}
+# Portal-driven cast volume, applied at the *player* level instead of
+# PulseAudio: mpv's own "volume" property for mpv casts, the <video>
+# element's .volume for browser YouTube casts. This intentionally never
+# touches PulseAudio sink/sink-input volume, for two reasons:
+#   - @DEFAULT_SINK@ is shared with Spotify (librespot) and the turntable
+#     loopback (see docker-compose.yml) — moving it from here drags them
+#     down with the video-cast audio, which once made Spotify go quiet
+#     after a reboot.
+#   - Targeting the *sink-input*'s own volume (the previous fix for that)
+#     only survives as long as that particular stream lives. Every cast
+#     kills the old stream and starts a brand new one (a fresh mpv
+#     process, or a fresh Firefox tab/<video> via --new-tab) which starts
+#     back at its own 100% default — PulseAudio's module-stream-restore
+#     did not reliably catch this in practice, so every single new video
+#     played at full volume until manually pulled back down. Setting the
+#     player's own volume — passed to mpv at spawn, and (re-)applied to
+#     the new <video> element as soon as it exists, see
+#     youtube_go_fullscreen — means a fresh stream starts at the right
+#     level with nothing to restore.
+_desired_volume: int = max(0, min(100, int(os.environ.get("MEDIACAST_DEFAULT_VOLUME", "60"))))
 
 
-def _active_cast_sink_input() -> dict | None:
-    """Return the PulseAudio sink-input dict for the currently playing
-    cast (Firefox or mpv), or None if neither has an active stream.
-
-    Deliberately does NOT touch @DEFAULT_SINK@ (the shared hardware
-    sink). Since librespot switched to the pulseaudio backend (see
-    docker-compose.yml), Spotify and the turntable loopback mix into
-    that same sink — moving its volume from here would take them down
-    with the video-cast audio, which is exactly the bug that made
-    Spotify go quiet after a reboot once. Targeting the Firefox/mpv
-    sink-input's own per-stream volume instead means only the cast
-    audio moves. PulseAudio persists per-app stream volume across
-    restarts on its own (module-stream-restore, keyed by application
-    name), so this survives reboots with no extra plumbing.
-    """
-    proc = subprocess.run(
-        ["pactl", "-f", "json", "list", "sink-inputs"],
-        capture_output=True,
-        text=True,
-        timeout=SUBPROC_TIMEOUT,
-        check=False,
-    )
-    try:
-        inputs = json.loads(proc.stdout)
-    except (json.JSONDecodeError, TypeError):
+def _mpv_get_property(prop: str, rid: int = 90) -> float | None:
+    """Like the `get()` helper in mpv_playback_state, standalone: send one
+    get_property and match the reply by request_id so an interleaved mpv
+    event can't be mistaken for the answer."""
+    if not os.path.exists(MPV_IPC_SOCK):
         return None
-    for si in inputs:
-        props = si.get("properties", {})
-        binary = props.get("application.process.binary", "")
-        name = props.get("application.name", "")
-        if binary in _CAST_STREAM_BINARIES or name in _CAST_STREAM_APP_NAMES:
-            return si
-    return None
+    try:
+        s = socket.socket(socket.AF_UNIX)
+        s.settimeout(2.0)
+        s.connect(MPV_IPC_SOCK)
+        s.sendall(json.dumps({"command": ["get_property", prop], "request_id": rid}).encode() + b"\n")
+        buf = b""
+        while True:
+            chunk = s.recv(1024)
+            if not chunk:
+                return None
+            buf += chunk
+            for line in buf.split(b"\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("request_id") == rid:
+                    data = msg.get("data")
+                    if msg.get("error") == "success" and isinstance(data, (int, float)):
+                        return float(data)
+                    return None
+    except OSError:
+        return None
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def _cdp_set_volume(pct: int) -> bool:
+    v = _cdp_eval(
+        "(()=>{const v=document.querySelector('video');if(!v)return null;"
+        f"v.volume=Math.max(0,Math.min(1,{pct}/100));return Math.round(v.volume*100)}})()"
+    )
+    return isinstance(v, (int, float))
+
+
+def _cdp_get_volume() -> int | None:
+    v = _cdp_eval(
+        "(()=>{const v=document.querySelector('video');"
+        "return v?Math.round(v.volume*100):null})()"
+    )
+    return int(v) if isinstance(v, (int, float)) else None
 
 
 def control_volume(*, absolute: int | None = None, delta: int | None = None) -> tuple[int, str]:
-    """Set or nudge the active cast stream's own PulseAudio volume."""
-    si = _active_cast_sink_input()
-    if si is None:
-        return 1, "no active cast stream (nothing playing)"
-    idx = si["index"]
+    """Set or nudge the portal's remembered cast volume, applying it live
+    to whichever backend is currently playing (see _desired_volume)."""
+    global _desired_volume
     if absolute is not None:
-        absolute = max(0, min(100, int(absolute)))
-        arg = f"{absolute}%"
+        _desired_volume = max(0, min(100, int(absolute)))
     elif delta is not None:
-        sign = "+" if delta >= 0 else "-"
-        arg = f"{sign}{abs(int(delta))}%"
+        _desired_volume = max(0, min(100, _desired_volume + int(delta)))
     else:
         return 1, "neither set nor delta provided"
-    rc, out = _run(["pactl", "set-sink-input-volume", str(idx), arg])
-    if rc != 0:
-        return rc, f"pactl: {out!r}"
-    si = _active_cast_sink_input()
-    pct = _sink_input_volume_pct(si) if si is not None else -1
-    return 0, f"{arg} -> {pct}%"
+    rc, out = _mpv_command(["set_property", "volume", _desired_volume])
+    if rc == 0:
+        return 0, f"mpv volume -> {_desired_volume}%"
+    if rc != 404:
+        return rc, f"mpv: {out}"
+    if _cdp_set_volume(_desired_volume):
+        return 0, f"cdp volume -> {_desired_volume}%"
+    # Nothing currently playing to apply it to — still record the choice
+    # (see _desired_volume) so the next cast starts at this level.
+    return 1, "no active cast stream (remembered for next cast)"
 
 
 def control_volume_get() -> tuple[int, int]:
-    si = _active_cast_sink_input()
-    if si is None:
-        return 1, -1
-    return 0, _sink_input_volume_pct(si)
-
-
-def _sink_input_volume_pct(si: dict) -> int:
-    # "volume": {"front-left": {"value_percent": "84%", ...}, ...}
-    try:
-        pct = si["volume"]["front-left"]["value_percent"]
-        return int(pct.rstrip("%"))
-    except (KeyError, ValueError):
-        return -1
+    v = _mpv_get_property("volume")
+    if v is not None:
+        return 0, int(round(v))
+    v = _cdp_get_volume()
+    if v is not None:
+        return 0, v
+    # Idle screen — report the last value the slider set rather than an
+    # error, so the portal's slider reflects what the *next* cast will
+    # play at instead of going blank.
+    return 0, _desired_volume
 
 
 def youtube_go_fullscreen(url: str = "") -> str:
@@ -1317,13 +1429,23 @@ def youtube_go_fullscreen(url: str = "") -> str:
 
     # 1) Ensure playing: call video.play() directly in the target tab
     # until the player reports playing(1)/buffering(3). No OS focus or
-    # window activation involved — this can't hit the wrong tab.
+    # window activation involved — this can't hit the wrong tab. The
+    # first time we see the <video> element, also force currentTime to 0
+    # and apply the portal's last-set volume: a logged-in YouTube account
+    # (required to dodge the bot wall — see resolve_youtube) auto-resumes
+    # a previously-watched video's saved position, and a fresh <video>
+    # element always starts at its own 100% rather than remembering the
+    # slider, so without this every cast can start mid-video and at full
+    # volume. __mcInit guards it to once per element so a later poll here
+    # doesn't keep yanking playback back to 0.
     for _ in range(8):
         if player_state() in (1, 3):
             break
         _cdp_eval(
-            "(()=>{const v=document.querySelector('video');"
-            "if(v)v.play().catch(()=>{});return null})()",
+            "(()=>{const v=document.querySelector('video');if(!v)return null;"
+            "if(!v.__mcInit){v.__mcInit=1;v.currentTime=0;"
+            f"v.volume=Math.max(0,Math.min(1,{_desired_volume}/100));}}"
+            "v.play().catch(()=>{});return null})()",
             prefer=vid,
         )
         time.sleep(0.5)
