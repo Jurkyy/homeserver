@@ -439,6 +439,51 @@ X-GNOME-Autostart-enabled=false
 EOF
     pkill -x -u "$SUDO_USER" light-locker 2>/dev/null || true
 
+    # 6c. Disable xfce4-power-manager's own DPMS/blank management. Xfce
+    # runs its own power-manager daemon that enforces its *own* idle
+    # timeouts (dpms-on-ac-off / dpms-on-ac-sleep / blank-on-ac) directly
+    # against the DPMS/screensaver state, completely independent of the
+    # plain `xset` timeouts set above — and its packaged defaults
+    # (dpms-on-ac-off/-sleep=60) blanked the projector after just 60s of
+    # no mouse/keyboard input, regardless of whether a video was actively
+    # playing, silently overriding the intended 1-hour `xset` idle from
+    # ~/.xprofile. Since X's own idle timers already know nothing about
+    # playback either way, having two competing idle managers only made
+    # it worse — one X-level idle policy (step 6, 1 hour) is enough.
+    # Written directly into the xfconf channel file (rather than via
+    # `xfconf-query`, which needs a live X session) so it's already
+    # correct before xfce4-power-manager's first launch on a fresh box.
+    local xfconf_dir="$user_home/.config/xfce4/xfconf/xfce-perchannel-xml"
+    local power_xml="$xfconf_dir/xfce4-power-manager.xml"
+    sudo -u "$SUDO_USER" mkdir -p "$xfconf_dir"
+    sudo -u "$SUDO_USER" python3 - "$power_xml" <<'PYEOF'
+import sys
+import xml.etree.ElementTree as ET
+
+path = sys.argv[1]
+DESIRED = {"dpms-enabled": ("bool", "false"), "blank-on-ac": ("int", "0")}
+
+try:
+    tree = ET.parse(path)
+    root = tree.getroot()
+except (FileNotFoundError, ET.ParseError):
+    root = ET.Element("channel", {"name": "xfce4-power-manager", "version": "1.0"})
+    tree = ET.ElementTree(root)
+
+top = root.find("./property[@name='xfce4-power-manager']")
+if top is None:
+    top = ET.SubElement(root, "property", {"name": "xfce4-power-manager", "type": "empty"})
+
+for name, (ptype, value) in DESIRED.items():
+    prop = top.find(f"./property[@name='{name}']")
+    if prop is None:
+        prop = ET.SubElement(top, "property", {"name": name})
+    prop.set("type", ptype)
+    prop.set("value", value)
+
+tree.write(path, encoding="UTF-8", xml_declaration=True)
+PYEOF
+
     # 7. Systemd --user unit for the host helper, plus linger so it
     # runs across SSH disconnects (and starts on boot once the user
     # session exists).
