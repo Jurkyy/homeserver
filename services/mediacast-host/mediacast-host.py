@@ -698,24 +698,70 @@ _cdp_lock = threading.Lock()
 # ws_url -> {"sock": socket, "next_id": int}. Torn down whenever we close
 # tabs (the cached tab may no longer exist) — see _cdp_reset_conns.
 _cdp_conns: dict[str, dict] = {}
+
+
+def _mc_lock_volume_js(v_expr: str, desired_expr: str) -> str:
+    """JS: pin `v_expr`'s real volume to `desired_expr` (0-100) and make it
+    stick — override the HTMLMediaElement volume accessor on this specific
+    element so any *later* write to .volume, from anyone (YouTube's own
+    player re-applying the logged-in account's saved volume, an ad module,
+    a fullscreen/quality-change reinit — whatever it turns out to be) is
+    silently redirected back to our value instead of taking effect. Only
+    `_mc_set_volume_js` (below) can actually move it after that.
+
+    649c8fd's fix only ever set .volume once, when a <video> element first
+    appeared, on the theory that a fresh 100%-default element was the only
+    way this goes wrong. It wasn't: something was still overwriting the
+    *same* element's volume a minute or two into playback, well after
+    __mcInit had already fired, so that one-shot set went uncorrected. This
+    closes that off structurally — nothing can push an unwanted volume
+    through in the first place — instead of racing to poll for drift after
+    the fact.
+
+    Idempotent (v.__mcDesc marks "already locked"), so it's cheap to call
+    on every poll and only does anything the first time it sees a given
+    element.
+    """
+    return (
+        f"if(!{v_expr}.__mcDesc){{"
+        f"const d=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'volume');"
+        f"{v_expr}.__mcDesc=d;"
+        f"{v_expr}.__mcVol=Math.max(0,Math.min(1,({desired_expr})/100));"
+        f"d.set.call({v_expr},{v_expr}.__mcVol);"
+        f"Object.defineProperty({v_expr},'volume',{{configurable:true,"
+        f"get(){{return d.get.call({v_expr});}},"
+        f"set(x){{d.set.call({v_expr},{v_expr}.__mcVol);}}}});"
+        f"}}"
+    )
+
+
+def _mc_set_volume_js(v_expr: str, pct_expr: str) -> str:
+    """JS: actually change `v_expr`'s volume to `pct_expr` (0-100) — the
+    only way to move it once _mc_lock_volume_js has locked the element;
+    falls back to a plain assignment if the lock isn't installed yet
+    (e.g. a video element CDP hasn't polled at all since it appeared)."""
+    return (
+        f"if({v_expr}.__mcDesc){{"
+        f"{v_expr}.__mcVol=Math.max(0,Math.min(1,({pct_expr})/100));"
+        f"{v_expr}.__mcDesc.set.call({v_expr},{v_expr}.__mcVol);"
+        f"}}else{{{v_expr}.volume=Math.max(0,Math.min(1,({pct_expr})/100));}}"
+    )
+
+
 def _cdp_state_js() -> str:
     """JS for the ~1Hz status poll: currentTime/duration/paused + a cleaned
     title in one round-trip. Also self-heals a *fresh* <video> element —
     not just the one our own cast flow (youtube_go_fullscreen) creates,
     but one YouTube's own "autoplay next video" swaps in on its own, with
-    no /open call and no CDP hook of ours involved. That element starts
-    at its own 100% default with nothing to reset it, which is exactly
-    the "volume randomly jumps back to max" report once the initial-cast
-    fix (youtube_go_fullscreen) stopped covering every case. Every poll
-    checks the live <video> for our __mcInit marker and, the first time
-    it's missing, zeroes currentTime and applies the portal's remembered
-    volume — same correction, just running continuously instead of only
-    right after a cast.
+    no /open call and no CDP hook of ours involved — by zeroing its
+    currentTime once (__mcInit) and locking its volume (see
+    _mc_lock_volume_js) so nothing can push it back to the 100% default
+    afterwards, from this element's creation to the end of its life.
     """
     return (
         "(()=>{const v=document.querySelector('video');if(!v)return null;"
-        "if(!v.__mcInit){v.__mcInit=1;v.currentTime=0;"
-        f"v.volume=Math.max(0,Math.min(1,{_desired_volume}/100));}}"
+        "if(!v.__mcInit){v.__mcInit=1;v.currentTime=0;}"
+        f"{_mc_lock_volume_js('v', str(_desired_volume))}"
         "return {t:v.currentTime,d:v.duration,p:v.paused,"
         # Strip YouTube's "(3) " unread-count prefix and " - YouTube" suffix.
         "title:(document.title||'').replace(/^\\(\\d+\\)\\s*/,'').replace(/ - YouTube$/,'')}"
@@ -1255,6 +1301,14 @@ def stop_active_playback() -> str:
 #     the new <video> element as soon as it exists, see
 #     youtube_go_fullscreen — means a fresh stream starts at the right
 #     level with nothing to restore.
+#   - Setting the <video>'s .volume once, on creation, wasn't the end of
+#     it either: something (most likely YouTube's own player re-applying
+#     the logged-in account's saved volume — we're forced onto a logged-in
+#     account to dodge the bot wall, see resolve_youtube) kept overwriting
+#     it a minute or two into playback, well after that one-shot set had
+#     already run. See _mc_lock_volume_js for the actual fix: the element's
+#     volume accessor is overridden so no later write, from anyone, can
+#     take effect except through our own _mc_set_volume_js.
 _desired_volume: int = max(0, min(100, int(os.environ.get("MEDIACAST_DEFAULT_VOLUME", "60"))))
 
 
@@ -1300,7 +1354,8 @@ def _mpv_get_property(prop: str, rid: int = 90) -> float | None:
 def _cdp_set_volume(pct: int) -> bool:
     v = _cdp_eval(
         "(()=>{const v=document.querySelector('video');if(!v)return null;"
-        f"v.volume=Math.max(0,Math.min(1,{pct}/100));return Math.round(v.volume*100)}})()"
+        f"{_mc_set_volume_js('v', str(pct))}"
+        "return Math.round(v.volume*100)})()"
     )
     return isinstance(v, (int, float))
 
@@ -1443,8 +1498,8 @@ def youtube_go_fullscreen(url: str = "") -> str:
             break
         _cdp_eval(
             "(()=>{const v=document.querySelector('video');if(!v)return null;"
-            "if(!v.__mcInit){v.__mcInit=1;v.currentTime=0;"
-            f"v.volume=Math.max(0,Math.min(1,{_desired_volume}/100));}}"
+            "if(!v.__mcInit){v.__mcInit=1;v.currentTime=0;}"
+            f"{_mc_lock_volume_js('v', str(_desired_volume))}"
             "v.play().catch(()=>{});return null})()",
             prefer=vid,
         )
