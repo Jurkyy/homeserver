@@ -393,18 +393,24 @@ async def _jf_authenticate(client: httpx.AsyncClient) -> tuple[str, str]:
 
 
 async def _jf_request(method: str, path: str, **kw) -> httpx.Response:
-    """Call the Jellyfin API with the cached token, re-authing once on 401."""
+    """Call the Jellyfin API with the cached token, re-authing once on 401.
+
+    The token rides in the Authorization header (Jellyfin dropped support
+    for the legacy X-Emby-Token header / api_key query param on the REST
+    API somewhere around when jf.mrplink.com was last upgraded — only the
+    plain media-streaming endpoints still accept api_key).
+    """
     global _jf_token, _jf_user_id
     async with httpx.AsyncClient(timeout=JELLYFIN_TIMEOUT) as client:
         token, _ = await _jf_authenticate(client)
-        headers = {**kw.pop("headers", {}), "X-Emby-Token": token}
+        headers = {**kw.pop("headers", {}), "Authorization": f'{_JF_AUTH_HEADER}, Token="{token}"'}
         r = await client.request(method, f"{JELLYFIN_URL}{path}", headers=headers, **kw)
         if r.status_code == 401:
             # Token expired/revoked — drop the cache, re-auth, retry once.
             async with _jf_lock:
                 _jf_token = _jf_user_id = None
             token, _ = await _jf_authenticate(client)
-            headers["X-Emby-Token"] = token
+            headers["Authorization"] = f'{_JF_AUTH_HEADER}, Token="{token}"'
             r = await client.request(method, f"{JELLYFIN_URL}{path}", headers=headers, **kw)
         return r
 
@@ -853,9 +859,6 @@ _INDEX_HTML = """<!doctype html>
             min-height: 1.4em; font-size: .95rem; word-break: break-all; }
   .status.ok  { background: #1f5132; color: #d1f3dd; }
   .status.err { background: #5d1f1f; color: #f3d1d1; }
-  .bm { display: inline-block; padding: .4rem .9rem; margin: .2rem 0;
-        border: 1px solid currentColor; border-radius: .35rem;
-        text-decoration: none; color: inherit; }
   .controls { display: flex; gap: .5rem; margin: .5rem 0; flex-wrap: wrap; }
   .ctrl { padding: .55rem .9rem; font-size: 1rem; cursor: pointer;
           border: 1px solid currentColor; border-radius: .35rem;
@@ -973,15 +976,6 @@ _INDEX_HTML = """<!doctype html>
   </div>
 </section>
 
-<h2>One-tap from any page</h2>
-<p>Drag this to your bookmarks bar (PC), or save it as a bookmark and
-   tap it from any page (mobile):</p>
-<p><a class="bm" id="bm">Cast to projector</a></p>
-<details>
-  <summary><small>show bookmarklet code (copy-paste for mobile)</small></summary>
-  <pre id="bmcode"></pre>
-</details>
-
 <h2>Screensaver</h2>
 <p><small>Kicks in on its own after a while with nothing playing, or pick one now. "Screen off" blanks the projector until something's cast or a screensaver is picked.</small></p>
 <div class="controls" id="ss-themes"></div>
@@ -997,7 +991,6 @@ _INDEX_HTML = """<!doctype html>
 </div>
 
 <script>
-const HOST = location.host;
 const f = document.getElementById('f');
 const i = document.getElementById('url');
 const s = document.getElementById('s');
@@ -1327,14 +1320,6 @@ document.querySelectorAll('button.collapse').forEach(btn => {
     render();
   });
 });
-
-// Bookmarklet: open the UI in a new tab with ?url=<current>&auto=1.
-// This dodges mixed-content (HTTPS page → HTTP API) because the new
-// tab is loaded over plain HTTP and then does the POST same-origin.
-const bm = "javascript:void(window.open('http://" + HOST +
-           "/?url='+encodeURIComponent(location.href)+'&auto=1','_blank'))";
-document.getElementById('bm').setAttribute('href', bm);
-document.getElementById('bmcode').textContent = bm;
 
 // Screensaver / screen-off. State (which theme's showing, screen-off)
 // lives host-side so it stays right even if this page isn't open when

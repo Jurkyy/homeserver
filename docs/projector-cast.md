@@ -1,14 +1,13 @@
 # Projector / Browser Cast (mediacast)
 
-Send any URL to the projector. Three ways in, all hitting the same
-backend: web UI in any browser, a one-tap bookmarklet, or an Android
-share-menu shortcut. No keyboard on the projector — just send, watch.
+Send any URL to the projector. Two ways in, both hitting the same
+backend: web UI in any browser, or an Android share-menu shortcut. No
+keyboard on the projector — just send, watch.
 
 ## Pipeline
 
 ```
-   web UI form  ─┐
-   bookmarklet  ─┼─→ POST :8765/ui-cast (LAN, no token)  ─┐
+   web UI form    ──→ POST :8765/ui-cast (LAN, no token)  ─┐
                                                           │
    HTTP Shortcuts ──→ POST :8765/cast (bearer token)    ──┤
    curl / scripts ──→ POST :8765/cast (bearer token)    ──┤
@@ -47,20 +46,6 @@ This endpoint is **token-less** — the trust boundary is "you're on the
 LAN" (the page is never exposed publicly; the WAN side stays
 token-protected via `/cast`). Great for guests: stick the URL or a
 QR code near the projector and they're done.
-
-### One-tap bookmarklet
-
-The same page shows a draggable "Cast to projector" bookmarklet. On PC,
-drag it to the bookmarks bar; on mobile, save the page as a bookmark
-and edit its URL to paste the `javascript:…` code shown under "show
-bookmarklet code". Tapping it from any page POSTs the current tab's
-URL — no app needed.
-
-Why it opens a new tab instead of casting silently: HTTPS pages can't
-fetch an HTTP API directly (mixed-content block). The bookmarklet
-sidesteps that by opening the mediacast UI in a new HTTP tab, which
-then casts same-origin and shows you `✓` or the error. Close the tab
-when you're done.
 
 ## Android share-menu shortcut (optional, for any browser)
 
