@@ -1710,9 +1710,21 @@ def _keepawake_watchdog() -> None:
     is running, so an unattended cast (or screensaver) longer than the
     timeout blanks the projector mid-playback. `xset s reset` restarts that
     idle countdown without needing real input, so as long as this loop
-    keeps seeing activity the timeout never fires."""
+    keeps seeing activity the timeout never fires.
+
+    Must skip this entirely over an explicit /screen-off: `xset s reset`
+    doesn't just reset the idle clock, X treats it as real activity and
+    un-blanks an already-DPMS-off display. /screen-off only pauses the
+    Firefox tab rather than closing it (stop_active_playback), so its
+    still-loaded <video> keeps reporting a position — _current_activity()
+    can't tell "paused" from "playing" — and without this check the
+    screen-off would get silently undone within one poll interval."""
     while True:
         time.sleep(KEEPAWAKE_POLL_INTERVAL)
+        with _state_lock:
+            screen_off = _state["screen_off"]
+        if screen_off:
+            continue
         if _current_activity():
             _run(["xset", "s", "reset"])
 
