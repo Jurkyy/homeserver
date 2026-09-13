@@ -215,6 +215,11 @@ SCREENSAVER_DEFAULT = os.environ.get("MEDIACAST_SCREENSAVER_DEFAULT", "woods")
 # page open to notice the idle projector.
 SCREENSAVER_IDLE_TIMEOUT = float(os.environ.get("MEDIACAST_SCREENSAVER_IDLE_TIMEOUT", "900"))
 SCREENSAVER_POLL_INTERVAL = float(os.environ.get("MEDIACAST_SCREENSAVER_POLL_INTERVAL", "20"))
+# How often to check for active playback and, if found, reset X's idle
+# counter so the DPMS/blank timeout (bootstrap.sh step 6, input-idle only)
+# doesn't trip mid-playback. Independent of the screensaver feature above —
+# runs even with SCREENSAVER_IDLE_TIMEOUT=0.
+KEEPAWAKE_POLL_INTERVAL = float(os.environ.get("MEDIACAST_KEEPAWAKE_POLL_INTERVAL", "30"))
 
 
 def _run(cmd: list[str], timeout: float = SUBPROC_TIMEOUT) -> tuple[int, str]:
@@ -311,8 +316,9 @@ def open_in_mpv(
         # Start at the portal's last-set volume, not mpv's own 100%
         # default — see _desired_volume. A freshly-spawned process here
         # (every cast kills the old one and starts a new one) has nothing
-        # to restore from otherwise.
-        f"--volume={_desired_volume}",
+        # to restore from otherwise. Muted instead while a screensaver is
+        # showing — see _effective_volume.
+        f"--volume={_effective_volume()}",
     ]
     if title:
         # Drives the UI's "Now playing" label (read back as mpv's
@@ -761,7 +767,7 @@ def _cdp_state_js() -> str:
     return (
         "(()=>{const v=document.querySelector('video');if(!v)return null;"
         "if(!v.__mcInit){v.__mcInit=1;v.currentTime=0;}"
-        f"{_mc_lock_volume_js('v', str(_desired_volume))}"
+        f"{_mc_lock_volume_js('v', str(_effective_volume()))}"
         "return {t:v.currentTime,d:v.duration,p:v.paused,"
         # Strip YouTube's "(3) " unread-count prefix and " - YouTube" suffix.
         "title:(document.title||'').replace(/^\\(\\d+\\)\\s*/,'').replace(/ - YouTube$/,'')}"
@@ -1499,7 +1505,7 @@ def youtube_go_fullscreen(url: str = "") -> str:
         _cdp_eval(
             "(()=>{const v=document.querySelector('video');if(!v)return null;"
             "if(!v.__mcInit){v.__mcInit=1;v.currentTime=0;}"
-            f"{_mc_lock_volume_js('v', str(_desired_volume))}"
+            f"{_mc_lock_volume_js('v', str(_effective_volume()))}"
             "v.play().catch(()=>{});return null})()",
             prefer=vid,
         )
@@ -1560,6 +1566,22 @@ _state: dict = {
     "screensaver": None,   # theme key currently showing, or None
     "screen_off": False,   # display explicitly turned off via /screen-off
 }
+
+
+def _effective_volume() -> int:
+    """The volume applied to the next/current player element.
+
+    Silent by default while a screensaver is showing — it's ambient
+    wallpaper video, not something anyone asked to hear — otherwise the
+    portal's remembered cast volume (see _desired_volume). The slider
+    still works during a screensaver: control_volume's direct set /
+    _cdp_set_volume calls bypass this and move the real element volume;
+    this only governs the level a *freshly appearing* video element
+    gets locked to."""
+    with _state_lock:
+        if _state["screensaver"]:
+            return 0
+    return _desired_volume
 
 
 def _cast(url: str, want_backend: str = "", want_title: str | None = None) -> tuple[int, str, str]:
@@ -1679,15 +1701,37 @@ def _current_activity() -> bool:
     return False
 
 
+def _keepawake_watchdog() -> None:
+    """Background thread: reset X's idle counter every KEEPAWAKE_POLL_INTERVAL
+    while something is actually playing.
+
+    bootstrap.sh's `xset s 3600 3600` / `xset dpms 3600 3600 3600` idle
+    timeout only tracks mouse/keyboard input — it has no idea a long video
+    is running, so an unattended cast (or screensaver) longer than the
+    timeout blanks the projector mid-playback. `xset s reset` restarts that
+    idle countdown without needing real input, so as long as this loop
+    keeps seeing activity the timeout never fires."""
+    while True:
+        time.sleep(KEEPAWAKE_POLL_INTERVAL)
+        if _current_activity():
+            _run(["xset", "s", "reset"])
+
+
 def _start_screensaver(theme: str) -> tuple[int, str, str]:
     entry = SCREENSAVER_THEMES.get(theme)
     if not entry:
         return 400, "", f"unknown screensaver theme: {theme!r}"
     _, url = entry
+    # Mark the screensaver active *before* casting so _effective_volume()
+    # is already muted by the time the video element first appears —
+    # otherwise the opening seconds would play at the portal's cast volume.
+    with _state_lock:
+        _state["screensaver"] = theme
     rc, backend, out = _cast(url)
     with _state_lock:
         _state["screen_off"] = False
-        _state["screensaver"] = theme if rc == 0 else None
+        if rc != 0:
+            _state["screensaver"] = None
     LOG.info("screensaver theme=%s rc=%s backend=%s", theme, rc, backend)
     return rc, backend, out
 
@@ -1964,13 +2008,18 @@ class Handler(BaseHTTPRequestHandler):
         # title is fetched here by yt-dlp instead; Firefox casts have none.
         want_title = (body.get("title") or "").strip() or None
 
-        rc, backend, out = _cast(url, want_backend=want_backend, want_title=want_title)
         # A real cast always wins over whatever screensaver/screen-off
         # state was active — the whole point of casting is to take over
-        # the projector.
+        # the projector. Cleared *before* _cast() runs, not after: it
+        # kicks off a background thread (youtube_go_fullscreen) that
+        # starts locking the new video element's volume via
+        # _effective_volume() almost immediately, and that lock only
+        # ever applies once — clearing "screensaver" too late could
+        # latch the new cast to the screensaver's muted volume.
         with _state_lock:
             _state["screensaver"] = None
             _state["screen_off"] = False
+        rc, backend, out = _cast(url, want_backend=want_backend, want_title=want_title)
         if rc != 0:
             self._json(502, {"error": f"{backend} failed", "rc": rc, "stderr": out})
             return
@@ -2000,6 +2049,9 @@ def main() -> None:
     # Idle screensaver watchdog — runs independent of the HTTP server so
     # it fires even with no one polling the portal.
     threading.Thread(target=_screensaver_watchdog, name="screensaver", daemon=True).start()
+    # Keep-awake watchdog — stops DPMS/blank from tripping mid-playback
+    # during a long unattended cast (see _keepawake_watchdog).
+    threading.Thread(target=_keepawake_watchdog, name="keepawake", daemon=True).start()
     # 0.0.0.0 so the container reaches us via host.docker.internal.
     # Token is the trust boundary. See module docstring.
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
