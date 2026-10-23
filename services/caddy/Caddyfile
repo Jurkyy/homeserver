@@ -16,8 +16,7 @@
 # getting a bare name like https://home, since no public CA can ever
 # issue a cert for a name with no dot/TLD. `homeserver.local` already
 # resolves LAN-wide via avahi mDNS with no router/DHCP involvement at
-# all (see install_avahi in bootstrap.sh) — it just had no HTTPS
-# until now.
+# all (avahi-daemon, set up by install_avahi() in bootstrap.sh).
 #
 # Both blocks proxy to the same mediacast container, so
 # `https://home/`, `https://homeserver.local/`, `http://homeserver/`,

@@ -1,6 +1,12 @@
 # Homeserver
 
-A self-hosted home server stack featuring OpenClaw (AI Discord bot), Home Assistant (home automation), Jellyfin (media streaming), and Tailscale (secure networking).
+A self-hosted home server stack centred on **mediacast** — a LAN portal
+(web UI + REST API) and native **Android app** that cast URLs, YouTube and
+Jellyfin to the projector on the box's HDMI output — alongside **librespot**
+(Spotify Connect → Focusrite Scarlett 2i2), **Caddy** (LAN reverse proxy,
+`https://home`), **Home Assistant** + Mosquitto (home automation),
+**Jellyfin** / Navidrome (media), **OpenClaw** (AI Discord bot), and host
+**Tailscale** for remote access.
 
 ## Prerequisites
 
@@ -44,32 +50,37 @@ That's it. One script does everything.
 | Navidrome      | 4533  | http://localhost:4533        | Local music streaming          |
 | librespot      | n/a   | (Spotify app device picker)  | Spotify Connect target → Scarlett 2i2  |
 | mediacast      | 8765  | http://homeserver.local/ | Phone/PC → projector URL cast (web UI + share-menu) |
-| Caddy (proxy)  | 80    | http://&lt;lan-ip&gt;/         | LAN welcome page                       |
+| Caddy (proxy)  | 80/443 | https://home/, http://&lt;lan-ip&gt;/ | Reverse proxy to the mediacast portal; serves `/ca.crt` |
 
 ## Project Structure
 
 ```
 homeserver/
-├── bootstrap.sh        # Fresh box setup script
-├── docker-compose.yml  # All services defined
+├── bootstrap.sh        # Fresh box setup script (idempotent, re-runnable)
+├── docker-compose.yml  # All containers defined
 ├── .env.example        # Template for secrets
+├── INSTALL.md          # Fresh-box install walkthrough
 ├── SETUP.md            # Detailed setup notes
+├── android/            # mediacast Android app (Kotlin/Compose, see android/README.md)
+├── docs/
+│   ├── api-v1.md           # mediacast API contract (backend ↔ web portal + Android app)
+│   ├── projector-cast.md   # Projector casting setup + troubleshooting
+│   └── https-home-setup.md # https://home via Caddy's internal CA + dnsmasq
 ├── dotfiles/
 │   └── aliases         # Shell aliases (installed to ~/.aliases)
-├── scripts/
-│   ├── backup.sh       # Backup all configs
-│   ├── deploy.sh       # Deploy projects to server
-│   └── update.sh       # Update services
+├── scripts/            # backup / update / deploy / harden-ssh / setup-remote
 └── services/
+    ├── mediacast/      # Portal + API container (FastAPI, static web UI)
+    ├── mediacast-host/ # Host helper (X11/Firefox/mpv driver) + systemd --user units
+    ├── librespot/      # Spotify Connect container (ALSA → Scarlett 2i2)
+    ├── caddy/          # Caddyfile + internal CA root
     ├── homeassistant/
-    │   └── config/     # HA configuration
-    ├── jellyfin/
-    │   ├── config/     # Jellyfin configuration
-    │   └── cache/      # Transcoding cache
-    ├── openclaw/
-    │   └── config/     # OpenClaw configuration
-    └── projects/
-        └── polymarket-insider-bot.service
+    │   └── config/     # HA configuration (tracked YAML)
+    ├── mosquitto/      # MQTT broker config
+    ├── jellyfin/       # Jellyfin config + transcode cache
+    ├── navidrome/      # Navidrome data
+    ├── openclaw/       # OpenClaw agent config + workspace
+    └── projects/       # systemd units for deployed side projects
 ```
 
 ## Helper Scripts
@@ -116,10 +127,9 @@ Bits worth knowing:
 
 - mDNS discovery requires the controlling device to be on the same
   LAN as the homeserver (or a Spotify Connect-aware proxy in between).
-- The `bootstrap.sh` `install_mdns_carveout` step installs a systemd
-  unit that adds an `ip rule` + iptables ACCEPT for outbound multicast
-  on the LAN interface — without it, NordVPN's kill-switch swallows
-  the announcements.
+- librespot publishes its Connect record through the host's
+  avahi-daemon (`install_avahi` in `bootstrap.sh`, pinned to the LAN
+  interface).
 - ALSA card name is set via `LIBRESPOT_ALSA_DEVICE` in `.env`. Default
   is `plughw:CARD=USB,DEV=0`; verify with `aplay -l` on the host.
 
@@ -128,70 +138,19 @@ Bits worth knowing:
 Once Tailscale is connected, access services via your Tailscale IP:
 - `http://100.x.x.x:8123` - Home Assistant
 - `http://100.x.x.x:8096` - Jellyfin
-- `http://100.x.x.x/` - Caddy welcome page (LAN service directory)
+- `http://100.x.x.x/` (or `http://homeserver/` via MagicDNS) - mediacast portal
 
 (Spotify Connect is LAN-only — the librespot device is announced over
 mDNS, which doesn't cross subnets, so it only shows up in the Spotify
 device picker when the controlling device is on the home LAN.)
 
-## VPN (NordVPN, always-on)
+## VPN
 
-The bootstrap installs the official NordVPN CLI and configures it as an
-**always-on, whole-host VPN**. All outbound traffic from the homeserver
-— including every Docker container that uses the host's network stack —
-exits through Nord. Autoconnect is enabled, so the VPN comes up on every
-boot before user services start.
-
-A few practical notes:
-
-- **Spotify catalog follows your exit country.** Pin `NORDVPN_COUNTRY` in
-  `.env` (e.g. `Netherlands`, `Germany`, `United_States`) if your Spotify
-  account is region-locked or you want a specific catalog. Leave blank to
-  let Nord pick the fastest server.
-- **LAN access is preserved.** The bootstrap detects your LAN subnet
-  (e.g. `192.168.1.0/24`) and adds it to NordVPN's allowlist before the
-  kill-switch engages. Phones/laptops on the same network can still hit
-  the Caddy welcome page, Jellyfin, Home Assistant, etc. on the
-  homeserver's LAN IP without going through Nord.
-- **mDNS multicast carve-out.** NordVPN's allowlist is per-subnet — it
-  doesn't cover `224.0.0.0/4` (the mDNS group), so the kill-switch
-  drops librespot's Spotify Connect announcements by default.
-  `install_mdns_carveout` (run after `install_nordvpn` in bootstrap)
-  installs a small systemd unit that re-adds the `ip rule` + iptables
-  ACCEPT after every boot or `nordvpnd` restart.
-- **Tailscale keeps working.** The Tailscale CGNAT range (`100.64.0.0/10`)
-  is also allowlisted, so remote access via your tailnet is unaffected.
-- **Kill-switch is on.** If the Nord tunnel ever drops, non-LAN /
-  non-Tailscale traffic is blocked rather than leaking out the bare WAN.
-
-Operate it with:
-
-```bash
-# Temporarily disable (e.g. for a service that breaks behind VPN):
-sudo nordvpn disconnect
-sudo nordvpn set autoconnect off    # also stop it coming back on reboot
-
-# Re-enable always-on:
-sudo nordvpn set autoconnect on
-sudo nordvpn connect
-
-# Check state:
-nordvpn status
-nordvpn settings
-nordvpn allowlist
-```
-
-If you left `NORDVPN_TOKEN` blank during bootstrap, the client is
-installed but not logged in. Generate a token at
-<https://my.nordaccount.com/dashboard/nordvpn/access-tokens/>, add it to
-`.env`, then run:
-
-```bash
-sudo nordvpn login --token "$NORDVPN_TOKEN"
-sudo nordvpn set killswitch on
-sudo nordvpn set autoconnect on
-sudo nordvpn connect
-```
+NordVPN is **no longer used**. Its datacenter exit IP triggered YouTube's
+"confirm you're not a bot" wall, broke container DNS, and its kill-switch
+blocked Tailscale and LAN mDNS. `install_nordvpn` / `install_mdns_carveout`
+are kept in `bootstrap.sh` for reference but are not called. Remote access
+is via host Tailscale only.
 
 ## Project Deployment
 
@@ -224,7 +183,9 @@ ssh homeserver 'journalctl -u polymarket-insider-bot -f'
 
 ## Documentation
 
-For detailed setup instructions, troubleshooting, and configuration guides, see [SETUP.md](SETUP.md).
+For detailed setup instructions, troubleshooting, and configuration guides, see [SETUP.md](SETUP.md)
+and [INSTALL.md](INSTALL.md). The mediacast API contract is [docs/api-v1.md](docs/api-v1.md);
+the Android client lives in [android/](android/README.md).
 
 ### librespot (Spotify Connect)
 

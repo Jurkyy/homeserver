@@ -15,8 +15,8 @@ re-runnable), but having them ready saves a second pass.
 | What | Where |
 |---|---|
 | **NordVPN access token** | <https://my.nordaccount.com/dashboard/nordvpn/access-tokens/> → Generate new token |
-| **Spotify Client ID / Secret** | <https://developer.spotify.com/dashboard> → Create app. Redirect URI **must use HTTPS** (`https://localhost:6680`) — Spotify rejects plain http. |
-| **Spotify Premium username / password** | Your account (Premium required for Mopidy-Spotify) |
+| **Spotify Client ID / Secret** (optional) | <https://developer.spotify.com/dashboard> → Create app. Only for Home Assistant's Spotify integration; librespot needs no credentials. |
+| **Spotify Premium account** | Required for Spotify Connect (librespot) — no username/password goes in `.env` |
 | **Tailscale auth key** | <https://login.tailscale.com/admin/settings/keys> → Generate auth key |
 | **Anthropic API key** | <https://console.anthropic.com> (only if running OpenClaw) |
 | **Discord bot token + client ID** | <https://discord.com/developers/applications> (only if running OpenClaw) |
