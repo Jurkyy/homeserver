@@ -26,6 +26,7 @@ import hmac
 import json
 import logging
 import os
+import random
 import re
 import time
 from collections import OrderedDict
@@ -83,8 +84,8 @@ YT_FETCH_CONCURRENCY = int(os.environ.get("YT_FETCH_CONCURRENCY", "12"))
 # client is looking, and push `event: feed` over SSE when it changed.
 YT_FEED_REFRESH_MIN = float(os.environ.get("YT_FEED_REFRESH_MIN", "5") or 5)
 # Channel RSS answers `Cache-Control: max-age=900` (and no ETag/Last-
-# Modified, so no conditional GET). We honour max-age, capped here, so each
-# cycle only re-fetches the channels whose copy has expired.
+# Modified, so no conditional GET). We honour max-age (jittered, capped
+# here), so each cycle only re-fetches the channels whose copy expired.
 YT_RSS_MAX_AGE_CAP = float(os.environ.get("YT_RSS_MAX_AGE_CAP", "900"))
 _YT_UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 _UC_RE = re.compile(r"UC[0-9A-Za-z_-]{22}")
@@ -1193,7 +1194,10 @@ async def _build_feed() -> list[dict]:
                 return []
             return old
         items = _parse_channel_rss(r.text)
-        _rss_cache[cid] = {"items": items, "expires": time.time() + _max_age(r)}
+        # Jittered expiry spreads the channels over the cycles instead of
+        # all 560 coming due in the same one every 15 min.
+        _rss_cache[cid] = {"items": items,
+                           "expires": time.time() + _max_age(r) * random.uniform(0.3, 1.0)}
         return items
 
     async def tag_short(item: dict) -> None:
