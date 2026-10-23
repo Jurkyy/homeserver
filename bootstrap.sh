@@ -259,14 +259,21 @@ install_projector_session() {
     # finds the running Firefox instance via D-Bus instead of cold-
     # starting a parallel one and timing out. playerctl drives Firefox
     # YouTube transport (pause/seek/stop/status) over MPRIS. mpv is the
-    # player for Jellyfin and other non-YouTube video hosts.
+    # player for Jellyfin and other non-YouTube video hosts. libxss1 +
+    # libxext6 are loaded via ctypes by the helper's wake detection (X
+    # input-idle + DPMS state); x11-xserver-utils also ships xrandr,
+    # polled for projector hotplug while soft-sleeping.
     if [[ $DISTRO_FAMILY == "debian" ]]; then
         install_packages firefox-esr xdotool wmctrl x11-xserver-utils lightdm \
-                         dbus-x11 playerctl mpv pipx
+                         dbus-x11 playerctl mpv pipx libxss1 libxext6
     elif [[ $DISTRO_FAMILY == "arch" ]]; then
-        install_packages firefox xdotool wmctrl xorg-xset lightdm \
-                         playerctl mpv python-pipx
+        install_packages firefox xdotool wmctrl xorg-xset xorg-xrandr lightdm \
+                         playerctl mpv python-pipx libxss libxext
     fi
+
+    # Writable state dir for the mediacast container (YouTube feed cache),
+    # owned by the login user so the container's uid 1000 can write it.
+    install -d -o "$SUDO_USER" -g "$SUDO_USER" "$script_dir/services/mediacast/data"
 
     # Latest yt-dlp via pipx — apt's package lags ~12 months and
     # YouTube's anti-bot signatures iterate weekly, so the apt

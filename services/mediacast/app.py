@@ -1,135 +1,120 @@
 """
-mediacast — phone-to-projector URL relay.
+mediacast — phone-to-projector relay + media portal API.
 
-Two surfaces, same forwarding logic:
+Surfaces (all funnel into the host helper at MEDIACAST_HOST_URL, which
+owns the X11 / Firefox / mpv side and runs outside the container):
 
-  - POST /cast        token-protected JSON API for scripts / HTTP
-                      Shortcuts on Android. Bearer MEDIACAST_TOKEN.
-  - GET  /            human web UI: paste-and-cast form + a
-                      drag-to-bookmarks "Cast" bookmarklet. Pairs with…
-  - POST /ui-cast     same-origin, no bearer — LAN trust. Anyone who can
-                      load the form can fire one. (Cross-origin browsers
-                      can't reach it: no CORS headers, JSON-only body
-                      blocks form-style CSRF.)
+  - /api/v1/*        the JSON API (contract: docs/api-v1.md). Bearer
+                     MEDIACAST_TOKEN on everything except health and
+                     images. Used by the Android app and the web portal.
+  - GET /            the web portal (static/), token injected into the
+                     page; it sends it as an Authorization header, which
+                     forces a CORS preflight we never answer → no CSRF.
+  - POST /cast, /control, GET /health
+                     legacy token routes kept for Home Assistant /
+                     OpenClaw / HTTP Shortcuts.
 
-Both paths funnel into the host helper at MEDIACAST_HOST_URL, which
-owns the X11/Firefox side and runs outside the container.
+The old token-less /ui-* routes are gone: they let any web page on the
+internet a LAN browser visited fire casts, screen-off and power-off.
 """
 
+from __future__ import annotations
+
 import asyncio
+import contextlib
 import hmac
 import json
 import logging
 import os
 import re
 import time
+from collections import OrderedDict
+from pathlib import Path
 from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+VERSION = "2.0.0"
 
 logger = logging.getLogger("mediacast")
-# Without this, "mediacast".info()/.warning() calls below have nowhere to
-# go: uvicorn's own dictConfig only wires up its "uvicorn.*" loggers, not
-# root, so the root logger stays at its no-handler default and every
-# logger.info() here (cast requests, feed refreshes, Jellyfin auth) is
-# silently dropped — only a bare last-resort WARNING+ line reaches
-# `docker logs`. This makes the existing logging calls actually surface.
+# uvicorn's dictConfig only wires up its own "uvicorn.*" loggers, so
+# without this our logger.info() calls would be silently dropped.
 logging.basicConfig(
     level=os.environ.get("MEDIACAST_LOG", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+# httpx logs every request at INFO (the host long-poll, image proxying,
+# Jellyfin progress reports) — pure noise.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 TOKEN = os.environ.get("MEDIACAST_TOKEN", "")
 HOST_URL = os.environ.get("MEDIACAST_HOST_URL", "http://host.docker.internal:8766/open")
-HOST_CONTROL_URL = HOST_URL.rsplit("/", 1)[0] + "/control"
-HOST_SCREENSAVER_URL = HOST_URL.rsplit("/", 1)[0] + "/screensaver"
-HOST_SCREEN_OFF_URL = HOST_URL.rsplit("/", 1)[0] + "/screen-off"
-HOST_POWEROFF_URL = HOST_URL.rsplit("/", 1)[0] + "/poweroff"
-HOST_STATE_URL = HOST_URL.rsplit("/", 1)[0] + "/state"
+HOST_BASE = HOST_URL.rsplit("/", 1)[0]
 HOST_TIMEOUT = float(os.environ.get("MEDIACAST_HOST_TIMEOUT", "5.0"))
-# Casting a YouTube URL makes the host helper resolve the stream with
-# yt-dlp before it answers (so it can route playback through the local
-# anti-throttle proxy) — a few seconds, occasionally more on a slow
-# extract. Give the cast forward its own roomy budget so a normal
-# resolution never trips a spurious "host unreachable" in the UI. The
-# control path keeps the snappy HOST_TIMEOUT.
+# Casting a YouTube URL can make the host helper resolve the stream with
+# yt-dlp before it answers; give casts their own roomy budget.
 CAST_TIMEOUT = float(os.environ.get("MEDIACAST_CAST_TIMEOUT", "60.0"))
+# Base URLs offered in the portal's "Pair phone" QR (comma-separated).
+PAIR_URLS = [u.strip().rstrip("/") for u in
+             os.environ.get("MEDIACAST_PAIR_URLS", "http://homeserver.local").split(",") if u.strip()]
+STATIC_DIR = Path(__file__).with_name("static")
 
-# YouTube subscriptions feed. Optional, like mrpflix: if the channel
-# list file is missing/empty the section hides itself and the endpoint
-# 404s. We read a newline-separated list of channels (a Google Takeout
-# subscriptions.csv works as-is — we pull the UC… id out of each row),
-# poll each channel's PUBLIC RSS feed (no account, no API key, no
-# quota), merge by publish date, and show the newest uploads as a grid.
-# Clicking a card casts the watch URL through the normal YouTube path
-# (host helper → anti-throttle proxy → mpv), so playback rides NVDEC.
+# YouTube subscriptions feed. Optional: if neither the account scrape nor
+# the channel-list file yields channels, the endpoint 404s. We poll each
+# channel's PUBLIC RSS feed (no account, no API key, no quota), merge by
+# publish date, and serve the newest uploads.
 YT_CHANNELS_FILE = os.environ.get("YT_CHANNELS_FILE", "/config/yt-channels.txt")
-# Auto-populate the channel list from the logged-in YouTube account: the
-# host helper scrapes the account's subscriptions (yt-dlp + the projector
-# Firefox's cookies) and we build the same public per-channel RSS feed
-# from them. Takes over from the static file entirely once it has ids
-# (see _channel_ids) — the file is only a fallback for a cold cache or
-# the scrape failing (not logged in / no cookies). Cached so the
-# feed poll doesn't re-scrape every time.
-HOST_SUBS_URL = HOST_URL.rsplit("/", 1)[0] + "/yt-subscriptions"
+# Auto-populate the channel list from the logged-in YouTube account (the
+# host helper scrapes it with yt-dlp + the projector Firefox's cookies).
 YT_SUBS_FROM_ACCOUNT = os.environ.get("YT_SUBS_FROM_ACCOUNT", "1") not in ("0", "false", "")
 YT_SUBS_TTL = float(os.environ.get("YT_SUBS_TTL", "21600"))    # re-scrape every 6h
-# The host scrape (yt-dlp over the subscriptions page) can take a while;
-# allow for it so the first uncached fetch doesn't time out.
 YT_SUBS_FETCH_TIMEOUT = float(os.environ.get("YT_SUBS_FETCH_TIMEOUT", "100"))
 YT_FEED_TTL = float(os.environ.get("YT_FEED_TTL", "600"))      # cache 10 min
-# Fetched and cached server-side; the UI paginates this client-side with
-# a "Load more" button, so these bound how far back "load more" can go
-# rather than how many cards show up front.
 YT_FEED_LIMIT = int(os.environ.get("YT_FEED_LIMIT", "150"))    # cards cached
 YT_PER_CHANNEL = int(os.environ.get("YT_PER_CHANNEL", "15"))   # recent per channel (RSS max)
 YT_FETCH_CONCURRENCY = int(os.environ.get("YT_FETCH_CONCURRENCY", "12"))
 _YT_UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
-# A YouTube channel id: "UC" + 22 url-safe base64 chars.
 _UC_RE = re.compile(r"UC[0-9A-Za-z_-]{22}")
-# Last-known-good subscriptions + feed survive a container restart (not a
-# rebuild — this is the container's writable layer, not a bind mount) so
-# the page never opens onto the placeholder yt-channels.txt list while
-# waiting on a fresh ~90s account scrape. Best-effort only: every read/write
-# is wrapped and failures just mean falling back to the in-memory caches.
-YT_STATE_FILE = os.environ.get("YT_STATE_FILE", "/tmp/mediacast-yt-state.json")
+_VID_RE = re.compile(r"[0-9A-Za-z_-]{11}")
+# Last-known-good subscriptions + feed. Lives on the writable /data bind
+# mount (services/mediacast/data) so it survives rebuilds, not just
+# restarts — the page never opens onto the placeholder channel list while
+# waiting on a fresh ~90s account scrape.
+YT_STATE_FILE = os.environ.get("YT_STATE_FILE", "/data/yt-state.json")
 
-# Jellyfin ("mrpflix") integration. Optional: if MRPFLIX_URL is unset
-# the catalog section is simply hidden and the endpoints 404. We log in
-# with the user's own (non-admin) credentials and mint a session token
-# on demand — no admin API key needed. The token never leaves the
-# container: the browser talks only to our /ui-jellyfin/* proxy.
+# Jellyfin ("mrpflix"). Optional: if MRPFLIX_URL is unset the endpoints
+# 404. We log in with the user's own (non-admin) credentials; the token
+# never leaves the container (images are proxied).
 JELLYFIN_URL = os.environ.get("MRPFLIX_URL", "").rstrip("/")
 JELLYFIN_USER = os.environ.get("MRPFLIX_USER", "")
 JELLYFIN_PASS = os.environ.get("MRPFLIX_PASS", "")
 JELLYFIN_ENABLED = bool(JELLYFIN_URL and JELLYFIN_USER and JELLYFIN_PASS)
 JELLYFIN_TIMEOUT = float(os.environ.get("MRPFLIX_TIMEOUT", "20.0"))
-# Stable per-install device id so Jellyfin groups our sessions.
 _JF_DEVICE_ID = "mediacast-" + (os.environ.get("HOSTNAME", "homeserver"))
 _JF_AUTH_HEADER = (
     f'MediaBrowser Client="mediacast", Device="homeserver", '
-    f'DeviceId="{_JF_DEVICE_ID}", Version="1.0"'
+    f'DeviceId="{_JF_DEVICE_ID}", Version="{VERSION}"'
 )
-# Device profile we advertise to Jellyfin's PlaybackInfo. We can direct
-# play H.264 (the only codec the projector's GTX 970 decodes in
-# hardware); anything else (HEVC/AV1/VP9) Jellyfin transcodes to an
-# H.264 HLS stream so mpv still rides NVDEC. See projector GPU notes.
-#
-# MaxStreamingBitrate is the one field the "low quality" toggle varies:
-# the remote mrpflix link is normal-day fine at full bitrate, but its
-# throughput to us is occasionally starved (seen 2026-07-19: ~1Mbps
-# actual vs ~7Mbps the transcode wanted, causing constant rebuffer
-# pauses) with nothing wrong on our end to fix. The toggle re-requests
-# PlaybackInfo at a bitrate that fits within that degraded link.
+# MaxStreamingBitrate is the one device-profile field the "low quality"
+# toggle varies: the remote mrpflix link is occasionally starved (seen
+# 2026-07-19: ~1Mbps actual vs ~7Mbps wanted) with nothing to fix on our end.
 _JF_MAX_BITRATE = int(os.environ.get("MRPFLIX_MAX_BITRATE", "20000000"))
 _JF_LOW_BITRATE = int(os.environ.get("MRPFLIX_LOW_BITRATE", "1200000"))
+JF_PROGRESS_INTERVAL = 10.0
+_TICKS = 10_000_000
 
 
 def _jf_device_profile(max_bitrate: int) -> dict:
+    # We direct play H.264 (the only codec the projector's GTX 970 decodes
+    # in hardware); anything else Jellyfin transcodes to H.264 HLS so mpv
+    # still rides NVDEC.
     return {
         "MaxStreamingBitrate": max_bitrate,
         "DirectPlayProfiles": [
@@ -153,238 +138,497 @@ def _jf_device_profile(max_bitrate: int) -> dict:
         ],
     }
 
+
 if not TOKEN:
     raise RuntimeError("MEDIACAST_TOKEN is unset — refusing to start with an open endpoint")
 
-app = FastAPI(title="mediacast", docs_url=None, redoc_url=None)
+
+# ---------------------------------------------------------------------------
+# App, shared HTTP client, errors, auth
+# ---------------------------------------------------------------------------
+
+_http: httpx.AsyncClient | None = None
+_bg_tasks: set = set()
 
 
-class CastRequest(BaseModel):
-    url: str
+def _spawn(coro) -> None:
+    # asyncio only keeps weak refs to tasks; hold strong ones.
+    t = asyncio.create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+
+
+def http() -> httpx.AsyncClient:
+    assert _http is not None
+    return _http
+
+
+@contextlib.asynccontextmanager
+async def lifespan(_app: FastAPI):
+    global _http
+    _http = httpx.AsyncClient(
+        timeout=JELLYFIN_TIMEOUT, follow_redirects=True,
+        limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+    )
+    _load_yt_state()
+    watcher = asyncio.create_task(_host_watch())
+    try:
+        yield
+    finally:
+        watcher.cancel()
+        await _http.aclose()
+
+
+app = FastAPI(title="mediacast", docs_url=None, redoc_url=None, openapi_url=None,
+              lifespan=lifespan)
+
+_CODES = {400: "bad_request", 401: "unauthorized", 403: "forbidden", 404: "not_found",
+          405: "method_not_allowed", 409: "conflict", 422: "validation_error",
+          502: "upstream_error", 503: "unavailable", 504: "upstream_timeout"}
+
+
+class ApiError(HTTPException):
+    def __init__(self, status: int, error: str, code: str | None = None):
+        super().__init__(status_code=status, detail=error)
+        self.code = code or _CODES.get(status, "error")
+
+
+def _is_api(request: Request) -> bool:
+    return request.url.path.startswith("/api/")
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_exc(request: Request, exc: StarletteHTTPException):
+    if not _is_api(request):
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
+                            headers=getattr(exc, "headers", None))
+    code = getattr(exc, "code", None) or _CODES.get(exc.status_code, "error")
+    return JSONResponse({"error": str(exc.detail), "code": code}, status_code=exc.status_code)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exc(request: Request, exc: RequestValidationError):
+    if not _is_api(request):
+        return JSONResponse({"detail": exc.errors()}, status_code=422)
+    errs = exc.errors()
+    first = errs[0] if errs else {}
+    loc = ".".join(str(p) for p in first.get("loc", []) if p != "body")
+    msg = f"{loc}: {first.get('msg')}" if loc else str(first.get("msg", "invalid request"))
+    return JSONResponse({"error": msg, "code": "validation_error"}, status_code=422)
 
 
 def _check_auth(authorization: str | None) -> None:
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="missing bearer token")
+        raise ApiError(401, "missing bearer token", "unauthorized")
     presented = authorization.removeprefix("Bearer ").strip()
     # Constant-time compare so a remote attacker can't time-attack the secret.
     if not hmac.compare_digest(presented, TOKEN):
-        raise HTTPException(status_code=401, detail="bad token")
+        raise ApiError(401, "bad token", "unauthorized")
+
+
+async def require_token(authorization: str | None = Header(default=None)) -> None:
+    _check_auth(authorization)
 
 
 def _check_url(url: str) -> None:
     try:
         parsed = urlparse(url)
     except ValueError:
-        raise HTTPException(status_code=400, detail="unparseable url")
+        raise ApiError(400, "unparseable url", "bad_url")
     if parsed.scheme not in ("http", "https"):
         # Block file://, javascript:, data:, etc. — those are remote-code
         # execution against the auto-logged-in projector browser.
-        raise HTTPException(status_code=400, detail="only http(s) urls allowed")
+        raise ApiError(400, "only http(s) urls allowed", "bad_url")
     if not parsed.netloc:
-        raise HTTPException(status_code=400, detail="url missing host")
+        raise ApiError(400, "url missing host", "bad_url")
 
 
-async def _forward(url: str, backend: str | None = None, title: str | None = None) -> None:
-    payload = {"url": url}
+# ---------------------------------------------------------------------------
+# Host helper forwarding
+# ---------------------------------------------------------------------------
+
+_HOST_AUTH = {"Authorization": f"Bearer {TOKEN}"}
+
+
+async def _host_post(path: str, payload: dict, timeout: float = HOST_TIMEOUT) -> dict:
+    try:
+        r = await http().post(f"{HOST_BASE}{path}", json=payload, headers=_HOST_AUTH,
+                              timeout=timeout)
+    except httpx.HTTPError as exc:
+        logger.warning("host helper unreachable (%s): %s", path, exc)
+        raise ApiError(502, f"host helper unreachable: {exc}", "host_unreachable")
+    try:
+        body = r.json()
+    except ValueError:
+        body = {"detail": r.text}
+    if r.status_code == 404 and path == "/control":
+        raise ApiError(409, "nothing is playing", "no_active_cast")
+    if r.status_code >= 400:
+        detail = body.get("error") or body.get("detail") or "request failed"
+        if body.get("stderr"):
+            detail = f"{detail}: {str(body['stderr'])[:200]}"
+        logger.warning("host helper %s -> %s: %s", path, r.status_code, detail)
+        status = r.status_code if r.status_code in (400, 404) else 502
+        raise ApiError(status, str(detail), "host_error")
+    return body
+
+
+async def _host_open(url: str, *, backend: str | None = None, title: str | None = None,
+                     meta: dict | None = None, start: float | None = None) -> None:
+    payload: dict = {"url": url}
     if backend:
-        # Tell the host helper which player to use for an already-resolved
-        # URL (e.g. "mpv" for a Jellyfin stream the host can't recognise
-        # by hostname). Omitted for normal casts so host-side routing
-        # (video host → mpv, else Firefox) stays in charge.
+        # Force a player for an already-resolved media URL (Jellyfin → mpv).
         payload["backend"] = backend
     if title:
-        # Display name for the UI's "Now playing" (e.g. the Jellyfin
-        # movie/episode title). YouTube titles are resolved host-side by
-        # yt-dlp, so plain URL casts leave this unset.
         payload["title"] = title
+    if meta:
+        payload["meta"] = meta
+    if start:
+        payload["start"] = start
+    await _host_post("/open", payload, timeout=CAST_TIMEOUT)
+
+
+# ---------------------------------------------------------------------------
+# State: host long-poll → merged state → SSE fan-out
+# ---------------------------------------------------------------------------
+
+_host_state: dict = {"version": -1, "state": None}
+_spotify: dict | None = None
+_subscribers: set[asyncio.Queue] = set()
+
+_OFFLINE_STATE = {
+    "power": "on", "screen": "on", "activity": "idle", "source": None, "title": None,
+    "subtitle": None, "artwork_url": None, "position_s": None, "duration_s": None,
+    "volume": 0, "muted": False, "item": None,
+    "screensaver": {"active": False, "theme": None, "themes": [], "idle_minutes": 0},
+    "updated_at": 0,
+}
+
+
+def _merged_state() -> dict:
+    st = dict(_host_state["state"] or _OFFLINE_STATE)
+    sp = _spotify
+    st["spotify"] = dict(sp) if sp else None
+    st["updated_at"] = max(int(st.get("updated_at") or 0), int(sp["updated_at"]) if sp else 0)
+    return st
+
+
+def _broadcast() -> None:
+    data = json.dumps(_merged_state(), separators=(",", ":"))
+    for q in list(_subscribers):
+        if q.full():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                q.get_nowait()   # slow client: drop the stale frame
+        q.put_nowait(data)
+
+
+async def _fetch_host_state(since: int, wait: float) -> dict:
+    r = await http().get(f"{HOST_BASE}/v1/state", params={"since": since, "wait": wait},
+                         headers=_HOST_AUTH, timeout=wait + 10)
+    r.raise_for_status()
+    return r.json()
+
+
+async def _host_watch() -> None:
+    """Long-poll the host helper forever; every new version is merged and
+    pushed to SSE subscribers (and drives Jellyfin progress reporting)."""
+    backoff = 1.0
+    while True:
+        try:
+            data = await _fetch_host_state(_host_state["version"], 25)
+            backoff = 1.0
+            if data.get("version") != _host_state["version"]:
+                _host_state.update(version=data["version"], state=data["state"])
+                _broadcast()
+                await _jf_on_state(data["state"])
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — keep watching no matter what
+            logger.warning("host state watch: %s", exc)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 15)
+
+
+api = APIRouter(prefix="/api/v1")
+authed = [Depends(require_token)]
+
+
+@api.get("/health")
+async def api_health() -> dict:
+    return {"ok": True, "version": VERSION}
+
+
+@api.get("/state", dependencies=authed)
+async def api_state() -> dict:
+    if _host_state["state"] is None:
+        try:
+            data = await _fetch_host_state(-1, 0)
+            _host_state.update(version=data["version"], state=data["state"])
+        except Exception as exc:  # noqa: BLE001
+            raise ApiError(502, f"host helper unreachable: {exc}", "host_unreachable")
+    return _merged_state()
+
+
+@api.get("/events", dependencies=authed)
+async def api_events(request: Request) -> StreamingResponse:
+    q: asyncio.Queue = asyncio.Queue(maxsize=4)
+    _subscribers.add(q)
+
+    async def gen():
+        try:
+            yield "retry: 3000\n"
+            yield f"event: state\ndata: {json.dumps(_merged_state(), separators=(',', ':'))}\n\n"
+            while True:
+                try:
+                    data = await asyncio.wait_for(q.get(), timeout=15)
+                    yield f"event: state\ndata: {data}\n\n"
+                except asyncio.TimeoutError:
+                    if await request.is_disconnected():
+                        break
+                    yield ": ping\n\n"
+        finally:
+            _subscribers.discard(q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+    })
+
+
+# ---------------------------------------------------------------------------
+# Playback / screensaver / power
+# ---------------------------------------------------------------------------
+
+class CastRequest(BaseModel):
+    url: str
+
+
+class V1Control(BaseModel):
+    action: str
+    value: float | None = None
+
+
+class V1Screensaver(BaseModel):
+    theme: str | None = None
+
+
+class V1Power(BaseModel):
+    action: str
+
+
+def _yt_vid(url: str) -> str:
     try:
-        async with httpx.AsyncClient(timeout=CAST_TIMEOUT) as client:
-            # Forward with the bearer token — host helper binds 0.0.0.0
-            # and re-validates the token as its trust boundary.
-            r = await client.post(
-                HOST_URL,
-                json=payload,
-                headers={"Authorization": f"Bearer {TOKEN}"},
-            )
-    except httpx.HTTPError as exc:
-        logger.warning("host helper unreachable: %s", exc)
-        raise HTTPException(status_code=502, detail=f"host helper unreachable: {exc}")
-
-    if r.status_code >= 400:
-        logger.warning("host helper returned %s: %s", r.status_code, r.text)
-        raise HTTPException(status_code=502, detail=f"host helper error: {r.text}")
+        u = urlparse(url)
+    except ValueError:
+        return ""
+    host = u.netloc.lower().removeprefix("www.").removeprefix("m.")
+    if host == "youtu.be":
+        vid = u.path.lstrip("/").split("/")[0]
+    elif host.endswith("youtube.com"):
+        q = dict(p.split("=", 1) for p in u.query.split("&") if "=" in p)
+        parts = u.path.split("/")
+        vid = q.get("v") or (parts[2] if len(parts) > 2 and parts[1] in ("shorts", "live", "embed") else "")
+    else:
+        return ""
+    return vid if _VID_RE.fullmatch(vid or "") else ""
 
 
-@app.get("/health")
-async def health() -> dict[str, bool]:
+def _cast_meta(url: str) -> dict | None:
+    """Pre-fill title/channel for a YouTube cast from the feed cache so the
+    now-playing card is right before the page has even loaded."""
+    vid = _yt_vid(url)
+    if not vid:
+        return None
+    meta: dict = {"source": "youtube", "item": {"kind": "youtube", "id": vid},
+                  "artwork_url": f"/api/v1/artwork/youtube/{vid}"}
+    hit = next((it for it in _feed_cache["items"] if it.get("id") == vid), None)
+    if hit:
+        meta.update(title=hit.get("title"), subtitle=hit.get("channel"))
+    return meta
+
+
+@api.post("/cast", dependencies=authed)
+async def api_cast(req: CastRequest) -> dict:
+    _check_url(req.url)
+    logger.info("cast host=%s", urlparse(req.url).netloc)
+    await _jf_stop_session()
+    await _host_open(req.url, meta=_cast_meta(req.url))
     return {"ok": True}
 
 
-@app.post("/cast")
-async def cast(req: CastRequest, authorization: str | None = Header(default=None)) -> dict[str, str]:
-    _check_auth(authorization)
-    _check_url(req.url)
-    logger.info("cast (token) host=%s", urlparse(req.url).netloc)
-    await _forward(req.url)
-    return {"status": "ok"}
+_V1_VALUE_ACTIONS = {"seek", "seek_to", "volume", "volume_delta"}
 
 
-async def _forward_post(url: str, payload: dict, timeout: float = HOST_TIMEOUT) -> dict:
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(
-                url, json=payload,
-                headers={"Authorization": f"Bearer {TOKEN}"},
-            )
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"host helper unreachable: {exc}")
-    try:
-        body = r.json()
-    except ValueError:
-        body = {"detail": r.text}
-    if r.status_code >= 400:
-        # Propagate the host helper's status code so the UI's
-        # `if (r.ok)` check fires for "no active cast" 404s and the
-        # 502 surface for upstream errors.
-        raise HTTPException(
-            status_code=r.status_code,
-            detail=body.get("detail") or body.get("error") or "request failed",
+@api.post("/control", dependencies=authed)
+async def api_control(req: V1Control) -> dict:
+    a, v = req.action, req.value
+    if a in _V1_VALUE_ACTIONS and v is None:
+        raise ApiError(400, f"action {a!r} needs a numeric value", "missing_value")
+    if a == "toggle":
+        body = {"action": "pause"}
+    elif a in ("play", "pause"):
+        body = {"action": "set_pause", "paused": a == "pause"}
+    elif a == "stop":
+        body = {"action": "stop"}
+    elif a == "seek":
+        body = {"action": "seek", "offset": int(v)}
+    elif a == "seek_to":
+        body = {"action": "seek_to", "position": max(0.0, float(v))}
+    elif a == "volume":
+        body = {"action": "volume", "set": max(0, min(100, int(round(v))))}
+    elif a == "volume_delta":
+        body = {"action": "volume", "delta": int(round(v))}
+    else:
+        raise ApiError(400, f"unknown action {a!r}", "bad_action")
+    await _host_post("/control", body)
+    return {"ok": True}
+
+
+@api.post("/screensaver", dependencies=authed)
+async def api_screensaver(req: V1Screensaver) -> dict:
+    if req.theme:
+        await _jf_stop_session()
+    # Starting one goes through the same yt-dlp/Firefox cast path → roomy budget.
+    await _host_post("/screensaver", {"theme": req.theme}, timeout=CAST_TIMEOUT)
+    return {"ok": True}
+
+
+@api.post("/power", dependencies=authed)
+async def api_power(req: V1Power, request: Request) -> dict:
+    if req.action not in ("sleep", "wake", "screen_off", "poweroff"):
+        raise ApiError(400, f"unknown power action {req.action!r}", "bad_action")
+    client = request.client.host if request.client else "?"
+    if req.action == "poweroff":
+        logger.warning("POWEROFF requested from=%s", client)
+    else:
+        logger.info("power %s from=%s", req.action, client)
+    if req.action in ("sleep", "screen_off"):
+        await _jf_stop_session()
+    await _host_post("/power", {"action": req.action}, timeout=15)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Artwork
+# ---------------------------------------------------------------------------
+
+_art_cache: OrderedDict[str, tuple[bytes, str]] = OrderedDict()
+_ART_CACHE_MAX = 200
+
+
+@api.get("/artwork/youtube/{vid}")
+async def api_artwork_youtube(vid: str) -> Response:
+    if not _VID_RE.fullmatch(vid):
+        raise ApiError(404, "bad video id", "not_found")
+    hit = _art_cache.get(vid)
+    if hit is None:
+        for name in ("maxresdefault", "hqdefault"):
+            try:
+                r = await http().get(f"https://i.ytimg.com/vi/{vid}/{name}.jpg", timeout=10)
+            except httpx.HTTPError:
+                continue
+            if r.status_code == 200:
+                hit = (r.content, r.headers.get("Content-Type", "image/jpeg"))
+                break
+        if hit is None:
+            raise ApiError(404, "no thumbnail", "not_found")
+        _art_cache[vid] = hit
+        while len(_art_cache) > _ART_CACHE_MAX:
+            _art_cache.popitem(last=False)
+    _art_cache.move_to_end(vid)
+    return Response(content=hit[0], media_type=hit[1],
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+# ---------------------------------------------------------------------------
+# Spotify (librespot --onevent hook → state.spotify)
+# ---------------------------------------------------------------------------
+
+class SpotifyEvent(BaseModel):
+    event: str
+    track_id: str | None = None
+    name: str | None = None
+    artists: str | None = None
+    album: str | None = None
+    covers: str | None = None
+    duration_ms: int | None = None
+    position_ms: int | None = None
+
+
+@api.post("/spotify/event", dependencies=authed)
+async def api_spotify_event(ev: SpotifyEvent) -> dict:
+    """Internal: librespot's --onevent hook (services/librespot/onevent.sh)
+    posts every player event here."""
+    global _spotify
+    sp = dict(_spotify) if _spotify else {
+        "active": False, "playing": False, "title": None, "artist": None, "album": None,
+        "artwork_url": None, "position_s": None, "duration_s": None, "updated_at": 0,
+    }
+    e = ev.event
+    now_ms = int(time.time() * 1000)
+    if e in ("session_connected", "session_client_changed"):
+        sp["active"] = True
+    elif e == "session_disconnected":
+        sp.update(active=False, playing=False)
+    elif e == "track_changed":
+        covers = [c for c in (ev.covers or "").splitlines() if c.strip()]
+        sp.update(
+            active=True,
+            title=ev.name or None,
+            artist=", ".join(a for a in (ev.artists or "").splitlines() if a) or None,
+            album=ev.album or None,
+            artwork_url=covers[0].strip() if covers else None,
+            duration_s=round(ev.duration_ms / 1000, 1) if ev.duration_ms else None,
+            position_s=0.0,
         )
-    return body
-
-
-async def _forward_get(url: str) -> dict:
-    try:
-        async with httpx.AsyncClient(timeout=HOST_TIMEOUT) as client:
-            r = await client.get(url, headers={"Authorization": f"Bearer {TOKEN}"})
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"host helper unreachable: {exc}")
-    try:
-        body = r.json()
-    except ValueError:
-        body = {"detail": r.text}
-    if r.status_code >= 400:
-        raise HTTPException(
-            status_code=r.status_code,
-            detail=body.get("detail") or body.get("error") or "request failed",
-        )
-    return body
-
-
-async def _forward_control(action: dict) -> dict:
-    return await _forward_post(HOST_CONTROL_URL, action)
-
-
-class ControlRequest(BaseModel):
-    action: str
-    offset: int | None = None
-    set: int | None = None
-    delta: int | None = None
-    position: float | None = None
-
-
-@app.post("/control")
-async def control(req: ControlRequest, authorization: str | None = Header(default=None)) -> dict:
-    _check_auth(authorization)
-    return await _forward_control(req.model_dump(exclude_none=True))
-
-
-@app.post("/ui-control")
-async def ui_control(req: ControlRequest, request: Request) -> dict:
-    # Same trust model as /ui-cast — LAN-only, no token. The host
-    # helper still re-checks the token on its side, so this is the
-    # one trust hop here.
-    client_host = request.client.host if request.client else "?"
-    logger.info("control (ui) from=%s action=%s", client_host, req.action)
-    return await _forward_control(req.model_dump(exclude_none=True))
+    elif e == "playing":
+        sp.update(active=True, playing=True)
+    elif e in ("paused", "stopped", "end_of_track", "unavailable"):
+        sp["playing"] = False
+    elif e not in ("seeked", "position_correction", "loading", "preloading"):
+        return {"ok": True}   # volume/shuffle/repeat/…: not part of the state
+    if ev.position_ms is not None:
+        sp["position_s"] = round(ev.position_ms / 1000, 1)
+    sp["updated_at"] = now_ms
+    _spotify = sp
+    _broadcast()
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
-# Screensaver / screen-off
+# Jellyfin ("mrpflix")
 # ---------------------------------------------------------------------------
-# All state (which theme, idle auto-trigger) lives host-side — see
-# mediacast-host.py — since it has to keep working even when no one has
-# this page open. This container is just the LAN-trust relay, same model
-# as /ui-cast and /ui-control.
-
-class ScreensaverRequest(BaseModel):
-    theme: str
-
-
-@app.get("/ui-screensaver-state")
-async def ui_screensaver_state() -> dict:
-    return await _forward_get(HOST_STATE_URL)
-
-
-@app.post("/ui-screensaver")
-async def ui_screensaver(req: ScreensaverRequest, request: Request) -> dict:
-    # CAST_TIMEOUT, not the snappy HOST_TIMEOUT — picking a theme goes
-    # through the exact same yt-dlp-resolve / Firefox-cast path as any
-    # other YouTube cast, so it needs the same roomy budget.
-    client_host = request.client.host if request.client else "?"
-    logger.info("screensaver (ui) from=%s theme=%s", client_host, req.theme)
-    return await _forward_post(HOST_SCREENSAVER_URL, {"theme": req.theme}, timeout=CAST_TIMEOUT)
-
-
-@app.post("/ui-screen-off")
-async def ui_screen_off(request: Request) -> dict:
-    client_host = request.client.host if request.client else "?"
-    logger.info("screen off (ui) from=%s", client_host)
-    return await _forward_post(HOST_SCREEN_OFF_URL, {})
-
-
-@app.post("/ui-poweroff")
-async def ui_poweroff(request: Request) -> dict:
-    # Same LAN-trust model as the rest of /ui-*, but this is the most
-    # consequential button on the page — the portal's own confirm()
-    # dialog is the only speed bump before it fires, so WARNING (not
-    # INFO) for a clear audit trail of who/when.
-    client_host = request.client.host if request.client else "?"
-    logger.warning("POWEROFF requested (ui) from=%s", client_host)
-    return await _forward_post(HOST_POWEROFF_URL, {})
-
-
-@app.post("/ui-cast")
-async def ui_cast(req: CastRequest, request: Request) -> dict[str, str]:
-    # No bearer here on purpose: this is the surface the web UI and the
-    # bookmarklet talk to. Trust boundary is "you reached :8765" (LAN +
-    # Tailscale only — never exposed publicly). JSON-only body blocks
-    # simple-form CSRF; cross-origin fetch is preflighted and we don't
-    # send CORS-allow headers.
-    _check_url(req.url)
-    client_host = request.client.host if request.client else "?"
-    logger.info("cast (ui) from=%s host=%s", client_host, urlparse(req.url).netloc)
-    await _forward(req.url)
-    return {"status": "ok"}
-
-
-# ---------------------------------------------------------------------------
-# Jellyfin ("mrpflix") catalog + playback
-# ---------------------------------------------------------------------------
-# A small async client over the Jellyfin REST API. The browser never sees
-# the Jellyfin host or token: it browses through /ui-jellyfin/items, loads
-# posters through /ui-jellyfin/image/<id>, and plays through
-# /ui-jellyfin/play, all LAN-trust (same model as /ui-cast).
 
 _jf_token: str | None = None
 _jf_user_id: str | None = None
 _jf_lock = asyncio.Lock()
+# The one Jellyfin item we are playing (for Sessions/Playing reporting).
+_jf_session: dict | None = None
 
 
-async def _jf_authenticate(client: httpx.AsyncClient) -> tuple[str, str]:
+def _require_jellyfin() -> None:
+    if not JELLYFIN_ENABLED:
+        raise ApiError(404, "jellyfin not configured", "not_configured")
+
+
+async def _jf_authenticate(force: bool = False) -> tuple[str, str]:
     """Log in with the configured user creds; cache the token + user id."""
     global _jf_token, _jf_user_id
     async with _jf_lock:
+        if force:
+            _jf_token = _jf_user_id = None
         if _jf_token and _jf_user_id:
             return _jf_token, _jf_user_id
-        r = await client.post(
-            f"{JELLYFIN_URL}/Users/AuthenticateByName",
-            headers={"Authorization": _JF_AUTH_HEADER},
-            json={"Username": JELLYFIN_USER, "Pw": JELLYFIN_PASS},
-        )
+        try:
+            r = await http().post(
+                f"{JELLYFIN_URL}/Users/AuthenticateByName",
+                headers={"Authorization": _JF_AUTH_HEADER},
+                json={"Username": JELLYFIN_USER, "Pw": JELLYFIN_PASS},
+            )
+        except httpx.HTTPError as exc:
+            raise ApiError(502, f"jellyfin unreachable: {exc}", "jellyfin_unreachable")
         if r.status_code >= 400:
-            raise HTTPException(status_code=502, detail=f"jellyfin auth failed ({r.status_code})")
+            raise ApiError(502, f"jellyfin auth failed ({r.status_code})", "jellyfin_auth")
         data = r.json()
         _jf_token = data["AccessToken"]
         _jf_user_id = data["User"]["Id"]
@@ -394,147 +638,215 @@ async def _jf_authenticate(client: httpx.AsyncClient) -> tuple[str, str]:
 
 async def _jf_request(method: str, path: str, **kw) -> httpx.Response:
     """Call the Jellyfin API with the cached token, re-authing once on 401.
-
-    The token rides in the Authorization header (Jellyfin dropped support
-    for the legacy X-Emby-Token header / api_key query param on the REST
-    API somewhere around when jf.mrplink.com was last upgraded — only the
-    plain media-streaming endpoints still accept api_key).
-    """
-    global _jf_token, _jf_user_id
-    async with httpx.AsyncClient(timeout=JELLYFIN_TIMEOUT) as client:
-        token, _ = await _jf_authenticate(client)
-        headers = {**kw.pop("headers", {}), "Authorization": f'{_JF_AUTH_HEADER}, Token="{token}"'}
-        r = await client.request(method, f"{JELLYFIN_URL}{path}", headers=headers, **kw)
-        if r.status_code == 401:
-            # Token expired/revoked — drop the cache, re-auth, retry once.
-            async with _jf_lock:
-                _jf_token = _jf_user_id = None
-            token, _ = await _jf_authenticate(client)
-            headers["Authorization"] = f'{_JF_AUTH_HEADER}, Token="{token}"'
-            r = await client.request(method, f"{JELLYFIN_URL}{path}", headers=headers, **kw)
-        return r
+    The token rides in the Authorization header (current Jellyfin rejects
+    X-Emby-Token / api_key on the REST API)."""
+    token, _ = await _jf_authenticate()
+    extra = kw.pop("headers", {})
+    for attempt in range(2):
+        headers = {**extra, "Authorization": f'{_JF_AUTH_HEADER}, Token="{token}"'}
+        try:
+            r = await http().request(method, f"{JELLYFIN_URL}{path}", headers=headers, **kw)
+        except httpx.HTTPError as exc:
+            raise ApiError(502, f"jellyfin unreachable: {exc}", "jellyfin_unreachable")
+        if r.status_code != 401 or attempt:
+            return r
+        token, _ = await _jf_authenticate(force=True)
+    return r
 
 
-_PLAYABLE = frozenset({"Movie", "Episode"})
+async def _jf_json(method: str, path: str, **kw) -> dict:
+    r = await _jf_request(method, path, **kw)
+    if r.status_code == 404:
+        raise ApiError(404, "jellyfin item not found", "not_found")
+    if r.status_code >= 400:
+        raise ApiError(502, f"jellyfin error ({r.status_code}) on {path}", "jellyfin_error")
+    return r.json() if r.content else {}
 
 
-def _jf_card(it: dict) -> dict:
-    """Shape one Jellyfin item into the minimal card the UI renders."""
+_JF_FIELDS = "Overview,ChildCount,RecursiveItemCount,ProductionYear,ParentId"
+
+
+def _jf_img(item_id: str, kind: str = "Primary") -> str:
+    return f"/api/v1/jellyfin/image/{item_id}?type={kind}"
+
+
+def _jf_item(it: dict) -> dict:
+    """Jellyfin item → JfItem (docs/api-v1.md)."""
     typ = it.get("Type", "")
-    name = it.get("Name", "?")
-    # Episodes read better with their SxEy prefix and the series name.
+    ud = it.get("UserData") or {}
+    out: dict = {"id": it.get("Id"), "name": it.get("Name") or "?", "type": typ,
+                 "played": bool(ud.get("Played"))}
+    if typ in ("Episode", "Season") and it.get("SeriesName"):
+        out["series_name"] = it["SeriesName"]
     if typ == "Episode":
-        s, e = it.get("ParentIndexNumber"), it.get("IndexNumber")
-        tag = f"S{s}·E{e}" if s and e else "Episode"
-        subtitle = f"{it.get('SeriesName', '')} · {tag}".strip(" ·")
-    elif typ == "Series":
-        yr = it.get("ProductionYear")
-        subtitle = f"Series · {yr}" if yr else "Series"
-    elif typ == "Season":
-        subtitle = "Season"
-    else:
-        subtitle = str(it.get("ProductionYear") or "")
-    has_img = "Primary" in (it.get("ImageTags") or {})
-    return {
-        "id": it.get("Id"),
-        "name": name,
-        "type": typ,
-        "subtitle": subtitle,
-        "playable": typ in _PLAYABLE,
-        "image": f"/ui-jellyfin/image/{it.get('Id')}" if has_img else None,
-    }
+        if it.get("ParentIndexNumber") is not None:
+            out["season"] = it["ParentIndexNumber"]
+        if it.get("IndexNumber") is not None:
+            out["episode"] = it["IndexNumber"]
+    elif typ == "Season" and it.get("IndexNumber") is not None:
+        out["season"] = it["IndexNumber"]
+    if it.get("ProductionYear"):
+        out["year"] = it["ProductionYear"]
+    if it.get("Overview"):
+        out["overview"] = it["Overview"]
+    if it.get("RunTimeTicks"):
+        out["runtime_s"] = round(it["RunTimeTicks"] / _TICKS)
+    if ud.get("PlayedPercentage"):
+        out["played_pct"] = round(ud["PlayedPercentage"], 1)
+    if ud.get("PlaybackPositionTicks"):
+        out["resume_s"] = round(ud["PlaybackPositionTicks"] / _TICKS)
+    cc = it.get("ChildCount")
+    if cc is None and typ in ("Series", "Season", "BoxSet", "Folder", "CollectionFolder"):
+        cc = it.get("RecursiveItemCount")
+    if cc is not None:
+        out["child_count"] = cc
+    # Poster: own Primary, else the series' / parent's (episodes without stills).
+    tags = it.get("ImageTags") or {}
+    img_id = it.get("Id")
+    if "Primary" not in tags:
+        if it.get("SeriesPrimaryImageTag") and it.get("SeriesId"):
+            img_id = it["SeriesId"]
+        elif it.get("ParentPrimaryImageItemId"):
+            img_id = it["ParentPrimaryImageItemId"]
+    out["image_url"] = _jf_img(img_id)
+    if it.get("BackdropImageTags"):
+        out["backdrop_url"] = _jf_img(it["Id"], "Backdrop")
+    elif it.get("ParentBackdropItemId"):
+        out["backdrop_url"] = _jf_img(it["ParentBackdropItemId"], "Backdrop")
+    return out
 
 
-def _require_jellyfin() -> None:
-    if not JELLYFIN_ENABLED:
-        raise HTTPException(status_code=404, detail="jellyfin not configured")
+def _jf_common_params(uid: str) -> dict:
+    return {"userId": uid, "Fields": _JF_FIELDS, "EnableUserData": "true",
+            "EnableImageTypes": "Primary,Backdrop", "ImageTypeLimit": 1}
 
 
-@app.get("/ui-jellyfin/items")
-async def jellyfin_items(parentId: str | None = None) -> dict:
-    # No parent → top level: every Movie and Series the account can see.
-    # With a parent → that container's children (Series→Seasons→Episodes).
+@api.get("/jellyfin/views", dependencies=authed)
+async def api_jf_views() -> dict:
     _require_jellyfin()
-    _, uid = await _jf_authenticate_cached()
-    params = {
-        "userId": uid,
-        "Fields": "ProductionYear",
-        "ImageTypeLimit": 1,
-        "EnableImageTypes": "Primary",
-        "Limit": 500,
-    }
-    if parentId:
-        params["parentId"] = parentId
-        params["SortBy"] = "IndexNumber,SortName"
-    else:
+    _, uid = await _jf_authenticate()
+    data = await _jf_json("GET", "/UserViews", params={"userId": uid})
+    return {"items": [_jf_item(it) for it in data.get("Items", [])]}
+
+
+@api.get("/jellyfin/items", dependencies=authed)
+async def api_jf_items(parent_id: str | None = None, search: str | None = None,
+                       start: int = 0, limit: int = 60, types: str | None = None) -> dict:
+    _require_jellyfin()
+    _, uid = await _jf_authenticate()
+    params = _jf_common_params(uid)
+    params.update(StartIndex=max(0, start), Limit=max(1, min(500, limit)),
+                  EnableTotalRecordCount="true")
+    if parent_id:
+        params["parentId"] = parent_id
+    if search:
+        params["searchTerm"] = search
+    if types:
+        params["IncludeItemTypes"] = types
+    elif not parent_id:
         params["IncludeItemTypes"] = "Movie,Series"
+    # Recursive whenever we're filtering by type/search or at the top
+    # level; a bare parent_id lists that container's direct children.
+    if search or types or not parent_id:
         params["Recursive"] = "true"
         params["SortBy"] = "SortName"
-    r = await _jf_request("GET", "/Items", params=params)
-    if r.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"jellyfin items error ({r.status_code})")
-    items = [_jf_card(it) for it in r.json().get("Items", [])]
-    return {"items": items}
+    else:
+        params["SortBy"] = "IndexNumber,SortName"
+    data = await _jf_json("GET", "/Items", params=params)
+    items = [_jf_item(it) for it in data.get("Items", [])]
+    return {"items": items, "total": data.get("TotalRecordCount", len(items))}
 
 
-async def _jf_authenticate_cached() -> tuple[str, str]:
-    # Thin wrapper so the items route can get (token, uid) without making
-    # a throwaway request; reuses the same client lifecycle.
-    async with httpx.AsyncClient(timeout=JELLYFIN_TIMEOUT) as client:
-        return await _jf_authenticate(client)
-
-
-@app.get("/ui-jellyfin/image/{item_id}")
-async def jellyfin_image(item_id: str) -> Response:
-    # Proxy the Primary poster so the token stays server-side. Cached hard
-    # in the browser — posters don't change.
+@api.get("/jellyfin/resume", dependencies=authed)
+async def api_jf_resume() -> dict:
     _require_jellyfin()
-    r = await _jf_request(
-        "GET", f"/Items/{item_id}/Images/Primary", params={"maxWidth": 400, "quality": 90}
-    )
+    _, uid = await _jf_authenticate()
+    params = {**_jf_common_params(uid), "MediaTypes": "Video", "Limit": 30}
+    data = await _jf_json("GET", "/UserItems/Resume", params=params)
+    return {"items": [_jf_item(it) for it in data.get("Items", [])]}
+
+
+@api.get("/jellyfin/nextup", dependencies=authed)
+async def api_jf_nextup() -> dict:
+    _require_jellyfin()
+    _, uid = await _jf_authenticate()
+    params = {**_jf_common_params(uid), "Limit": 30}
+    data = await _jf_json("GET", "/Shows/NextUp", params=params)
+    return {"items": [_jf_item(it) for it in data.get("Items", [])]}
+
+
+async def _jf_get_item(item_id: str) -> dict:
+    _, uid = await _jf_authenticate()
+    return await _jf_json("GET", f"/Items/{item_id}", params={"userId": uid})
+
+
+@api.get("/jellyfin/item/{item_id}", dependencies=authed)
+async def api_jf_item(item_id: str) -> dict:
+    _require_jellyfin()
+    _, uid = await _jf_authenticate()
+    it = await _jf_get_item(item_id)
+    out = _jf_item(it)
+    typ = it.get("Type")
+    params = _jf_common_params(uid)
+    children = None
+    if typ == "Series":
+        data = await _jf_json("GET", f"/Shows/{item_id}/Seasons", params=params)
+        children = data.get("Items", [])
+    elif typ == "Season":
+        series_id = it.get("SeriesId") or it.get("ParentId")
+        data = await _jf_json("GET", f"/Shows/{series_id}/Episodes",
+                              params={**params, "seasonId": item_id})
+        children = data.get("Items", [])
+    elif it.get("IsFolder"):
+        data = await _jf_json("GET", "/Items", params={
+            **params, "parentId": item_id, "SortBy": "IndexNumber,SortName", "Limit": 500})
+        children = data.get("Items", [])
+    if children is not None:
+        out["children"] = [_jf_item(c) for c in children]
+    return out
+
+
+@api.get("/jellyfin/image/{item_id}")
+async def api_jf_image(item_id: str, type: str = "Primary", max_width: int = 600) -> Response:
+    # Proxied so the Jellyfin token stays server-side; no auth (it's an image).
+    _require_jellyfin()
+    kind = type if type in ("Primary", "Backdrop", "Thumb", "Logo") else "Primary"
+    if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", item_id):
+        raise ApiError(404, "bad item id", "not_found")
+    r = await _jf_request("GET", f"/Items/{item_id}/Images/{kind}",
+                          params={"maxWidth": max(64, min(3840, max_width)), "quality": 90})
     if r.status_code >= 400:
-        raise HTTPException(status_code=404, detail="no image")
-    return Response(
-        content=r.content,
-        media_type=r.headers.get("Content-Type", "image/jpeg"),
-        headers={"Cache-Control": "public, max-age=86400"},
-    )
+        raise ApiError(404, "no image", "not_found")
+    return Response(content=r.content, media_type=r.headers.get("Content-Type", "image/jpeg"),
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
-class JellyfinPlayRequest(BaseModel):
-    itemId: str
-    title: str | None = None
-    lowQuality: bool = False
-
-
-async def _jf_resolve_stream(item_id: str, max_bitrate: int) -> str:
-    """Ask Jellyfin how to play an item; return a URL mpv can open.
+async def _jf_resolve_stream(item_id: str, max_bitrate: int) -> tuple[str, dict]:
+    """Ask Jellyfin how to play an item; return (URL mpv can open, session
+    info for playback reporting).
 
     Direct-stream when the source is already H.264; otherwise Jellyfin
     hands back an HLS TranscodingUrl (transcoded to H.264 per our device
     profile) which mpv plays and the GTX 970 hardware-decodes.
     """
-    token, uid = await _jf_authenticate_cached()
-    r = await _jf_request(
-        "POST",
-        f"/Items/{item_id}/PlaybackInfo",
+    token, uid = await _jf_authenticate()
+    data = await _jf_json(
+        "POST", f"/Items/{item_id}/PlaybackInfo",
         params={"userId": uid},
         json={"DeviceProfile": _jf_device_profile(max_bitrate)},
     )
-    if r.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"jellyfin playbackinfo error ({r.status_code})")
-    data = r.json()
     sources = data.get("MediaSources") or []
     if not sources:
-        raise HTTPException(status_code=404, detail="no playable media source")
+        raise ApiError(404, "no playable media source", "not_playable")
     ms = sources[0]
     psid = data.get("PlaySessionId", "")
+    info = {"media_source_id": ms.get("Id", item_id), "play_session_id": psid}
     transcode_url = ms.get("TranscodingUrl")
     if transcode_url:
         url = f"{JELLYFIN_URL}{transcode_url}"
         if "api_key=" not in url:
             url += f"&api_key={token}"
-        return url
+        return url, {**info, "play_method": "Transcode"}
     if ms.get("SupportsDirectStream") or ms.get("SupportsDirectPlay"):
         url = (
             f"{JELLYFIN_URL}/Videos/{item_id}/stream"
@@ -543,22 +855,98 @@ async def _jf_resolve_stream(item_id: str, max_bitrate: int) -> str:
         )
         if ms.get("Container"):
             url += f"&Container={ms['Container']}"
-        return url
-    raise HTTPException(status_code=502, detail="jellyfin returned no usable stream")
+        return url, {**info, "play_method": "DirectStream"}
+    raise ApiError(502, "jellyfin returned no usable stream", "not_playable")
 
 
-@app.post("/ui-jellyfin/play")
-async def jellyfin_play(req: JellyfinPlayRequest, request: Request) -> dict[str, str]:
-    # LAN-trust, same as /ui-cast. Resolve the item to a stream URL, then
-    # hand it to the host helper forcing the mpv backend (the Jellyfin
-    # host isn't in the helper's video-host list).
+def _jf_report_body(sess: dict, position_s: float | None, paused: bool = False) -> dict:
+    return {
+        "ItemId": sess["item_id"],
+        "MediaSourceId": sess["media_source_id"],
+        "PlaySessionId": sess["play_session_id"],
+        "PlayMethod": sess["play_method"],
+        "PositionTicks": int((position_s or 0) * _TICKS),
+        "IsPaused": paused,
+        "CanSeek": True,
+    }
+
+
+async def _jf_report(path: str, body: dict) -> None:
+    try:
+        r = await _jf_request("POST", path, json=body)
+        if r.status_code >= 400:
+            logger.warning("jellyfin %s -> %s", path, r.status_code)
+    except Exception as exc:  # noqa: BLE001 — reporting is best-effort
+        logger.warning("jellyfin %s failed: %s", path, exc)
+
+
+async def _jf_stop_session() -> None:
+    """Report Stopped for the tracked Jellyfin playback (if any)."""
+    global _jf_session
+    sess, _jf_session = _jf_session, None
+    if sess:
+        logger.info("jellyfin: stopped item=%s at %.0fs", sess["item_id"], sess["last_pos"] or 0)
+        await _jf_report("/Sessions/Playing/Stopped", _jf_report_body(sess, sess["last_pos"]))
+
+
+async def _jf_on_state(st: dict) -> None:
+    """Drive Playing/Progress/Stopped reporting from the host's mpv position."""
+    sess = _jf_session
+    if not sess:
+        return
+    item = st.get("item") or {}
+    now = time.monotonic()
+    if st.get("source") == "jellyfin" and item.get("id") == sess["item_id"]:
+        if st.get("position_s") is not None:
+            sess["last_pos"] = st["position_s"]
+        paused = st.get("activity") == "paused"
+        if now - sess["last_report"] >= JF_PROGRESS_INTERVAL or paused != sess["paused"]:
+            sess["last_report"], sess["paused"] = now, paused
+            _spawn(_jf_report("/Sessions/Playing/Progress",
+                              _jf_report_body(sess, sess["last_pos"], paused)))
+    elif now - sess["started"] > 15:
+        # Something else is on the projector (or nothing): playback is over.
+        await _jf_stop_session()
+
+
+class V1JellyfinPlay(BaseModel):
+    id: str
+    resume: bool = False
+    low_quality: bool = False
+
+
+@api.post("/jellyfin/play", dependencies=authed)
+async def api_jf_play(req: V1JellyfinPlay, request: Request) -> dict:
+    global _jf_session
     _require_jellyfin()
-    client_host = request.client.host if request.client else "?"
-    logger.info("jellyfin play from=%s item=%s lowQuality=%s", client_host, req.itemId, req.lowQuality)
-    max_bitrate = _JF_LOW_BITRATE if req.lowQuality else _JF_MAX_BITRATE
-    stream_url = await _jf_resolve_stream(req.itemId, max_bitrate)
-    await _forward(stream_url, backend="mpv", title=req.title)
-    return {"status": "ok"}
+    client = request.client.host if request.client else "?"
+    logger.info("jellyfin play from=%s item=%s resume=%s low=%s",
+                client, req.id, req.resume, req.low_quality)
+    it = await _jf_get_item(req.id)
+    if it.get("Type") not in ("Movie", "Episode", "Video", "MusicVideo"):
+        raise ApiError(400, f"{it.get('Type')} is not playable", "not_playable")
+    start = 0.0
+    if req.resume:
+        start = ((it.get("UserData") or {}).get("PlaybackPositionTicks") or 0) / _TICKS
+    max_bitrate = _JF_LOW_BITRATE if req.low_quality else _JF_MAX_BITRATE
+    stream_url, info = await _jf_resolve_stream(req.id, max_bitrate)
+    card = _jf_item(it)
+    if it.get("Type") == "Episode":
+        s, e = it.get("ParentIndexNumber"), it.get("IndexNumber")
+        tag = f"S{s}E{e}" if s is not None and e is not None else ""
+        subtitle = " · ".join(x for x in (it.get("SeriesName"), tag) if x) or None
+    else:
+        subtitle = str(it["ProductionYear"]) if it.get("ProductionYear") else None
+    meta = {"source": "jellyfin", "item": {"kind": "jellyfin", "id": req.id},
+            "title": it.get("Name"), "subtitle": subtitle,
+            "artwork_url": card.get("backdrop_url") or card["image_url"]}
+    await _jf_stop_session()
+    await _host_open(stream_url, backend="mpv", title=it.get("Name"), meta=meta, start=start)
+    sess = {"item_id": req.id, **info, "last_pos": start, "paused": False,
+            "started": time.monotonic(), "last_report": time.monotonic()}
+    _jf_session = sess
+    _spawn(_jf_report("/Sessions/Playing", _jf_report_body(sess, start)))
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -569,31 +957,34 @@ _ATOM = "{http://www.w3.org/2005/Atom}"
 _YTNS = "{http://www.youtube.com/xml/schemas/2015}"
 _feed_cache: dict = {"ts": 0.0, "items": [], "refreshing": False}
 _subs_cache: dict = {"ts": 0.0, "ids": [], "refreshing": False}
-# Hold strong refs to background refresh tasks: asyncio only keeps a weak
-# reference, so without this they can be GC'd mid-flight and silently die.
-_bg_tasks: set = set()
 
 
-def _spawn(coro) -> None:
-    t = asyncio.create_task(coro)
-    _bg_tasks.add(t)
-    t.add_done_callback(_bg_tasks.discard)
+def _norm_feed_item(it: dict) -> dict:
+    """Upgrade a cached item from the pre-v1 shape (image/short)."""
+    vid = it.get("id", "")
+    return {
+        "id": vid,
+        "url": it.get("url") or f"https://www.youtube.com/watch?v={vid}",
+        "title": it.get("title") or "(untitled)",
+        "channel": it.get("channel") or "",
+        "channel_id": it.get("channel_id") or "",
+        "published": it.get("published") or "",
+        "thumbnail": it.get("thumbnail") or it.get("image") or f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
+        "duration_s": it.get("duration_s"),
+        "is_short": bool(it.get("is_short", it.get("short", False))),
+    }
 
 
-def _load_state() -> None:
-    """Seed the subs/feed caches from the last run's disk snapshot.
-
-    Runs once at import time. Without this, every container restart
-    starts both caches empty, so the very first page load falls back to
-    the placeholder yt-channels.txt list (or an empty feed) until a
-    fresh ~90s account scrape lands — exactly the "wrong subs on
-    startup" gap this avoids for a plain restart (a rebuild still
-    starts cold, since it's the container's own writable layer).
-    """
-    try:
-        with open(YT_STATE_FILE, encoding="utf-8") as f:
-            state = json.load(f)
-    except (OSError, ValueError):
+def _load_yt_state() -> None:
+    """Seed the subs/feed caches from the last run's snapshot (/data)."""
+    for path in (YT_STATE_FILE, "/tmp/mediacast-yt-state.json"):
+        try:
+            with open(path, encoding="utf-8") as f:
+                state = json.load(f)
+            break
+        except (OSError, ValueError):
+            continue
+    else:
         return
     subs = state.get("subs") or {}
     if subs.get("ids"):
@@ -601,48 +992,38 @@ def _load_state() -> None:
         _subs_cache["ts"] = subs.get("ts", 0.0)
     feed = state.get("feed") or {}
     if feed.get("items"):
-        _feed_cache["items"] = feed["items"]
+        _feed_cache["items"] = [_norm_feed_item(i) for i in feed["items"] if i.get("id")]
         _feed_cache["ts"] = feed.get("ts", 0.0)
 
 
-def _save_state() -> None:
+def _save_yt_state() -> None:
     try:
-        with open(YT_STATE_FILE, "w", encoding="utf-8") as f:
+        tmp = YT_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump({
                 "subs": {"ids": _subs_cache["ids"], "ts": _subs_cache["ts"]},
                 "feed": {"items": _feed_cache["items"], "ts": _feed_cache["ts"]},
             }, f)
+        os.replace(tmp, YT_STATE_FILE)
     except OSError as exc:
         logger.warning("yt state save failed: %s", exc)
 
 
-_load_state()
-
-
 async def _refresh_account_subs() -> None:
-    """Scrape the account subscriptions into the cache (background task).
-
-    The host's yt-dlp scrape can take tens of seconds, so this never runs
-    inline — it's fired off by _account_channel_ids and updates the cache
-    for the *next* request. The refreshing flag dedups concurrent scrapes.
-    """
+    """Scrape the account subscriptions into the cache (background task;
+    the host's yt-dlp scrape can take tens of seconds)."""
     try:
-        async with httpx.AsyncClient(timeout=YT_SUBS_FETCH_TIMEOUT) as client:
-            r = await client.get(
-                HOST_SUBS_URL, headers={"Authorization": f"Bearer {TOKEN}"}
-            )
+        r = await http().get(f"{HOST_BASE}/yt-subscriptions", headers=_HOST_AUTH,
+                             timeout=YT_SUBS_FETCH_TIMEOUT)
         if r.status_code == 200:
             ids = [c for c in r.json().get("channel_ids", []) if _UC_RE.fullmatch(c)]
             if ids:
                 changed = ids != _subs_cache["ids"]
                 _subs_cache["ids"] = ids
                 _subs_cache["ts"] = time.time()
-                _save_state()
+                _save_yt_state()
                 logger.info("account subscriptions: %d channels", len(ids))
-                # The subscriber list just changed (including cold-cache →
-                # populated): the cached feed may still be built from the
-                # placeholder file, so rebuild now instead of waiting for
-                # YT_FEED_TTL / a manual "Refresh" click to notice.
+                # Rebuild now if the list changed (cold cache → populated).
                 if changed and not _feed_cache["refreshing"]:
                     _feed_cache["refreshing"] = True
                     _spawn(_refresh_feed())
@@ -657,13 +1038,7 @@ async def _refresh_account_subs() -> None:
 
 
 async def _account_channel_ids() -> list[str]:
-    """Cached subscribed channel ids; refreshed in the background.
-
-    Never blocks: returns whatever's cached now and, when that's stale or
-    empty, kicks off a background scrape for next time. So the feed
-    endpoint always answers fast — the static-file channels cover a cold
-    cache until the first scrape lands.
-    """
+    """Cached subscribed channel ids; refreshed in the background, never blocks."""
     if not YT_SUBS_FROM_ACCOUNT:
         return []
     stale = (time.time() - _subs_cache["ts"]) >= YT_SUBS_TTL or not _subs_cache["ids"]
@@ -674,16 +1049,8 @@ async def _account_channel_ids() -> list[str]:
 
 
 async def _channel_ids() -> list[str]:
-    """Feed channel ids: the account's real subscriptions when we have
-    them, else the static-file list as a fallback for a cold cache with
-    account subs disabled/not yet scraped.
-
-    Deliberately NOT a union of both: once the account scrape has landed
-    even once, static-file entries (the placeholder yt-channels.txt demo
-    list, or anything hand-added there) must stop showing up — otherwise
-    channels the user was never subscribed to keep reappearing in the
-    feed alongside their real subscriptions forever.
-    """
+    """The account's real subscriptions when we have them, else the static
+    file. Deliberately not a union (placeholder channels would linger)."""
     if YT_SUBS_FROM_ACCOUNT:
         ids = await _account_channel_ids()
         if ids:
@@ -692,14 +1059,8 @@ async def _channel_ids() -> list[str]:
 
 
 def _load_channel_ids() -> list[str]:
-    """Channel ids from the list file, order-preserving and de-duped.
-
-    Each non-comment line may be a bare UC… id, a Takeout CSV row
-    (Channel Id,Channel Url,Channel Title), or a channel URL — we just
-    pull the first UC… token out of the line. Handles (@name) carry no
-    UC id and are skipped (Takeout gives ids, which is the supported
-    path). Missing file → empty list → the section hides itself.
-    """
+    """Channel ids from the list file (bare ids, Takeout CSV rows or channel
+    URLs — first UC… token per line), order-preserving and de-duped."""
     try:
         with open(YT_CHANNELS_FILE, encoding="utf-8") as f:
             lines = f.readlines()
@@ -717,46 +1078,38 @@ def _load_channel_ids() -> list[str]:
 
 
 def _parse_channel_rss(xml: str) -> list[dict]:
-    """Newest uploads from one channel's RSS as card dicts."""
+    """Newest uploads from one channel's RSS as feed items."""
     try:
         root = ET.fromstring(xml)
     except ET.ParseError:
         return []
     channel = root.findtext(f"{_ATOM}title") or ""
+    channel_id = root.findtext(f"{_YTNS}channelId") or ""
+    if channel_id and not channel_id.startswith("UC"):
+        channel_id = "UC" + channel_id
     out: list[dict] = []
     for e in root.findall(f"{_ATOM}entry")[:YT_PER_CHANNEL]:
         vid = e.findtext(f"{_YTNS}videoId")
         if not vid:
             continue
-        out.append({
+        out.append(_norm_feed_item({
             "id": vid,
-            "title": e.findtext(f"{_ATOM}title") or "(untitled)",
+            "title": e.findtext(f"{_ATOM}title"),
             "channel": channel,
-            "published": e.findtext(f"{_ATOM}published") or "",
-            # Public thumbnail CDN (https loads fine on the http portal).
-            "image": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
-            "url": f"https://www.youtube.com/watch?v={vid}",
-        })
+            "channel_id": channel_id,
+            "published": e.findtext(f"{_ATOM}published"),
+        }))
     return out
 
 
-async def _is_short(client: httpx.AsyncClient, vid: str) -> bool:
-    """Shorts vs. regular uploads aren't distinguished anywhere in the
-    per-channel RSS (no duration, no flag) — but /shorts/<id> answers
-    200 in place for an actual Short, and redirects (303) to /watch for
-    everything else, so a redirect-less HEAD there is a reliable,
-    single-request tell.
-
-    Deliberately spoofs a curl-style User-Agent instead of _YT_UA: a
-    browser-looking UA (or httpx's own default) makes YouTube detour
-    through the /consent cookie-wall page — a 302 for both Shorts and
-    regular videos alike, destroying the signal. Bot-looking UAs skip
-    that gate and get the real 200/303 straight away.
-    """
+async def _is_short(vid: str) -> bool:
+    """/shorts/<id> answers 200 for an actual Short and 303s to /watch for
+    everything else. Spoofs a curl UA: a browser-looking one detours
+    through the /consent cookie wall (302 for everything)."""
     try:
-        r = await client.head(
+        r = await http().head(
             f"https://www.youtube.com/shorts/{vid}",
-            headers={"User-Agent": "curl/8.5.0"}, follow_redirects=False,
+            headers={"User-Agent": "curl/8.5.0"}, follow_redirects=False, timeout=15,
         )
         return r.status_code == 200
     except httpx.HTTPError:
@@ -768,55 +1121,53 @@ async def _build_feed() -> list[dict]:
     if not ids:
         return []
     sem = asyncio.Semaphore(YT_FETCH_CONCURRENCY)
+    known = {it["id"]: it for it in _feed_cache["items"]}
 
-    async def fetch(client: httpx.AsyncClient, cid: str) -> list[dict]:
+    async def fetch(cid: str) -> list[dict]:
         url = f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
         async with sem:
             try:
-                r = await client.get(url, headers={"User-Agent": _YT_UA})
+                r = await http().get(url, headers={"User-Agent": _YT_UA}, timeout=15)
             except httpx.HTTPError as exc:
                 logger.warning("yt rss fetch failed for %s: %s", cid, exc)
                 return []
         return _parse_channel_rss(r.text) if r.status_code < 400 else []
 
-    async def tag_short(client: httpx.AsyncClient, item: dict) -> None:
+    async def tag_short(item: dict) -> None:
+        if item["id"] in known:   # already checked on an earlier build
+            item["is_short"] = known[item["id"]]["is_short"]
+            return
         async with sem:
-            item["short"] = await _is_short(client, item["id"])
+            item["is_short"] = await _is_short(item["id"])
 
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-        results = await asyncio.gather(*(fetch(client, c) for c in ids))
-        items = [v for chan in results for v in chan]
-        # ISO-8601 timestamps share the same offset, so a plain string sort
-        # is chronological. Newest first.
-        items.sort(key=lambda v: v["published"], reverse=True)
-        items = items[:YT_FEED_LIMIT]
-        # Tag Shorts only on the page we're actually keeping — checking
-        # every raw per-channel entry before the sort/truncate would be
-        # many times the HTTP requests for entries we'd drop anyway.
-        await asyncio.gather(*(tag_short(client, it) for it in items))
+    results = await asyncio.gather(*(fetch(c) for c in ids))
+    items = [v for chan in results for v in chan]
+    # ISO-8601 timestamps share the same offset → string sort is chronological.
+    items.sort(key=lambda v: v["published"], reverse=True)
+    items = items[:YT_FEED_LIMIT]
+    await asyncio.gather(*(tag_short(it) for it in items))
     return items
 
 
 async def _refresh_feed() -> None:
-    """Rebuild the RSS feed into the cache; keeps the last good feed if a
-    refresh comes back empty. Dedup'd via the refreshing flag."""
+    """Rebuild the feed cache; keeps the last good feed if a refresh comes
+    back empty. Dedup'd via the refreshing flag."""
     try:
         items = await _build_feed()
         if items:
             _feed_cache["items"] = items
             _feed_cache["ts"] = time.time()
-            _save_state()
+            _save_yt_state()
     finally:
         _feed_cache["refreshing"] = False
 
 
 async def _get_feed(force: bool = False) -> list[dict]:
-    # Stale-while-revalidate: serve cached items immediately and refresh
-    # in the background when stale, so a page load never waits on the
-    # (potentially many-channel) RSS rebuild. Only a cold cache or an
-    # explicit refresh builds inline, so the first load still returns data.
+    # Stale-while-revalidate: only a cold cache or an explicit refresh
+    # builds inline.
     stale = (time.time() - _feed_cache["ts"]) >= YT_FEED_TTL
     if force or (stale and not _feed_cache["items"]):
+        _feed_cache["refreshing"] = True
         await _refresh_feed()
     elif stale and not _feed_cache["refreshing"]:
         _feed_cache["refreshing"] = True
@@ -824,594 +1175,105 @@ async def _get_feed(force: bool = False) -> list[dict]:
     return _feed_cache["items"]
 
 
-@app.get("/ui-youtube/feed")
-async def youtube_feed(refresh: int = 0) -> dict:
-    # LAN-trust, same model as /ui-jellyfin and /ui-cast. 404 when no
-    # channel list is configured (neither account subscriptions nor a
-    # static file) so the UI hides the whole section.
+@api.get("/youtube/feed", dependencies=authed)
+async def api_youtube_feed(refresh: int = 0, shorts: int = 1) -> dict:
     if not await _channel_ids():
-        raise HTTPException(status_code=404, detail="youtube feed not configured")
+        raise ApiError(404, "youtube feed not configured", "not_configured")
     items = await _get_feed(force=bool(refresh))
-    return {"items": items}
+    if not shorts:
+        items = [it for it in items if not it["is_short"]]
+    return {"items": items, "updated_at": int(_feed_cache["ts"] * 1000)}
 
 
-_INDEX_HTML = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cast to projector</title>
-<style>
-  :root { color-scheme: dark light; }
-  body { font: 16px/1.45 system-ui, -apple-system, sans-serif;
-         max-width: 38rem; margin: 2rem auto; padding: 0 1rem; }
-  h1 { margin: 0 0 .25rem; }
-  h2 { margin-top: 2rem; font-size: 1.05rem; }
-  p  { margin: .5rem 0; }
-  form { display: flex; gap: .5rem; margin: 1rem 0 .5rem; }
-  input[type=url] { flex: 1; min-width: 0; padding: .65rem .8rem; font-size: 1rem;
-                    border: 1px solid #888; border-radius: .35rem;
-                    background: transparent; color: inherit; }
-  button { padding: .65rem 1.1rem; font-size: 1rem; cursor: pointer;
-           border: 0; border-radius: .35rem; background: #3b82f6; color: #fff; }
-  button:hover { background: #2563eb; }
-  .status { padding: .55rem .8rem; border-radius: .35rem;
-            min-height: 1.4em; font-size: .95rem; word-break: break-all; }
-  .status.ok  { background: #1f5132; color: #d1f3dd; }
-  .status.err { background: #5d1f1f; color: #f3d1d1; }
-  .controls { display: flex; gap: .5rem; margin: .5rem 0; flex-wrap: wrap; }
-  .ctrl { padding: .55rem .9rem; font-size: 1rem; cursor: pointer;
-          border: 1px solid currentColor; border-radius: .35rem;
-          background: transparent; color: inherit; min-width: 4rem; }
-  .ctrl:hover { background: rgba(127,127,127,.12); }
-  .seekrow { display: flex; gap: .6rem; align-items: center; margin: .5rem 0; }
-  .seekrow input[type=range] { flex: 1; }
-  .seekrow .t { font-variant-numeric: tabular-nums; font-size: .85rem;
-                min-width: 3.2rem; opacity: .85; }
-  .seekrow #cur { text-align: right; }
-  .volrow { display: flex; gap: .6rem; align-items: center; margin: .5rem 0 1rem; }
-  .volrow input[type=range] { flex: 1; }
-  #volv { min-width: 3.2rem; text-align: right; font-variant-numeric: tabular-nums; }
-  pre { background: rgba(127,127,127,.15); padding: .6rem .8rem;
-        border-radius: .35rem; overflow-x: auto; font-size: .85rem; }
-  small { opacity: .7; }
-  .jfbar { display: flex; align-items: center; gap: .6rem; margin: .4rem 0; }
-  .jfbar .crumb { font-size: .9rem; opacity: .75; word-break: break-word; }
-  .grid { display: grid; gap: .7rem; margin: .6rem 0 1rem;
-          grid-template-columns: repeat(auto-fill, minmax(7rem, 1fr)); }
-  .card { cursor: pointer; border: 0; background: transparent; color: inherit;
-          padding: 0; text-align: left; font: inherit; }
-  .card img, .card .ph { width: 100%; aspect-ratio: 2/3; object-fit: cover;
-          border-radius: .4rem; background: rgba(127,127,127,.18); display: block; }
-  .card .ph { display: flex; align-items: center; justify-content: center; font-size: 1.8rem; }
-  .card .t  { font-size: .82rem; margin-top: .25rem; line-height: 1.2; }
-  .card .st { font-size: .72rem; opacity: .65; }
-  .card:hover img, .card:hover .ph { outline: 2px solid #3b82f6; }
-  .muted { opacity: .6; font-size: .9rem; }
-  .nowtitle { font-size: 1.05rem; font-weight: 600; margin: .2rem 0 .6rem;
-              line-height: 1.3; word-break: break-word; }
-  .nowtitle.muted { font-weight: 400; }
-  /* YouTube subscriptions grid — wider cards, 16:9 thumbnails. */
-  .ytgrid { display: grid; gap: .8rem; margin: .6rem 0 1rem;
-            grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr)); }
-  .ytcard img, .ytcard .ph { aspect-ratio: 16/9; }
-  .ytcard .t { -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical;
-               display: -webkit-box; overflow: hidden; }
-  .secbar { display: flex; align-items: center; gap: .6rem; margin-top: 2rem; }
-  .secbar h2 { margin: 0; }
-  .secbar .refresh { margin-left: auto; padding: .3rem .7rem; font-size: .85rem;
-            cursor: pointer; border: 1px solid currentColor; border-radius: .35rem;
-            background: transparent; color: inherit; }
-  .secbar .refresh.active { background: rgba(127,127,127,.25); font-weight: 600; }
-  .ctrl.active { background: rgba(59,130,246,.3); font-weight: 600; }
-  #ss-status { min-height: 1.2em; }
-  .danger { margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid rgba(220,38,38,.35); }
-  .ctrl.danger-btn { border-color: #dc2626; color: #dc2626; }
-  .ctrl.danger-btn:hover { background: rgba(220,38,38,.12); }
-  .ytshorts { display: block; font-size: .82rem; opacity: .8; margin: -.2rem 0 .5rem; }
-  #yt-more { display: block; margin: 0 auto; }
-  .collapse { padding: .15rem .5rem; font-size: .9rem; line-height: 1; cursor: pointer;
-            border: 1px solid currentColor; border-radius: .35rem;
-            background: transparent; color: inherit; }
-  .hidden { display: none !important; }
-</style>
-</head>
-<body>
-<h2>Now playing</h2>
-<div id="nowtitle" class="nowtitle muted">Nothing playing</div>
-<div class="seekrow" id="seekrow" style="display:none">
-  <span class="t" id="cur">0:00</span>
-  <input type="range" id="seek" min="0" max="100" value="0" step="1" title="Seek">
-  <span class="t" id="dur">0:00</span>
-</div>
-<div class="controls">
-  <button class="ctrl" data-action="seek" data-offset="-30" title="Back 30s">⏪ &minus;30s</button>
-  <button class="ctrl" data-action="seek" data-offset="-10" title="Back 10s">&minus;10s</button>
-  <button class="ctrl" data-action="pause" title="Pause / resume">⏯</button>
-  <button class="ctrl" data-action="seek" data-offset="10"  title="Forward 10s">+10s</button>
-  <button class="ctrl" data-action="seek" data-offset="30"  title="Forward 30s">+30s ⏩</button>
-  <button class="ctrl" data-action="stop" title="Stop the cast">⏹ Stop</button>
-</div>
-<div class="volrow">
-  <label for="vol">🔊</label>
-  <input type="range" id="vol" min="0" max="100" step="2" value="60">
-  <span id="volv">—%</span>
-</div>
-<div id="s" class="status"></div>
-
-<h2>Cast a link</h2>
-<p><small>Paste a URL to open it on the projector.</small></p>
-<form id="f">
-  <button type="button" id="paste" title="Paste clipboard &amp; cast">📋 Paste</button>
-  <input type="url" id="url" placeholder="https://..." required autofocus>
-  <button type="submit">Cast</button>
-</form>
-
-<section id="yt-section" style="display:none">
-  <div class="secbar">
-    <button class="collapse" type="button" data-collapse="yt-grid" title="Hide / show">▾</button>
-    <h2>📺 Subscriptions</h2>
-    <button class="refresh" id="yt-refresh" type="button" title="Reload feed">↻ Refresh</button>
-  </div>
-  <label class="ytshorts"><input type="checkbox" id="yt-shorts-toggle"> Show Shorts</label>
-  <div class="grid ytgrid" id="yt-grid"></div>
-  <button class="refresh" id="yt-more" type="button" style="display:none">Load more</button>
-</section>
-
-<section id="jf-section" style="display:none">
-  <div class="secbar">
-    <button class="collapse" type="button" data-collapse="jf-body" title="Hide / show">▾</button>
-    <h2>🎬 mrpflix</h2>
-    <button class="refresh" id="jf-quality" type="button"
-            title="Cap the transcode bitrate for a slow/degraded link to mrpflix">
-      Full quality
-    </button>
-  </div>
-  <div id="jf-body">
-    <div class="jfbar" id="jf-bar" style="display:none">
-      <button class="ctrl" id="jf-back" type="button">← Back</button>
-      <span class="crumb" id="jf-crumb"></span>
-    </div>
-    <div class="grid" id="jf-grid"></div>
-  </div>
-</section>
-
-<h2>Screensaver</h2>
-<p><small>Kicks in on its own after a while with nothing playing, or pick one now. "Screen off" blanks the projector until something's cast or a screensaver is picked.</small></p>
-<div class="controls" id="ss-themes"></div>
-<div class="controls">
-  <button class="ctrl" id="ss-off" type="button">⏻ Screen off</button>
-</div>
-<p class="muted" id="ss-status"></p>
-
-<div class="danger">
-  <h2>⚠️ Danger zone</h2>
-  <p><small>Powers off the whole machine — not just the projector. Everything on it (Jellyfin, Home Assistant, music, this portal) goes down until someone physically presses the power button.</small></p>
-  <button class="ctrl danger-btn" id="poweroff-btn" type="button">⏻ Power off server</button>
-</div>
-
-<script>
-const f = document.getElementById('f');
-const i = document.getElementById('url');
-const s = document.getElementById('s');
-const q = new URLSearchParams(location.search);
-if (q.get('url')) i.value = q.get('url');
-
-async function cast(url) {
-  s.className = 'status'; s.textContent = 'casting…';
-  try {
-    const r = await fetch('/ui-cast', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({url}),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (r.ok) { s.className = 'status ok';  s.textContent = '✓ cast: ' + url; }
-    else      { s.className = 'status err'; s.textContent = '✗ ' + (j.detail || r.statusText); }
-  } catch (e) {
-    s.className = 'status err'; s.textContent = '✗ ' + e;
-  }
-}
-f.addEventListener('submit', e => { e.preventDefault(); cast(i.value); });
-if (q.get('auto') === '1' && i.value) cast(i.value);
-
-// Paste-and-cast: read the clipboard and cast it in one tap. The async
-// clipboard API only works in a secure context (https / localhost); over
-// plain http it throws, so we fall back to focusing the field for a
-// manual paste and say why.
-document.getElementById('paste').addEventListener('click', async () => {
-  try {
-    if (!navigator.clipboard || !navigator.clipboard.readText)
-      throw new Error('no clipboard API');
-    const text = ((await navigator.clipboard.readText()) || '').trim();
-    if (!text) { s.className = 'status err'; s.textContent = '✗ clipboard is empty'; return; }
-    i.value = text;
-    cast(text);
-  } catch (e) {
-    i.focus(); i.select();
-    s.className = 'status err';
-    s.textContent = '✗ clipboard blocked on http — paste into the field (long-press / Ctrl+V) then Cast';
-  }
-});
-
-// Control panel: pause/seek/stop buttons + volume slider all go to
-// /ui-control. Same trust model as /ui-cast (LAN-only).
-async function ctrl(body) {
-  try {
-    const r = await fetch('/ui-control', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (r.ok) { s.className = 'status ok';  s.textContent = '✓ ' + (j.detail || body.action); }
-    else      { s.className = 'status err'; s.textContent = '✗ ' + (j.detail || j.error || r.statusText); }
-    return j;
-  } catch (e) {
-    s.className = 'status err'; s.textContent = '✗ ' + e;
-  }
-}
-document.querySelectorAll('button.ctrl').forEach(b => {
-  b.addEventListener('click', () => {
-    const action = b.dataset.action;
-    const body = { action };
-    if (action === 'seek') body.offset = Number(b.dataset.offset);
-    ctrl(body);
-  });
-});
-
-// Volume slider — debounce so dragging doesn't fire dozens of
-// pactl calls per second. 80ms is comfortably below human-perceived
-// latency but lets the slider be responsive on touch.
-const vol = document.getElementById('vol');
-const volv = document.getElementById('volv');
-let volTimer = null;
-vol.addEventListener('input', () => {
-  volv.textContent = vol.value + '%';
-  clearTimeout(volTimer);
-  volTimer = setTimeout(() => ctrl({ action: 'volume', set: Number(vol.value) }), 80);
-});
-// Silent status read (no toast) — drives the 1s poll for the seek bar
-// and the one-time volume sync on load.
-async function fetchStatus() {
-  try {
-    const r = await fetch('/ui-control', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ action: 'status' }),
-    });
-    return r.ok ? await r.json() : null;
-  } catch (e) { return null; }
-}
-
-function fmt(sec) {
-  sec = Math.max(0, Math.floor(sec || 0));
-  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s2 = sec % 60;
-  const mm = h ? String(m).padStart(2, '0') : String(m);
-  return (h ? h + ':' : '') + mm + ':' + String(s2).padStart(2, '0');
-}
-
-// Seek bar. While the user drags, suppress poll updates so the thumb
-// doesn't snap back; on release send an absolute seek and keep
-// suppressing briefly until mpv reports the new position.
-const seekrow = document.getElementById('seekrow');
-const seek = document.getElementById('seek');
-const cur = document.getElementById('cur');
-const dur = document.getElementById('dur');
-let dragging = false, suppressUntil = 0;
-seek.addEventListener('input', () => { dragging = true; cur.textContent = fmt(Number(seek.value)); });
-seek.addEventListener('change', () => {
-  dragging = false; suppressUntil = Date.now() + 1500;
-  ctrl({ action: 'seek_to', position: Number(seek.value) });
-});
-
-// Poll: refresh seek bar (and sync volume once). The seek row shows
-// while something with a known duration is playing — mpv (mrpflix) or
-// the Firefox MPRIS player (browser YouTube); an idle screen or a
-// non-video Firefox tab hides it.
-let volSynced = false;
-async function poll() {
-  const j = await fetchStatus();
-  if (!volSynced && j && typeof j.volume === 'number' && j.volume >= 0) {
-    vol.value = j.volume; volv.textContent = j.volume + '%'; volSynced = true;
-  }
-  const playing = j && typeof j.duration === 'number' && j.duration > 0
-                    && typeof j.position === 'number';
-  // Show the scrub bar only when the position is live/seekable: mpv
-  // (mrpflix) or YouTube driven via CDP. The MPRIS-only fallback reports
-  // a frozen position, so it sets seekable=false and we hide the bar.
-  const trackable = playing && j.seekable;
-  // "Now playing" title — present whenever a player is active: mpv
-  // (mrpflix, or the legacy YouTube backend) or the Firefox MPRIS player
-  // (browser YouTube). Falls back to a muted placeholder when idle.
-  const nowtitle = document.getElementById('nowtitle');
-  const title = j && j.active && j.title ? j.title : null;
-  if (title) { nowtitle.textContent = (j.paused ? '⏸ ' : '') + title; nowtitle.classList.remove('muted'); }
-  else { nowtitle.textContent = 'Nothing playing'; nowtitle.classList.add('muted'); }
-  seekrow.style.display = trackable ? 'flex' : 'none';
-  if (trackable && !dragging && Date.now() > suppressUntil) {
-    seek.max = Math.floor(j.duration);
-    seek.value = Math.floor(j.position);
-    cur.textContent = fmt(j.position);
-    dur.textContent = fmt(j.duration);
-  }
-}
-poll();
-setInterval(poll, 1000);
-
-// mrpflix (Jellyfin) catalog. Browse a poster grid; click a movie or
-// episode to play it on the projector via mpv (same controls above).
-// Folders (series/seasons) drill in. If the server isn't configured the
-// first fetch 404s and we leave the whole section hidden.
-const jfSection = document.getElementById('jf-section');
-const jfGrid = document.getElementById('jf-grid');
-const jfBar = document.getElementById('jf-bar');
-const jfCrumb = document.getElementById('jf-crumb');
-const jfBack = document.getElementById('jf-back');
-let jfStack = [];  // breadcrumb: [{id, name}, ...]
-
-function esc(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
-
-async function jfLoad(parentId) {
-  jfGrid.innerHTML = '<span class="muted">loading…</span>';
-  try {
-    const u = parentId ? '/ui-jellyfin/items?parentId=' + encodeURIComponent(parentId)
-                       : '/ui-jellyfin/items';
-    const r = await fetch(u);
-    if (!r.ok) {
-      if (!jfStack.length) jfSection.style.display = 'none';   // not configured
-      else jfGrid.innerHTML = '<span class="muted">unavailable</span>';
-      return;
-    }
-    jfSection.style.display = '';
-    renderJf((await r.json()).items || []);
-  } catch (e) { if (!jfStack.length) jfSection.style.display = 'none'; }
-}
-
-function renderJf(items) {
-  jfBar.style.display = jfStack.length ? 'flex' : 'none';
-  jfCrumb.textContent = jfStack.map(x => x.name).join(' › ');
-  jfGrid.innerHTML = '';
-  if (!items.length) { jfGrid.innerHTML = '<span class="muted">empty</span>'; return; }
-  for (const it of items) {
-    const card = document.createElement('button');
-    card.className = 'card'; card.type = 'button';
-    const art = it.image
-      ? '<img loading="lazy" alt="" src="' + it.image +
-        '" onerror="this.outerHTML=\\'<div class=ph>🎬</div>\\'">'
-      : '<div class="ph">' + (it.playable ? '▶' : '📁') + '</div>';
-    card.innerHTML = art + '<div class="t">' + esc(it.name) + '</div>' +
-                     '<div class="st">' + esc(it.subtitle || '') + '</div>';
-    card.addEventListener('click', () => it.playable ? jfPlay(it) : jfEnter(it));
-    jfGrid.appendChild(card);
-  }
-}
-
-// Low-quality toggle: caps the transcode bitrate mrpflix is asked for,
-// for nights the link to it is degraded (see /ui-jellyfin/play). Sticks
-// across reloads like the collapse state above.
-const jfQuality = document.getElementById('jf-quality');
-function jfLowQuality() { return localStorage.getItem('jf-low-quality') === '1'; }
-function jfRenderQuality() {
-  const low = jfLowQuality();
-  jfQuality.textContent = low ? '🐢 Low quality' : 'Full quality';
-  jfQuality.classList.toggle('active', low);
-}
-jfQuality.addEventListener('click', () => {
-  localStorage.setItem('jf-low-quality', jfLowQuality() ? '0' : '1');
-  jfRenderQuality();
-});
-jfRenderQuality();
-
-function jfEnter(it) { jfStack.push({ id: it.id, name: it.name }); jfLoad(it.id); }
-jfBack.addEventListener('click', () => {
-  jfStack.pop();
-  const top = jfStack[jfStack.length - 1];
-  jfLoad(top ? top.id : null);
-});
-
-async function jfPlay(it) {
-  s.className = 'status'; s.textContent = 'casting ' + it.name + '…';
-  // Episodes read better with their series + SxEy prefix; movies are
-  // just the title. This is what shows under "Now playing".
-  const title = it.type === 'Episode' && it.subtitle
-    ? it.subtitle + ' · ' + it.name : it.name;
-  try {
-    const r = await fetch('/ui-jellyfin/play', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ itemId: it.id, title, lowQuality: jfLowQuality() }),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (r.ok) { s.className = 'status ok';  s.textContent = '✓ playing: ' + it.name; }
-    else      { s.className = 'status err'; s.textContent = '✗ ' + (j.detail || r.statusText); }
-  } catch (e) { s.className = 'status err'; s.textContent = '✗ ' + e; }
-}
-
-jfLoad(null);  // initial top-level load (hides itself if not configured)
-
-// YouTube subscriptions feed. Newest uploads from the configured
-// channels (merged from public RSS server-side). Click a card → cast
-// the video via the same YouTube pipeline as a pasted link. The whole
-// section stays hidden if no channel list is configured (feed 404s).
-const ytSection = document.getElementById('yt-section');
-const ytGrid = document.getElementById('yt-grid');
-const ytRefresh = document.getElementById('yt-refresh');
-const ytMore = document.getElementById('yt-more');
-const ytShortsToggle = document.getElementById('yt-shorts-toggle');
-const YT_PAGE = 24;
-let ytItems = [];   // full set fetched from the server, newest first
-let ytShown = 0;    // how many of the filtered list are currently rendered
-
-function ago(iso) {
-  const t = Date.parse(iso); if (isNaN(t)) return '';
-  const d = Math.max(0, (Date.now() - t) / 1000);
-  if (d < 3600)      return Math.floor(d / 60) + 'm ago';
-  if (d < 86400)     return Math.floor(d / 3600) + 'h ago';
-  if (d < 86400 * 7) return Math.floor(d / 86400) + 'd ago';
-  return Math.floor(d / (86400 * 7)) + 'w ago';
-}
-
-// Shorts are hidden by default (they drown out regular uploads in the
-// grid); "Show Shorts" is opt-in and remembered like the collapse toggles.
-ytShortsToggle.checked = localStorage.getItem('yt-show-shorts') === '1';
-
-function ytFiltered() {
-  return ytShortsToggle.checked ? ytItems : ytItems.filter(it => !it.short);
-}
-
-function ytCard(it) {
-  const card = document.createElement('button');
-  card.className = 'card ytcard'; card.type = 'button';
-  const meta = [esc(it.channel || ''), ago(it.published)].filter(Boolean).join(' · ');
-  card.innerHTML =
-    '<img loading="lazy" alt="" src="' + it.image +
-    '" onerror="this.outerHTML=\\'<div class=ph>📺</div>\\'">' +
-    '<div class="t">' + esc(it.title) + '</div>' +
-    '<div class="st">' + meta + '</div>';
-  card.addEventListener('click', () => cast(it.url));
-  return card;
-}
-
-// Re-render from the already-fetched ytItems (no network call) — used by
-// both the Shorts toggle and "Load more", so neither re-fetches the feed.
-function ytRender(reset) {
-  const list = ytFiltered();
-  if (reset) { ytGrid.innerHTML = ''; ytShown = 0; }
-  if (!list.length) { ytGrid.innerHTML = '<span class="muted">no recent videos</span>'; }
-  const next = list.slice(ytShown, ytShown + YT_PAGE);
-  for (const it of next) ytGrid.appendChild(ytCard(it));
-  ytShown += next.length;
-  ytMore.style.display = ytShown < list.length ? '' : 'none';
-}
-
-async function ytLoad(refresh) {
-  ytGrid.innerHTML = '<span class="muted">loading…</span>';
-  ytMore.style.display = 'none';
-  try {
-    const r = await fetch('/ui-youtube/feed' + (refresh ? '?refresh=1' : ''));
-    if (!r.ok) { ytSection.style.display = 'none'; return; }   // not configured
-    ytSection.style.display = '';
-    ytItems = (await r.json()).items || [];
-    ytRender(true);
-  } catch (e) { ytSection.style.display = 'none'; }
-}
-ytRefresh.addEventListener('click', () => ytLoad(true));
-ytMore.addEventListener('click', () => ytRender(false));
-ytShortsToggle.addEventListener('change', () => {
-  localStorage.setItem('yt-show-shorts', ytShortsToggle.checked ? '1' : '0');
-  ytRender(true);
-});
-ytLoad(false);
-
-// Collapsible sections (Subscriptions, mrpflix). Toggle the section body
-// and remember the choice in localStorage so it sticks across reloads.
-document.querySelectorAll('button.collapse').forEach(btn => {
-  const body = document.getElementById(btn.dataset.collapse);
-  const key = 'collapse:' + btn.dataset.collapse;
-  const render = () => {
-    // Default to collapsed: only an explicit '0' (user expanded) shows it.
-    const collapsed = (localStorage.getItem(key) ?? '1') === '1';
-    if (body) body.classList.toggle('hidden', collapsed);
-    btn.textContent = collapsed ? '▸' : '▾';
-  };
-  render();
-  btn.addEventListener('click', () => {
-    localStorage.setItem(key, localStorage.getItem(key) === '1' ? '0' : '1');
-    render();
-  });
-});
-
-// Screensaver / screen-off. State (which theme's showing, screen-off)
-// lives host-side so it stays right even if this page isn't open when
-// the idle timeout fires — this just reflects and drives it.
-const ssThemes = document.getElementById('ss-themes');
-const ssOff = document.getElementById('ss-off');
-const ssStatus = document.getElementById('ss-status');
-let ssBusy = false;
-
-async function ssRefresh() {
-  try {
-    const r = await fetch('/ui-screensaver-state');
-    if (!r.ok) return;
-    const st = await r.json();
-    const themes = st.themes || {};
-    ssThemes.innerHTML = '';
-    for (const key of Object.keys(themes)) {
-      const b = document.createElement('button');
-      b.className = 'ctrl' + (st.screensaver === key ? ' active' : '');
-      b.type = 'button';
-      b.textContent = themes[key];
-      b.addEventListener('click', () => ssPick(key));
-      ssThemes.appendChild(b);
-    }
-    ssOff.classList.toggle('active', !!st.screen_off);
-    ssStatus.textContent = st.screen_off ? 'Screen is off.'
-      : st.screensaver ? ('Screensaver: ' + (themes[st.screensaver] || st.screensaver))
-      : '';
-  } catch (e) { /* leave the buttons as they were */ }
-}
-
-async function ssPick(theme) {
-  if (ssBusy) return;
-  ssBusy = true;
-  s.className = 'status'; s.textContent = 'starting screensaver…';
-  try {
-    const r = await fetch('/ui-screensaver', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({theme}),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (r.ok) { s.className = 'status ok'; s.textContent = '✓ screensaver started'; }
-    else      { s.className = 'status err'; s.textContent = '✗ ' + (j.detail || r.statusText); }
-  } catch (e) { s.className = 'status err'; s.textContent = '✗ ' + e; }
-  ssBusy = false;
-  ssRefresh();
-}
-
-ssOff.addEventListener('click', async () => {
-  if (ssBusy) return;
-  ssBusy = true;
-  s.className = 'status'; s.textContent = 'turning screen off…';
-  try {
-    const r = await fetch('/ui-screen-off', { method: 'POST' });
-    const j = await r.json().catch(() => ({}));
-    if (r.ok) { s.className = 'status ok'; s.textContent = '✓ screen off'; }
-    else      { s.className = 'status err'; s.textContent = '✗ ' + (j.detail || r.statusText); }
-  } catch (e) { s.className = 'status err'; s.textContent = '✗ ' + e; }
-  ssBusy = false;
-  ssRefresh();
-});
-
-ssRefresh();
-setInterval(ssRefresh, 5000);  // picks up the idle-triggered auto-start too
-
-// Power off the whole machine. The one destructive action on this page —
-// a plain confirm() dialog is the speed bump against a stray tap; the
-// backend does no further confirmation of its own beyond the bearer/LAN
-// trust boundary every other action already relies on.
-document.getElementById('poweroff-btn').addEventListener('click', async () => {
-  const sure = confirm(
-    'Power off the WHOLE home server?\\n\\n' +
-    'This shuts down everything on the box — Jellyfin, Home Assistant, ' +
-    'music, this portal, all of it — not just the projector. It can ' +
-    'only be turned back on by physically pressing the power button.\\n\\n' +
-    'Continue?'
-  );
-  if (!sure) return;
-  s.className = 'status'; s.textContent = 'powering off the server…';
-  try {
-    const r = await fetch('/ui-poweroff', { method: 'POST' });
-    const j = await r.json().catch(() => ({}));
-    if (r.ok) { s.className = 'status ok';  s.textContent = '✓ server is powering off — bye!'; }
-    else      { s.className = 'status err'; s.textContent = '✗ ' + (j.detail || r.statusText); }
-  } catch (e) { s.className = 'status err'; s.textContent = '✗ ' + e; }
-});
-</script>
-</body>
-</html>
-"""
+app.include_router(api)
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.api_route("/api/{rest:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+               include_in_schema=False)
+async def api_not_found(rest: str) -> None:
+    raise ApiError(404, f"no such endpoint: /api/{rest}", "not_found")
+
+
+# ---------------------------------------------------------------------------
+# Legacy token routes (Home Assistant, OpenClaw, HTTP Shortcuts)
+# ---------------------------------------------------------------------------
+
+class LegacyControl(BaseModel):
+    action: str
+    offset: int | None = None
+    set: int | None = None
+    delta: int | None = None
+    position: float | None = None
+
+
+@app.get("/health")
+async def health() -> dict[str, bool]:
+    return {"ok": True}
+
+
+async def _legacy(coro):
+    try:
+        return await coro
+    except ApiError as exc:
+        # Pre-v1 shape and status codes ({"detail"}, 404 for "no cast").
+        status = 404 if exc.code == "no_active_cast" else exc.status_code
+        raise HTTPException(status_code=status, detail=exc.detail)
+
+
+@app.post("/cast")
+async def cast(req: CastRequest, authorization: str | None = Header(default=None)) -> dict[str, str]:
+    await _legacy(require_token(authorization))
+    try:
+        _check_url(req.url)
+    except ApiError as exc:
+        raise HTTPException(status_code=400, detail=exc.detail)
+    logger.info("cast (legacy) host=%s", urlparse(req.url).netloc)
+    await _legacy(_jf_stop_session())
+    await _legacy(_host_open(req.url, meta=_cast_meta(req.url)))
+    return {"status": "ok"}
+
+
+@app.post("/control")
+async def control(req: LegacyControl, authorization: str | None = Header(default=None)) -> dict:
+    await _legacy(require_token(authorization))
+    return await _legacy(_host_post("/control", req.model_dump(exclude_none=True)))
+
+
+# ---------------------------------------------------------------------------
+# Web portal (static/)
+# ---------------------------------------------------------------------------
+
+def _portal_config() -> str:
+    cfg = json.dumps({"token": TOKEN, "pairUrls": PAIR_URLS, "version": VERSION})
+    # Never let a value close the <script> element early.
+    return "<script>window.MEDIACAST=" + cfg.replace("</", "<\\/") + ";</script>"
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def index() -> HTMLResponse:
-    return HTMLResponse(_INDEX_HTML)
+    try:
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    except OSError:
+        html = "<!doctype html><title>mediacast</title><!--MEDIACAST_CONFIG--><p>portal files missing</p>"
+    html = html.replace("<!--MEDIACAST_CONFIG-->", _portal_config(), 1)
+    return HTMLResponse(html, headers={
+        "Cache-Control": "no-store",
+        # The page embeds the token: never let another site frame it.
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+    })
+
+
+@app.get("/manifest.webmanifest", include_in_schema=False)
+async def manifest() -> FileResponse:
+    return FileResponse(STATIC_DIR / "manifest.webmanifest", media_type="application/manifest+json")
+
+
+@app.get("/sw.js", include_in_schema=False)
+async def service_worker() -> FileResponse:
+    return FileResponse(STATIC_DIR / "sw.js", media_type="text/javascript",
+                        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
+
+
+if STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

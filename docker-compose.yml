@@ -131,6 +131,10 @@ services:
     environment:
       - PULSE_SERVER=unix:/run/pulse/native
       - PULSE_COOKIE=/run/pulse/cookie
+      # --onevent hook (services/librespot/onevent.sh) posts now-playing
+      # to mediacast's published port on loopback (host network).
+      - MEDIACAST_TOKEN=${MEDIACAST_TOKEN}
+      - MEDIACAST_EVENT_URL=http://127.0.0.1:8765/api/v1/spotify/event
     volumes:
       - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
       - /run/avahi-daemon/socket:/run/avahi-daemon/socket
@@ -151,6 +155,7 @@ services:
       --bitrate 320
       --initial-volume 80
       --enable-volume-normalisation
+      --onevent /usr/local/bin/librespot-onevent.sh
     restart: unless-stopped
 
   caddy:
@@ -196,11 +201,17 @@ services:
     # file is bind-mounted, not baked into the image, so editing the
     # list takes effect on the next feed refresh without a rebuild. The
     # whole section hides itself if the file is missing/empty.
+    #
+    # /data is the writable state dir (YouTube subs/feed cache) so it
+    # survives image rebuilds — it used to live in the container's /tmp.
     volumes:
       - ./services/mediacast/config:/config:ro
+      - ./services/mediacast/data:/data
     environment:
       - MEDIACAST_TOKEN=${MEDIACAST_TOKEN}
       - MEDIACAST_HOST_URL=http://host.docker.internal:8766/open
+      # Base URLs offered in the portal's "Pair phone" QR code.
+      - MEDIACAST_PAIR_URLS=${MEDIACAST_PAIR_URLS:-http://homeserver.local}
       # mrpflix (Jellyfin) catalog in the cast UI — optional. A blank
       # MRPFLIX_URL hides the section. See .env.example.
       - MRPFLIX_URL=${MRPFLIX_URL:-}

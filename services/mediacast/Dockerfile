@@ -19,6 +19,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
+COPY static/ static/
 
 USER mediacast
 
@@ -27,4 +28,6 @@ EXPOSE 8765
 # Single worker — this is a one-user "send me a URL" endpoint, not a
 # fan-out service. Bind 0.0.0.0 because the container's port is
 # published to the host LAN via docker-compose.
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8765", "--log-level", "info"]
+# --timeout-graceful-shutdown: open SSE streams would otherwise hold a
+# restart for uvicorn's full drain.
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8765", "--log-level", "info", "--timeout-graceful-shutdown", "3"]

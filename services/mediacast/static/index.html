@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d12">
+<meta name="color-scheme" content="dark">
+<title>Projector</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="icon" href="/static/icon-192.png" sizes="192x192" type="image/png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<link rel="stylesheet" href="/static/style.css">
+<!--MEDIACAST_CONFIG-->
+<script src="/static/vendor/qrcode.min.js" defer></script>
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <img src="/static/icon.svg" alt="" width="28" height="28">
+  <h1>Projector</h1>
+  <span class="conn" id="conn" title="Live connection">offline</span>
+</header>
+
+<main>
+  <div class="banner hidden" id="power-banner" role="status">
+    <span id="power-text">Projector is asleep</span>
+    <button type="button" class="btn primary" id="wake-btn">Wake</button>
+  </div>
+
+  <!-- Now playing -->
+  <section class="card now" id="now" aria-labelledby="now-h">
+    <h2 id="now-h" class="sr-only">Now playing</h2>
+    <div class="now-main">
+      <div class="art" id="now-art-wrap"><img id="now-art" alt="" hidden></div>
+      <div class="now-meta">
+        <div class="badges"><span class="badge" id="now-source" hidden></span><span class="activity" id="now-activity">Idle</span></div>
+        <div class="now-title" id="now-title">Nothing playing</div>
+        <div class="now-sub" id="now-sub"></div>
+      </div>
+    </div>
+    <div id="transport" hidden>
+      <div class="progress-row">
+        <span class="t" id="pos">0:00</span>
+        <div class="progress" id="progress" role="slider" tabindex="0" aria-label="Seek"
+             aria-valuemin="0" aria-valuemax="0" aria-valuenow="0">
+          <div class="progress-fill" id="progress-fill"></div>
+          <div class="progress-knob" id="progress-knob"></div>
+        </div>
+        <span class="t" id="dur">0:00</span>
+      </div>
+      <div class="transport">
+        <button type="button" class="btn icon" data-seek="-30" aria-label="Back 30 seconds">−30</button>
+        <button type="button" class="btn icon" data-seek="-10" aria-label="Back 10 seconds">−10</button>
+        <button type="button" class="btn icon play" id="toggle-btn" aria-label="Play / pause">▶</button>
+        <button type="button" class="btn icon" data-seek="10" aria-label="Forward 10 seconds">+10</button>
+        <button type="button" class="btn icon" data-seek="30" aria-label="Forward 30 seconds">+30</button>
+        <button type="button" class="btn icon" id="stop-btn" aria-label="Stop">■</button>
+      </div>
+    </div>
+    <div class="volume-row">
+      <button type="button" class="btn icon small" id="vol-down" aria-label="Volume down">−</button>
+      <input type="range" id="vol" min="0" max="100" step="1" value="0" aria-label="Volume">
+      <button type="button" class="btn icon small" id="vol-up" aria-label="Volume up">+</button>
+      <span class="t vol-val" id="vol-val">—</span>
+    </div>
+  </section>
+
+  <!-- Spotify -->
+  <section class="card spotify hidden" id="spotify" aria-label="Spotify">
+    <img id="sp-art" alt="" class="sp-art" hidden>
+    <div class="sp-meta">
+      <div class="badges"><span class="badge sp">Spotify</span><span class="activity" id="sp-state"></span></div>
+      <div class="sp-title" id="sp-title"></div>
+      <div class="now-sub" id="sp-sub"></div>
+      <div class="progress thin"><div class="progress-fill" id="sp-fill"></div></div>
+      <div class="sp-foot"><span class="t" id="sp-time"></span><span class="muted">Control from the Spotify app</span></div>
+    </div>
+  </section>
+
+  <!-- Cast URL -->
+  <section class="section" aria-labelledby="cast-h">
+    <h2 id="cast-h">Cast a link</h2>
+    <form id="cast-form" class="cast-form">
+      <button type="button" class="btn" id="paste-btn" title="Paste from clipboard">Paste</button>
+      <input type="url" id="cast-url" placeholder="https://…" inputmode="url" autocomplete="off" required>
+      <button type="submit" class="btn primary">Cast</button>
+    </form>
+  </section>
+
+  <!-- YouTube -->
+  <section class="section hidden" id="yt" aria-labelledby="yt-h">
+    <div class="sec-head">
+      <h2 id="yt-h">YouTube</h2>
+      <label class="check"><input type="checkbox" id="yt-hide-shorts"> Hide Shorts</label>
+      <button type="button" class="btn small" id="yt-refresh">Refresh</button>
+    </div>
+    <div class="grid wide" id="yt-grid"></div>
+    <p class="muted center" id="yt-empty" hidden></p>
+    <button type="button" class="btn more" id="yt-more" hidden>Load more</button>
+  </section>
+
+  <!-- Jellyfin -->
+  <section class="section hidden" id="jf" aria-labelledby="jf-h">
+    <div class="sec-head">
+      <h2 id="jf-h">mrpflix</h2>
+      <label class="check" title="Cap the transcode bitrate for a slow link"><input type="checkbox" id="jf-lowq"> Low quality</label>
+    </div>
+    <div class="chips" role="tablist" id="jf-tabs">
+      <button type="button" class="chip" role="tab" data-tab="resume">Continue</button>
+      <button type="button" class="chip" role="tab" data-tab="nextup">Next up</button>
+      <button type="button" class="chip" role="tab" data-tab="views">Libraries</button>
+    </div>
+    <input type="search" id="jf-search" class="search" placeholder="Search mrpflix…" autocomplete="off" aria-label="Search mrpflix">
+    <div class="crumbs" id="jf-crumbs" hidden>
+      <button type="button" class="btn small" id="jf-back">← Back</button>
+      <span class="crumb" id="jf-crumb"></span>
+    </div>
+    <div class="grid poster" id="jf-grid"></div>
+    <p class="muted center" id="jf-empty" hidden></p>
+    <button type="button" class="btn more" id="jf-more" hidden>Load more</button>
+  </section>
+
+  <!-- Screensaver -->
+  <section class="section" aria-labelledby="ss-h">
+    <h2 id="ss-h">Screensaver</h2>
+    <p class="muted small" id="ss-note">Starts on its own when nothing is playing, or pick one now.</p>
+    <div class="btn-row" id="ss-themes"></div>
+  </section>
+
+  <!-- Power -->
+  <section class="section" aria-labelledby="pw-h">
+    <h2 id="pw-h">Power</h2>
+    <div class="btn-row">
+      <button type="button" class="btn" data-power="sleep">Sleep</button>
+      <button type="button" class="btn" data-power="wake">Wake</button>
+      <button type="button" class="btn" data-power="screen_off">Screen off</button>
+      <button type="button" class="btn danger" data-power="poweroff">Power off server</button>
+    </div>
+  </section>
+
+  <!-- Pair -->
+  <section class="section">
+    <details id="pair">
+      <summary><h2>Pair phone</h2></summary>
+      <p class="muted small">Scan with the Projector app to connect it to this server.</p>
+      <label class="field">Server address
+        <select id="pair-base"></select>
+      </label>
+      <div class="qr" id="pair-qr" aria-label="Pairing QR code"></div>
+      <div class="pair-info">
+        <code id="pair-url"></code>
+        <div class="btn-row">
+          <button type="button" class="btn small" id="token-show">Show token</button>
+          <button type="button" class="btn small" id="token-copy">Copy token</button>
+        </div>
+        <code id="pair-token" hidden></code>
+      </div>
+    </details>
+  </section>
+
+  <footer class="foot muted small" id="foot"></footer>
+</main>
+
+<!-- Jellyfin detail sheet -->
+<div class="sheet-backdrop" id="sheet" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+    <button type="button" class="btn icon small sheet-close" id="sheet-close" aria-label="Close">✕</button>
+    <div class="sheet-body">
+      <img id="sheet-img" alt="" class="sheet-img" hidden>
+      <div>
+        <h3 id="sheet-title"></h3>
+        <div class="muted small" id="sheet-meta"></div>
+      </div>
+    </div>
+    <p class="sheet-overview" id="sheet-overview"></p>
+    <div class="btn-col">
+      <button type="button" class="btn primary" id="sheet-resume" hidden></button>
+      <button type="button" class="btn" id="sheet-start">Play from start</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>
