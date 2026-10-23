@@ -398,6 +398,8 @@
     if (!data.length) return;
     if (event === 'state') {
       try { applyState(JSON.parse(data.join('\n'))); } catch (_) { /* malformed */ }
+    } else if (event === 'feed') {
+      try { ytOnFeedEvent(JSON.parse(data.join('\n'))); } catch (_) { /* malformed */ }
     }
   }
 
@@ -516,7 +518,12 @@
 
   // ---------------------------------------------------------------- YouTube
 
-  const yt = { items: [], shown: 0, page: 24, hideShorts: !!store.get('mc.yt.hideShorts', false), loading: false };
+  const yt = {
+    items: [], shown: 0, page: 24, hideShorts: !!store.get('mc.yt.hideShorts', false), loading: false,
+    changedAt: 0,      // feed `changed_at` we hold; SSE `event: feed` past it → silent refetch
+    pendingAt: 0,      // a feed event that arrived mid-load
+    fresh: new Set(),  // ids that arrived via a silent refetch, not yet seen
+  };
 
   function ytVisible() { return yt.items.filter((v) => !(yt.hideShorts && v.is_short)); }
 
@@ -530,7 +537,9 @@
       if (v.is_short) th.appendChild(el('span', 'pill short', 'Shorts'));
       if (v.duration_s) th.appendChild(el('span', 'pill dur', fmtTime(v.duration_s)));
       const sub = [v.channel, relTime(v.published)].filter(Boolean).join(' · ');
-      grid.appendChild(tile(th, v.title || v.url, sub, () => act('POST', '/cast', { url: v.url }, `Casting: ${v.title || v.url}`)));
+      const t = tile(th, v.title || v.url, sub, () => act('POST', '/cast', { url: v.url }, `Casting: ${v.title || v.url}`));
+      t.dataset.vid = v.id;
+      grid.appendChild(t);
     });
     yt.shown += next.length;
     $('yt-more').hidden = yt.shown >= list.length;
@@ -539,19 +548,87 @@
     if (!list.length) empty.textContent = yt.items.length ? 'Only Shorts in the feed.' : 'No videos.';
   }
 
-  async function ytLoad(refresh) {
+  // First tile at/below the top bar, and its viewport offset — the anchor
+  // a silent refetch restores so new videos landing above don't shove the
+  // page.
+  function ytAnchor() {
+    const topBar = document.querySelector('.top');
+    const minY = topBar ? topBar.getBoundingClientRect().bottom : 0;
+    for (const t of $('yt-grid').children) {
+      const r = t.getBoundingClientRect();
+      if (r.bottom > minY) return r.top > window.innerHeight ? null : { vid: t.dataset.vid, top: r.top };
+    }
+    return null;
+  }
+
+  function ytNewPill() {
+    let pill = $('yt-new');
+    const n = yt.fresh.size;
+    const gridTop = $('yt-grid').getBoundingClientRect().top;
+    // Only worth a pill when the newest tiles are scrolled out of view.
+    if (!n || gridTop > 0) {
+      yt.fresh.clear();
+      if (pill) pill.hidden = true;
+      return;
+    }
+    if (!pill) {
+      pill = el('button', 'new-pill');
+      pill.id = 'yt-new';
+      pill.type = 'button';
+      pill.addEventListener('click', () => {
+        yt.fresh.clear();
+        pill.hidden = true;
+        $('yt').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+      document.body.appendChild(pill);
+    }
+    pill.textContent = `↑ ${n} new video${n === 1 ? '' : 's'}`;
+    pill.hidden = false;
+  }
+  window.addEventListener('scroll', () => { if (yt.fresh.size) ytNewPill(); }, { passive: true });
+
+  function ytOnFeedEvent(ev) {
+    const at = Number(ev && ev.updated_at) || 0;
+    if (!at || at <= yt.changedAt || $('yt').classList.contains('hidden')) return;
+    if (yt.loading) { yt.pendingAt = Math.max(yt.pendingAt, at); return; }
+    ytLoad(false, true);
+  }
+
+  async function ytLoad(refresh, silent) {
     if (yt.loading) return;
     yt.loading = true;
+    yt.pendingAt = 0;
     const btn = $('yt-refresh');
-    btn.disabled = true;
-    btn.textContent = refresh ? 'Refreshing…' : 'Loading…';
+    if (!silent) {
+      btn.disabled = true;
+      btn.textContent = refresh ? 'Refreshing…' : 'Loading…';
+    }
     try {
       const data = await api('GET', `/youtube/feed?refresh=${refresh ? 1 : 0}&shorts=1`);
       $('yt').classList.remove('hidden');
-      yt.items = Array.isArray(data.items) ? data.items : [];
-      ytRender(true);
+      const items = Array.isArray(data.items) ? data.items : [];
+      yt.changedAt = Math.max(yt.changedAt, Number(data.changed_at) || 0);
+      if (silent && yt.items.length) {
+        const before = new Set(yt.items.map((v) => v.id));
+        const anchor = ytAnchor();
+        const shown = yt.shown;
+        yt.items = items;
+        items.forEach((v) => { if (!before.has(v.id)) yt.fresh.add(v.id); });
+        for (const id of [...yt.fresh]) if (!items.some((v) => v.id === id)) yt.fresh.delete(id);
+        ytRender(true);
+        while (yt.shown < shown && yt.shown < ytVisible().length) ytRender(false);
+        const t = anchor && $('yt-grid').querySelector(`[data-vid="${CSS.escape(anchor.vid)}"]`);
+        if (t) window.scrollBy(0, t.getBoundingClientRect().top - anchor.top);
+        ytNewPill();
+      } else {
+        yt.items = items;
+        yt.fresh.clear();
+        ytRender(true);
+        ytNewPill();
+      }
       if (refresh) toast('Feed refreshed');
     } catch (e) {
+      if (silent) return;
       if (e.status === 404) { $('yt').classList.add('hidden'); return; }
       $('yt').classList.remove('hidden');
       if (!yt.items.length) {
@@ -563,8 +640,11 @@
       }
     } finally {
       yt.loading = false;
-      btn.disabled = false;
-      btn.textContent = 'Refresh';
+      if (!silent) {
+        btn.disabled = false;
+        btn.textContent = 'Refresh';
+      }
+      if (yt.pendingAt > yt.changedAt) ytLoad(false, true);
     }
   }
 
