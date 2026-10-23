@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Homeserver</string>
+    <string name="share_label">Cast to projector</string>
+    <string name="share_casting">Casting to projector…</string>
+    <string name="share_failed">Couldn\'t cast: %1$s</string>
+    <string name="share_no_url">No link found in the shared text</string>
+    <string name="share_not_paired">Pair Homeserver with your server first</string>
+    <string name="tile_label">Projector</string>
+    <string name="tile_not_paired">Not paired</string>
+    <string name="tile_offline">Offline</string>
+    <string name="tile_unknown">Tap to toggle</string>
+    <string name="tile_working">Working…</string>
+    <string name="tile_sleeping">Sleeping</string>
+    <string name="tile_awake">Awake</string>
+    <string name="widget_label">Now playing</string>
+    <string name="widget_description">What\'s on the projector, with play/pause</string>
+</resources>
