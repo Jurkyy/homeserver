@@ -270,6 +270,7 @@ def open_in_mpv(
     use_ytdl: bool = True,
     audio_url: str | None = None,
     title: str | None = None,
+    start: float | None = None,
 ) -> tuple[int, str]:
     """Spawn a detached fullscreen mpv with the given URL.
 
@@ -320,6 +321,11 @@ def open_in_mpv(
         # showing — see _effective_volume.
         f"--volume={_effective_volume()}",
     ]
+    if start and start > 0:
+        # Resume offset (Jellyfin "continue watching"). mpv seeks before
+        # the first frame; for Jellyfin HLS transcodes the server restarts
+        # the transcode at the requested segment, same as jellyfin-web.
+        args.append(f"--start={float(start):.1f}")
     if title:
         # Drives the UI's "Now playing" label (read back as mpv's
         # media-title). Needed on the --no-ytdl paths (YouTube proxy,
@@ -768,7 +774,12 @@ def _cdp_state_js() -> str:
         "(()=>{const v=document.querySelector('video');if(!v)return null;"
         "if(!v.__mcInit){v.__mcInit=1;v.currentTime=0;}"
         f"{_mc_lock_volume_js('v', str(_effective_volume()))}"
-        "return {t:v.currentTime,d:v.duration,p:v.paused,"
+        # YouTube's player API knows the *current* video (it changes under
+        # us on autoplay-next) and its channel name.
+        "let vd=null;try{const p=document.querySelector('#movie_player');"
+        "vd=p&&p.getVideoData?p.getVideoData():null}catch(e){}"
+        "return {t:v.currentTime,d:v.duration,p:v.paused,e:v.ended,"
+        "vid:(vd&&vd.video_id)||null,author:(vd&&vd.author)||null,"
         # Strip YouTube's "(3) " unread-count prefix and " - YouTube" suffix.
         "title:(document.title||'').replace(/^\\(\\d+\\)\\s*/,'').replace(/ - YouTube$/,'')}"
         "})()"
@@ -1061,6 +1072,9 @@ def firefox_cdp_state() -> dict | None:
         "duration": dur if isinstance(dur, (int, float)) and dur > 0 else None,
         "paused": bool(v.get("p")),
         "title": v.get("title") or None,
+        "ended": bool(v.get("e")),
+        "video_id": v.get("vid") or None,
+        "author": v.get("author") or None,
         # CDP gives a live, seekable position → the portal can show a
         # tracking scrub bar (unlike the MPRIS fallback, which is frozen).
         "seekable": True,
@@ -1235,10 +1249,44 @@ def mpv_playback_state() -> dict:
         s.close()
 
 
+def _cdp_cast_tab() -> dict | None:
+    """The CDP page target that holds the current cast: the tab showing
+    the tracked media's YouTube video if we know it, else any YouTube
+    tab, else the only/first page. None if CDP is unreachable."""
+    pages = [t for t in _cdp_pages() if t.get("webSocketDebuggerUrl")]
+    if not pages:
+        return None
+    with _state_lock:
+        media = dict(_state["media"] or {})
+    vid = media.get("vid") or ""
+    murl = media.get("url") or ""
+    for t in pages:
+        u = t.get("url") or ""
+        if (vid and vid in u) or (murl and u == murl):
+            return t
+    yt = next((t for t in pages if "youtube.com" in (t.get("url") or "")), None)
+    return yt or pages[0]
+
+
+# Blank the cast tab in place: stop every media element for good (src
+# dropped, so YouTube can't auto-resume or ad-roll) and replace the page
+# with a black, empty document so the fullscreen kiosk shows black, not a
+# white about:blank or a leftover YouTube end screen.
+_BLANK_TAB_JS = (
+    "(()=>{document.querySelectorAll('video,audio').forEach(m=>{"
+    "try{m.pause();m.removeAttribute('src');m.load();}catch(e){}});"
+    "document.documentElement.innerHTML='<head><title>mediacast</title></head>"
+    "<body style=\"background:#000;margin:0\"></body>';return true})()"
+)
+
+
 def control_stop() -> tuple[int, str]:
-    # mpv: quit cleanly so the IPC socket file gets unlinked. Firefox:
-    # close the active tab via Ctrl+W; the WM keeps Firefox itself
-    # running because mediacast-firefox.service spawns one window.
+    """Stop the cast. mpv: quit cleanly (socket gets unlinked). Firefox:
+    act on the *cast tab* through CDP — close it when other pages exist,
+    otherwise blank it in place (closing the last tab would take the
+    whole kiosk window down and flap mediacast-firefox.service). This used
+    to send Ctrl+W via xdotool to whichever tab had focus, which could
+    close the wrong one."""
     rc, out = _mpv_command(["quit"])
     if rc == 0:
         return 0, f"mpv quit: {out}"
@@ -1249,10 +1297,37 @@ def control_stop() -> tuple[int, str]:
         # the next _mpv_command. Stop must always work from the UI.
         _run(["pkill", "-f", MPV_BIN])
         return 0, f"mpv killed (ipc unresponsive: {out})"
-    rc2, out2 = _firefox_key("ctrl+w")
-    if rc2 == 0:
-        return 0, "firefox tab closed"
-    return _no_cast_or(rc2, out2)
+    tab = _cdp_cast_tab()
+    if tab is None:
+        # CDP down: last resort, pause over MPRIS so at least audio stops.
+        prc, pout = _playerctl("pause")
+        return (0, "mpris pause (cdp unavailable)") if prc == 0 else (404, f"no active cast ({pout})")
+    pages = _cdp_pages()
+    if len(pages) > 1:
+        try:
+            urllib.request.urlopen(f"{CDP_BASE}/json/close/{tab['id']}", timeout=2).read()
+            _cdp_reset_conns()
+            return 0, "firefox cast tab closed (cdp)"
+        except (OSError, ValueError, KeyError) as exc:
+            LOG.warning("cdp close of cast tab failed: %s — blanking instead", exc)
+    _cdp_eval(_BLANK_TAB_JS, prefer=tab.get("url") or None)
+    return 0, "firefox cast tab blanked (cdp)"
+
+
+def control_set_pause(paused: bool) -> tuple[int, str]:
+    """Explicit play / pause (not a toggle) for the v1 API."""
+    rc, out = _mpv_command(["set_property", "pause", bool(paused)])
+    if rc != 404:
+        return rc, f"mpv pause={paused}: {out}"
+    js = ("(()=>{const v=document.querySelector('video');if(!v)return null;"
+          + ("v.pause();" if paused else "v.play().catch(()=>{});")
+          + "return true})()")
+    if _cdp_eval(js) is True:
+        return 0, f"cdp {'pause' if paused else 'play'}"
+    prc, pout = _playerctl("pause" if paused else "play")
+    if prc == 0:
+        return 0, f"mpris {'pause' if paused else 'play'}"
+    return 404, f"no active cast ({pout})"
 
 
 def stop_active_playback() -> str:
@@ -1557,15 +1632,49 @@ def _check_url(url: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Cast dispatch + screensaver/screen-off state
+# Cast dispatch + unified projector state (power / screen / media)
 # ---------------------------------------------------------------------------
-# _state is touched by request-handling threads (/open, /screensaver,
-# /screen-off) and by the idle watchdog thread, hence the lock.
+# This helper owns the one authoritative projector state. Request threads
+# (/open, /screensaver, /power, /control) mutate _state; one poller thread
+# (_state_poller) reads playback position from mpv / Firefox CDP once a
+# second, watches for physical wake while sleeping, and publishes a
+# snapshot. The container long-polls GET /v1/state and fans it out to
+# clients over SSE (see services/mediacast/app.py, docs/api-v1.md).
+
+# Soft sleep automatically once the screensaver has been running this
+# long (minutes; 0 disables). Without it, the screensaver + keep-awake
+# watchdog kept the projector lit forever.
+SLEEP_AFTER_SCREENSAVER_MIN = float(os.environ.get("SLEEP_AFTER_SCREENSAVER_MIN", "180"))
+STATE_POLL_INTERVAL = float(os.environ.get("MEDIACAST_STATE_POLL_INTERVAL", "1.0"))
+# While sleeping / screen-off: how often to look for the projector being
+# (re)connected via `xrandr --current` (cheap, no re-probe).
+HOTPLUG_POLL_INTERVAL = float(os.environ.get("MEDIACAST_HOTPLUG_POLL_INTERVAL", "3.0"))
+# A cast with no readable playback for this long (after this many
+# consecutive empty polls) is considered over.
+MEDIA_GRACE_S = 30.0
+MEDIA_MISSING_POLLS = 5
+# Don't restart an ended screensaver video more often than this.
+SCREENSAVER_RESTART_GAP_S = 300.0
+
 _state_lock = threading.Lock()
 _state: dict = {
-    "screensaver": None,   # theme key currently showing, or None
-    "screen_off": False,   # display explicitly turned off via /screen-off
+    "screensaver": None,       # theme key currently showing, or None
+    "screensaver_since": 0.0,  # when it started (auto-sleep timer)
+    "screen_off": False,       # display explicitly turned off via screen_off
+    "screen_off_at": 0.0,
+    "power": "on",             # "on" | "sleeping" (soft sleep)
+    "sleep_at": 0.0,
+    "woke_at": time.time(),    # last wake → restarts the idle-screensaver timer
+    # What we put on the projector (None = nothing). Keys: source, url
+    # (internal only — may carry a Jellyfin api_key, never published),
+    # vid, item, title, subtitle, artwork_url, backend, started, missing.
+    "media": None,
 }
+# Last playback reading, owned by the poller. "for" ties it to the media
+# (its "started" stamp) it was read for, so a stale reading never leaks
+# onto a newer cast.
+_pb: dict = {}
+_xstate: dict = {"dpms_off": None}
 
 
 def _effective_volume() -> int:
@@ -1584,7 +1693,36 @@ def _effective_volume() -> int:
     return _desired_volume
 
 
-def _cast(url: str, want_backend: str = "", want_title: str | None = None) -> tuple[int, str, str]:
+def _yt_artwork(vid: str | None) -> str | None:
+    # Served (and cached) by the container; no auth needed.
+    return f"/api/v1/artwork/youtube/{vid}" if vid else None
+
+
+def _media_meta(url: str, meta: dict | None) -> dict:
+    """Build the tracked-media record for a cast. `meta` (from the
+    container) can carry source/item/title/subtitle/artwork_url; anything
+    missing is derived from the URL."""
+    meta = meta if isinstance(meta, dict) else {}
+    vid = _yt_video_id(url) if is_youtube_host(url) else ""
+    item = meta.get("item")
+    if not (isinstance(item, dict) and item.get("kind") and item.get("id")):
+        item = {"kind": "youtube", "id": vid} if vid else {"kind": "url", "id": url}
+    return {
+        "source": meta.get("source") or ("youtube" if vid else "url"),
+        "url": url,
+        "vid": vid,
+        "item": item,
+        "title": meta.get("title") or None,
+        "subtitle": meta.get("subtitle") or (None if vid else urlparse(url).netloc or None),
+        "artwork_url": meta.get("artwork_url") or _yt_artwork(vid),
+        "backend": "",
+        "started": time.time(),
+        "missing": 0,
+    }
+
+
+def _cast(url: str, want_backend: str = "", want_title: str | None = None,
+          start: float = 0.0) -> tuple[int, str, str]:
     """Pick a backend for `url`, drive it, return (rc, backend, out).
 
     This is the entire "how a URL ends up on the projector" logic, shared
@@ -1612,7 +1750,7 @@ def _cast(url: str, want_backend: str = "", want_title: str | None = None) -> tu
     if want_backend == "mpv":
         # Pre-resolved direct media URL — play it as-is, no yt-dlp.
         _run(["wmctrl", "-r", "Firefox", "-b", "remove,fullscreen"])
-        rc, out = open_in_mpv(url, use_ytdl=False, title=want_title)
+        rc, out = open_in_mpv(url, use_ytdl=False, title=want_title, start=start)
         backend = "mpv-direct"
     elif is_youtube_host(url) and YOUTUBE_BACKEND == "firefox":
         # Browser YouTube: play in the logged-in Firefox (its session
@@ -1690,44 +1828,238 @@ def _cast(url: str, want_backend: str = "", want_title: str | None = None) -> tu
     return rc, backend, out
 
 
-def _current_activity() -> bool:
-    """Is anything actually playing right now (mpv or Firefox)? Reuses
-    the same state readers the /control status action polls, so "idle"
-    here means the exact same thing the portal's Now-playing UI does."""
-    if mpv_playback_state()["position"] is not None:
+# ---------------------------------------------------------------------------
+# X11 input-idle + DPMS readout (wake detection)
+# ---------------------------------------------------------------------------
+# Physical wake = the X server's input-idle counter going *down* (any real
+# mouse/keyboard event resets it). Read through the MIT-SCREEN-SAVER
+# extension (libXss, same thing `xprintidle` uses) via ctypes — stdlib
+# only. Verified on the box: `xset dpms force off/on` do NOT reset the
+# counter, `xdotool mousemove_relative` (XTEST) does, and `xset s reset`
+# does (so the keep-awake watchdog must stay quiet while dormant — it does).
+# DPMSInfo (libXext) tells us whether the display is actually powered
+# down, which also catches X's own idle blanking and anyone else turning it
+# back on. Only ever used from the poller thread (Xlib isn't thread-safe
+# without XInitThreads). Caveat: Xlib exit()s the process on a lost X
+# connection; systemd's Restart= brings us back.
+
+import ctypes  # noqa: E402  (kept next to its only user)
+
+
+class _XssInfo(ctypes.Structure):
+    _fields_ = [
+        ("window", ctypes.c_ulong), ("state", ctypes.c_int),
+        ("kind", ctypes.c_int), ("til_or_since", ctypes.c_ulong),
+        ("idle", ctypes.c_ulong), ("eventMask", ctypes.c_ulong),
+    ]
+
+
+class _XMonitor:
+    def __init__(self) -> None:
+        self.ok = False
+        self.d = None
+        try:
+            self.x11 = ctypes.CDLL("libX11.so.6")
+            self.xss = ctypes.CDLL("libXss.so.1")
+            self.xext = ctypes.CDLL("libXext.so.6")
+        except OSError as exc:
+            LOG.warning("wake detection: X libs unavailable (%s)", exc)
+            return
+        self.x11.XOpenDisplay.restype = ctypes.c_void_p
+        self.x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        self.x11.XDefaultRootWindow.restype = ctypes.c_ulong
+        self.x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        self.xss.XScreenSaverAllocInfo.restype = ctypes.POINTER(_XssInfo)
+        self.xss.XScreenSaverQueryInfo.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(_XssInfo)]
+        self.xext.DPMSInfo.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_ushort), ctypes.POINTER(ctypes.c_ubyte)]
+        self.ok = True
+
+    def _ensure(self) -> bool:
+        if not self.ok:
+            return False
+        if self.d is None:
+            d = self.x11.XOpenDisplay(None)
+            if not d:
+                return False
+            self.d = d
+            self.root = self.x11.XDefaultRootWindow(d)
+            self.info = self.xss.XScreenSaverAllocInfo()
         return True
-    if firefox_playback_state()["position"] is not None:
-        return True
-    return False
+
+    def idle_ms(self) -> int | None:
+        if not self._ensure():
+            return None
+        if not self.xss.XScreenSaverQueryInfo(self.d, self.root, self.info):
+            return None
+        return int(self.info.contents.idle)
+
+    def dpms_off(self) -> bool | None:
+        if not self._ensure():
+            return None
+        level, enabled = ctypes.c_ushort(0), ctypes.c_ubyte(0)
+        if not self.xext.DPMSInfo(self.d, ctypes.byref(level), ctypes.byref(enabled)):
+            return None
+        # level 0 = DPMSModeOn; standby/suspend/off all mean "dark".
+        return bool(enabled.value) and level.value != 0
 
 
-def _keepawake_watchdog() -> None:
-    """Background thread: reset X's idle counter every KEEPAWAKE_POLL_INTERVAL
-    while something is actually playing.
+def _connected_outputs() -> set[str] | None:
+    """RandR outputs currently reported connected (no re-probe:
+    --current just reads the X server's state, which the NVIDIA driver
+    updates on an HDMI hotplug interrupt)."""
+    rc, out = _run(["xrandr", "--current"], timeout=5)
+    if rc != 0:
+        return None
+    return {m.group(1) for m in re.finditer(r"^(\S+) connected", out, re.M)}
 
-    bootstrap.sh's `xset s 3600 3600` / `xset dpms 3600 3600 3600` idle
-    timeout only tracks mouse/keyboard input — it has no idea a long video
-    is running, so an unattended cast (or screensaver) longer than the
-    timeout blanks the projector mid-playback. `xset s reset` restarts that
-    idle countdown without needing real input, so as long as this loop
-    keeps seeing activity the timeout never fires.
 
-    Must skip this entirely over an explicit /screen-off: `xset s reset`
-    doesn't just reset the idle clock, X treats it as real activity and
-    un-blanks an already-DPMS-off display. /screen-off only pauses the
-    Firefox tab rather than closing it (stop_active_playback), so its
-    still-loaded <video> keeps reporting a position — _current_activity()
-    can't tell "paused" from "playing" — and without this check the
-    screen-off would get silently undone within one poll interval."""
-    while True:
-        time.sleep(KEEPAWAKE_POLL_INTERVAL)
-        with _state_lock:
-            screen_off = _state["screen_off"]
-        if screen_off:
-            continue
-        if _current_activity():
-            _run(["xset", "s", "reset"])
+# ---------------------------------------------------------------------------
+# Snapshot + publish (long-poll for the container)
+# ---------------------------------------------------------------------------
 
+_pub_cv = threading.Condition()
+_pub: dict = {"version": 0, "state": None, "ts": 0}
+
+
+def _pb_live(pb: dict) -> bool:
+    """A reading that means something is actually loaded and not finished."""
+    if pb.get("position") is None or pb.get("ended"):
+        return False
+    dur, pos = pb.get("duration"), pb.get("position")
+    # A paused element sitting at its very end (YouTube end screen).
+    if pb.get("paused") and dur and pos is not None and pos >= dur - 0.5:
+        return False
+    return True
+
+
+def _round(v):
+    return round(float(v), 1) if isinstance(v, (int, float)) else None
+
+
+def _build_snapshot() -> dict:
+    with _state_lock:
+        st = dict(_state)
+        media = dict(st["media"]) if st["media"] else None
+    pb = dict(_pb)
+    sleeping = st["power"] == "sleeping"
+    ss = st["screensaver"]
+    dark = sleeping or st["screen_off"] or bool(_xstate.get("dpms_off"))
+    snap = {
+        "power": "sleeping" if sleeping else "on",
+        "screen": "off" if dark else "on",
+        "activity": "idle", "source": None, "title": None, "subtitle": None,
+        "artwork_url": None, "position_s": None, "duration_s": None,
+        "volume": _desired_volume, "muted": bool(ss), "item": None,
+        "screensaver": {
+            "active": bool(ss),
+            "theme": ss,
+            "themes": [{"id": k, "name": label} for k, (label, _u) in SCREENSAVER_THEMES.items()],
+            "idle_minutes": round(SCREENSAVER_IDLE_TIMEOUT / 60, 1),
+        },
+    }
+    live = bool(media) and pb.get("for") == media.get("started") and _pb_live(pb)
+    if ss and not sleeping:
+        label, url = SCREENSAVER_THEMES.get(ss, (ss, ""))
+        snap.update(activity="screensaver", source="screensaver",
+                    title=(pb.get("title") if live else None) or label,
+                    subtitle="Screensaver",
+                    artwork_url=_yt_artwork(_yt_video_id(url)))
+    elif media and not sleeping:
+        snap.update(
+            activity="paused" if (live and pb.get("paused")) else "playing",
+            source=media["source"],
+            title=media.get("title") or (pb.get("title") if live else None)
+            or (urlparse(media["url"]).netloc if media["source"] == "url" else None),
+            subtitle=media.get("subtitle"),
+            artwork_url=media.get("artwork_url"),
+            item=media.get("item"),
+        )
+        if media["source"] == "youtube" and live:
+            # Live page data wins (autoplay-next swaps the video under us).
+            snap["title"] = pb.get("title") or snap["title"]
+            snap["subtitle"] = pb.get("author") or snap["subtitle"]
+    if live and snap["activity"] != "idle":
+        snap["position_s"] = _round(pb.get("position"))
+        snap["duration_s"] = _round(pb.get("duration"))
+    return snap
+
+
+def _publish() -> None:
+    snap = _build_snapshot()
+    with _pub_cv:
+        if snap != _pub["state"]:
+            _pub["version"] += 1
+            _pub["state"] = snap
+            _pub["ts"] = int(time.time() * 1000)
+            _pub_cv.notify_all()
+
+
+def _wait_state(since: int, timeout: float) -> dict:
+    with _pub_cv:
+        _pub_cv.wait_for(lambda: _pub["version"] != since and _pub["state"] is not None,
+                         timeout=timeout)
+        return {"version": _pub["version"],
+                "state": {**(_pub["state"] or {}), "updated_at": _pub["ts"]}}
+
+
+# ---------------------------------------------------------------------------
+# Power: soft sleep / screen off / wake
+# ---------------------------------------------------------------------------
+
+def _clear_media_locked() -> None:
+    _state["media"] = None
+    _state["screensaver"] = None
+    _pb.clear()
+
+
+def do_sleep(reason: str) -> None:
+    """Soft sleep: stop playback + screensaver, DPMS off, suspend the
+    idle-screensaver watchdog until something wakes us."""
+    stopped = stop_active_playback()
+    with _state_lock:
+        _clear_media_locked()
+        _state["power"] = "sleeping"
+        _state["sleep_at"] = time.time()
+        _state["screen_off"] = False
+    rc, out = _run(["xset", "dpms", "force", "off"])
+    LOG.info("sleep reason=%s stopped=[%s] xset rc=%s %s", reason, stopped, rc, out)
+    _publish()
+
+
+def do_screen_off() -> None:
+    """Legacy screen-off: stop playback, DPMS off. Cleared by physical
+    input or any cast, like sleep — but power stays "on"."""
+    stopped = stop_active_playback()
+    rc, out = _run(["xset", "dpms", "force", "off"])
+    with _state_lock:
+        _clear_media_locked()
+        _state["screen_off"] = True
+        _state["screen_off_at"] = time.time()
+    LOG.info("screen off (stopped=[%s] xset rc=%s out=%r)", stopped, rc, out)
+    _publish()
+
+
+def _mark_awake_locked() -> bool:
+    was = _state["power"] == "sleeping" or _state["screen_off"]
+    _state["power"] = "on"
+    _state["screen_off"] = False
+    _state["woke_at"] = time.time()
+    return was
+
+
+def do_wake(reason: str) -> None:
+    with _state_lock:
+        was = _mark_awake_locked()
+    out = wake_display()
+    LOG.info("wake reason=%s (was dormant=%s) %s", reason, was, out)
+    _publish()
+
+
+# ---------------------------------------------------------------------------
+# Screensaver
+# ---------------------------------------------------------------------------
 
 def _start_screensaver(theme: str) -> tuple[int, str, str]:
     entry = SCREENSAVER_THEMES.get(theme)
@@ -1738,51 +2070,244 @@ def _start_screensaver(theme: str) -> tuple[int, str, str]:
     # is already muted by the time the video element first appears —
     # otherwise the opening seconds would play at the portal's cast volume.
     with _state_lock:
+        _mark_awake_locked()
+        _clear_media_locked()
         _state["screensaver"] = theme
+        _state["screensaver_since"] = time.time()
+        media = _media_meta(url, {"source": "screensaver"})
+        _state["media"] = media
+    _publish()
     rc, backend, out = _cast(url)
     with _state_lock:
-        _state["screen_off"] = False
         if rc != 0:
-            _state["screensaver"] = None
+            _clear_media_locked()
+        elif _state["media"] is media:
+            media["backend"] = backend
     LOG.info("screensaver theme=%s rc=%s backend=%s", theme, rc, backend)
+    _publish()
     return rc, backend, out
+
+
+def _stop_screensaver() -> tuple[int, str]:
+    with _state_lock:
+        active = _state["screensaver"]
+    if not active:
+        return 0, "no screensaver running"
+    rc, out = control_stop()
+    with _state_lock:
+        _clear_media_locked()
+    _publish()
+    return (0 if rc in (0, 404) else rc), out
+
+
+def _activity_live() -> bool:
+    """Is something actually loaded on the projector right now (playing
+    or paused)? From the poller's cached reading — no extra CDP/IPC."""
+    with _state_lock:
+        media = _state["media"]
+        started = media["started"] if media else None
+    return started is not None and _pb.get("for") == started and _pb_live(_pb)
+
+
+def _keepawake_watchdog() -> None:
+    """Background thread: reset X's idle counter every KEEPAWAKE_POLL_INTERVAL
+    while something is actually playing.
+
+    The X screensaver/DPMS idle timeout only tracks mouse/keyboard input —
+    it has no idea a long video is running, so an unattended cast longer
+    than the timeout blanks the projector mid-playback. `xset s reset`
+    restarts that countdown without real input.
+
+    Must stay silent while sleeping / screen-off: X treats `xset s reset`
+    as activity (it un-blanks a DPMS-off display *and* resets the idle
+    counter our physical-wake detection watches)."""
+    while True:
+        time.sleep(KEEPAWAKE_POLL_INTERVAL)
+        with _state_lock:
+            dormant = _state["screen_off"] or _state["power"] == "sleeping"
+        if dormant:
+            continue
+        if _activity_live():
+            _run(["xset", "s", "reset"])
 
 
 def _screensaver_watchdog() -> None:
     """Background thread: auto-start the default screensaver once the
     projector's sat with nothing actually playing for
-    SCREENSAVER_IDLE_TIMEOUT — independent of whether anyone has the
-    portal page open to notice. Never fires over an explicit screen-off,
-    and re-arms itself once real playback (or a different screensaver
-    pick) starts, so it only acts once per idle spell.
-
-    Known gap: if the running screensaver's own (8-12h) video somehow
-    ends on its own, _state["screensaver"] stays set to that theme and
-    this won't re-trigger — not worth the extra bookkeeping for a video
-    length nothing here realistically reaches."""
+    SCREENSAVER_IDLE_TIMEOUT — independent of whether anyone has a client
+    open. Never fires while sleeping / screen-off; the idle timer restarts
+    on every wake. An ended screensaver is cleared by the poller (which
+    restarts it), so this re-arms instead of getting stuck."""
     if SCREENSAVER_IDLE_TIMEOUT <= 0:
         return
     idle_since: float | None = None
     while True:
         time.sleep(SCREENSAVER_POLL_INTERVAL)
         with _state_lock:
-            screen_off = _state["screen_off"]
+            dormant = _state["screen_off"] or _state["power"] == "sleeping"
             already = _state["screensaver"]
-        if screen_off or already:
+            woke_at = _state["woke_at"]
+        if dormant or already or _activity_live():
             idle_since = None
             continue
-        if _current_activity():
-            idle_since = None
-            continue
+        now = time.time()
         if idle_since is None:
-            idle_since = time.time()
+            idle_since = now
             continue
-        if time.time() - idle_since >= SCREENSAVER_IDLE_TIMEOUT:
+        idle_since = max(idle_since, woke_at)
+        if now - idle_since >= SCREENSAVER_IDLE_TIMEOUT:
             LOG.info("screensaver: idle for %.0fs, auto-starting %r",
-                      time.time() - idle_since, SCREENSAVER_DEFAULT)
+                     now - idle_since, SCREENSAVER_DEFAULT)
             _start_screensaver(SCREENSAVER_DEFAULT)
             idle_since = None
 
+
+# ---------------------------------------------------------------------------
+# The poller: playback readout, end-of-media, auto-sleep, wake detection
+# ---------------------------------------------------------------------------
+
+def _read_playback(media: dict | None) -> dict:
+    """One playback reading: mpv first (if its socket exists), else the
+    Firefox <video> over CDP. With media=None (discovery) only CDP — no
+    MPRIS subprocess."""
+    if os.path.exists(MPV_IPC_SOCK):
+        pb = mpv_playback_state()
+        if pb.get("position") is not None:
+            return {**pb, "backend": "mpv"}
+    if media is not None and (media.get("backend") or "").startswith("mpv"):
+        return {}
+    fb = firefox_cdp_state() if media is None else firefox_playback_state()
+    if fb and fb.get("position") is not None:
+        return {**fb, "backend": "firefox"}
+    return {}
+
+
+def _poll_media(now: float, state: dict) -> None:
+    media = state["media"]
+    if media is None:
+        return
+    pb = _read_playback(media)
+    with _state_lock:
+        cur = _state["media"]
+        if cur is not media:   # replaced/cleared while we were reading
+            return
+        _pb.clear()
+        _pb.update(pb)
+        _pb["for"] = media["started"]
+        if _pb_live(pb):
+            media["missing"] = 0
+            vid = pb.get("video_id")
+            if media["source"] == "youtube" and vid and vid != media.get("vid"):
+                # YouTube autoplay moved on to another video.
+                media.update(vid=vid, item={"kind": "youtube", "id": vid},
+                             artwork_url=_yt_artwork(vid), title=None, subtitle=None)
+            return
+        if media["source"] == "url" and not (media.get("backend") or "").startswith("mpv"):
+            return  # a plain web page: nothing to read, stays until replaced
+        if now - media["started"] < MEDIA_GRACE_S:
+            return
+        media["missing"] += 1
+        if media["missing"] < MEDIA_MISSING_POLLS:
+            return
+        ended_ss = _state["screensaver"]
+        _clear_media_locked()
+    LOG.info("media ended (source=%s screensaver=%s)", media["source"], ended_ss)
+    if ended_ss and now - _poller_mem.get("ss_restart", 0) > SCREENSAVER_RESTART_GAP_S:
+        _poller_mem["ss_restart"] = now
+        LOG.info("screensaver %r video ended — restarting it", ended_ss)
+        threading.Thread(target=_start_screensaver, args=(ended_ss,),
+                         name="ss-restart", daemon=True).start()
+
+
+_poller_mem: dict = {}
+
+
+def _discover(now: float) -> None:
+    """Nothing tracked: notice playback we didn't start (e.g. mpv left
+    running across a helper restart). Only *playing* media counts — a
+    paused leftover tab is not a cast."""
+    if now - _poller_mem.get("discover", 0) < 10:
+        return
+    _poller_mem["discover"] = now
+    pb = _read_playback(None)
+    if not _pb_live(pb) or pb.get("paused"):
+        return
+    vid = pb.get("video_id") or ""
+    url = f"https://www.youtube.com/watch?v={vid}" if vid else "about:unknown"
+    media = _media_meta(url, {"source": "youtube" if vid else "url"})
+    media["backend"] = pb.get("backend", "")
+    media["title"] = None if vid else pb.get("title")
+    media["subtitle"] = None
+    with _state_lock:
+        if _state["media"] is None and not _state["screensaver"]:
+            _state["media"] = media
+            _pb.clear()
+            _pb.update(pb)
+            _pb["for"] = media["started"]
+            LOG.info("discovered running playback (%s)", media["backend"])
+
+
+def _poll_dormant(now: float, state: dict, xmon: _XMonitor, idle: int | None) -> None:
+    sleeping = state["power"] == "sleeping"
+    since = state["sleep_at"] if sleeping else state["screen_off_at"]
+    prev = _poller_mem.get("idle")
+    settled = now - since > 2.5
+    if settled and idle is not None and prev is not None and idle + 400 < prev:
+        do_wake("input")
+        return
+    if settled and _xstate.get("dpms_off") is False and now - since > 4:
+        # Display came back on without us (X un-blanks on real input, or
+        # someone ran `xset dpms force on`).
+        do_wake("dpms-on")
+        return
+    if now - _poller_mem.get("hotplug_t", 0) >= HOTPLUG_POLL_INTERVAL:
+        _poller_mem["hotplug_t"] = now
+        outs = _connected_outputs()
+        before = _poller_mem.get("outputs")
+        if outs is not None:
+            if before is not None and outs - before and settled:
+                LOG.info("hotplug: outputs %s -> %s", sorted(before), sorted(outs))
+                _poller_mem["outputs"] = outs
+                do_wake("hotplug")
+                return
+            if before is not None and outs != before:
+                LOG.info("hotplug: outputs %s -> %s", sorted(before), sorted(outs))
+            _poller_mem["outputs"] = outs
+
+
+def _state_poller() -> None:
+    xmon = _XMonitor()
+    while True:
+        try:
+            now = time.time()
+            idle = xmon.idle_ms()
+            _xstate["dpms_off"] = xmon.dpms_off()
+            with _state_lock:
+                state = {k: _state[k] for k in (
+                    "power", "screen_off", "sleep_at", "screen_off_at",
+                    "screensaver", "screensaver_since", "media")}
+            dormant = state["power"] == "sleeping" or state["screen_off"]
+            if dormant:
+                _poll_dormant(now, state, xmon, idle)
+            else:
+                _poller_mem.pop("outputs", None)
+                if state["media"] is not None:
+                    _poll_media(now, state)
+                elif not state["screensaver"]:
+                    _discover(now)
+                if (state["screensaver"] and SLEEP_AFTER_SCREENSAVER_MIN > 0
+                        and now - state["screensaver_since"] >= SLEEP_AFTER_SCREENSAVER_MIN * 60):
+                    do_sleep(f"screensaver ran {SLEEP_AFTER_SCREENSAVER_MIN:.0f} min")
+            _poller_mem["idle"] = idle
+            _publish()
+        except Exception:  # noqa: BLE001 — the poller must never die
+            LOG.exception("state poll failed")
+        time.sleep(STATE_POLL_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
     # Quiet down the default per-request access log to stderr; we log
@@ -1798,36 +2323,42 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _authed(self) -> bool:
+        if _check_auth(self.headers.get("Authorization")):
+            return True
+        LOG.warning("auth failed from %s", self.client_address[0])
+        self._json(401, {"error": "bad token"})
+        return False
+
     def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/health":
+        u = urlparse(self.path)
+        if u.path == "/health":
             self._json(200, {"ok": True})
-        elif self.path == "/yt-subscriptions":
+        elif u.path == "/yt-subscriptions":
             # Authenticated: hands the container the account's subscribed
             # channel ids (scraped via yt-dlp + browser cookies) so it can
             # build the feed from the real account, not a static file.
-            if not _check_auth(self.headers.get("Authorization")):
-                LOG.warning("auth failed from %s", self.client_address[0])
-                self._json(401, {"error": "bad token"})
+            if not self._authed():
                 return
             ids = scrape_subscriptions()
             if ids is None:
                 self._json(502, {"error": "subscriptions unavailable"})
                 return
             self._json(200, {"channel_ids": ids})
-        elif self.path == "/state":
-            # Screensaver/screen-off state + the theme list, for the
-            # portal's screensaver buttons and status line.
-            if not _check_auth(self.headers.get("Authorization")):
-                LOG.warning("auth failed from %s", self.client_address[0])
-                self._json(401, {"error": "bad token"})
+        elif u.path == "/v1/state":
+            # Long-poll: returns as soon as the state version differs from
+            # `since` (immediately if it already does), else after `wait`
+            # seconds with the unchanged state.
+            if not self._authed():
                 return
-            with _state_lock:
-                st = dict(_state)
-            self._json(200, {
-                "themes": {k: label for k, (label, _url) in SCREENSAVER_THEMES.items()},
-                "screensaver": st["screensaver"],
-                "screen_off": st["screen_off"],
-            })
+            q = parse_qs(u.query)
+            try:
+                since = int(q.get("since", ["-1"])[0])
+                wait = max(0.0, min(60.0, float(q.get("wait", ["0"])[0])))
+            except ValueError:
+                self._json(400, {"error": "bad since/wait"})
+                return
+            self._json(200, _wait_state(since, wait))
         else:
             self._json(404, {"error": "not found"})
 
@@ -1836,16 +2367,24 @@ class Handler(BaseHTTPRequestHandler):
         if not length:
             return {}
         try:
-            return json.loads(self.rfile.read(length).decode("utf-8"))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return {}
+        return body if isinstance(body, dict) else {}
 
     def _do_control(self, body: dict) -> None:
         action = body.get("action", "")
-        if action == "pause":
+        if action in ("pause", "toggle"):
+            # Legacy "pause" is a toggle (Home Assistant / OpenClaw rely on it).
             rc, out = control_pause()
+        elif action == "set_pause":
+            rc, out = control_set_pause(bool(body.get("paused")))
         elif action == "stop":
             rc, out = control_stop()
+            with _state_lock:
+                _clear_media_locked()
+            if rc == 404:
+                rc = 0  # nothing to stop is still "stopped"
         elif action == "seek":
             offset = body.get("offset", 0)
             try:
@@ -1870,48 +2409,24 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(400, {"error": "volume needs `set` or `delta`"})
                 return
+            if rc == 1 and "remembered" in out:
+                rc = 0  # nothing playing: still a successful volume change
         elif action == "status":
-            # Read-only: current volume + playback position/duration. The
-            # UI polls this to drive the volume slider and the seek bar.
-            # "active" is derived from whether we actually read a position
-            # (a stale mpv socket alone doesn't count). mpv (Jellyfin /
-            # legacy YouTube) wins if present; otherwise fall to the
-            # Firefox MPRIS player (browser YouTube) so the seek bar +
-            # now-playing work the same for both.
-            t0 = time.monotonic()
-            _, vol = control_volume_get()
-            pb = mpv_playback_state()
-            backend = "mpv"
-            if pb["position"] is None:
-                fb = firefox_playback_state()
-                if fb["position"] is not None:
-                    pb, backend = fb, "firefox"
-            active = pb["position"] is not None
-            # This poll runs every ~1s from the portal; logging every hit
-            # would be pure noise. But a slow one is exactly the signal
-            # for "the portal hung" reports — flag it so a look at
-            # journalctl afterward finds it without turning on debug
-            # logging and waiting for a repeat.
-            elapsed = time.monotonic() - t0
-            if elapsed > 1.5:
-                LOG.warning(
-                    "status poll slow: %.1fs (backend=%s active=%s)",
-                    elapsed, backend, active,
-                )
+            # Legacy read-only status (pre-v1 clients): served from the
+            # poller's cached snapshot, no extra CDP/IPC round-trip.
+            snap = _build_snapshot()
+            active = snap["position_s"] is not None
             self._json(200, {
                 "status": "ok",
-                "volume": vol,
+                "volume": snap["volume"],
                 "active": active,
-                "backend": backend if active else None,
-                # Kept for backward compatibility with older UI builds.
-                "mpv": active and backend == "mpv",
-                "position": pb["position"],
-                "duration": pb["duration"],
-                "paused": pb["paused"],
-                # Scrub bar only when the position is live/seekable (mpv or
-                # CDP); the MPRIS fallback reports a frozen 0 for YouTube.
-                "seekable": active and pb.get("seekable", False),
-                "title": pb["title"] if active else None,
+                "backend": (_pb.get("backend") if active else None),
+                "mpv": active and _pb.get("backend") == "mpv",
+                "position": snap["position_s"],
+                "duration": snap["duration_s"],
+                "paused": snap["activity"] == "paused" if active else None,
+                "seekable": active,
+                "title": snap["title"] if active else None,
             })
             return
         else:
@@ -1919,6 +2434,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         LOG.info("control action=%s rc=%s detail=%s", action, rc, out)
+        _publish()
         if rc == 404:
             self._json(404, {"error": "no active cast", "detail": out})
             return
@@ -1928,20 +2444,24 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"status": "ok", "detail": out})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path == "/control":
-            if not _check_auth(self.headers.get("Authorization")):
-                LOG.warning("auth failed from %s", self.client_address[0])
-                self._json(401, {"error": "bad token"})
-                return
-            self._do_control(self._read_body())
+        path = urlparse(self.path).path
+        if path not in ("/control", "/screensaver", "/power", "/open"):
+            self._json(404, {"error": "not found"})
             return
-        if self.path == "/screensaver":
-            if not _check_auth(self.headers.get("Authorization")):
-                LOG.warning("auth failed from %s", self.client_address[0])
-                self._json(401, {"error": "bad token"})
+        if not self._authed():
+            return
+        body = self._read_body()
+        if path == "/control":
+            self._do_control(body)
+            return
+        if path == "/screensaver":
+            theme = body.get("theme")
+            if theme in (None, "", "off"):
+                rc, out = _stop_screensaver()
+                self._json(200 if rc == 0 else 502,
+                           {"status": "ok", "screensaver": None} if rc == 0 else {"error": out})
                 return
-            theme = self._read_body().get("theme", "")
-            rc, backend, out = _start_screensaver(theme)
+            rc, backend, out = _start_screensaver(str(theme))
             if rc == 400:
                 self._json(400, {"error": out})
                 return
@@ -1950,88 +2470,75 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json(200, {"status": "ok", "screensaver": theme})
             return
-        if self.path == "/screen-off":
-            if not _check_auth(self.headers.get("Authorization")):
-                LOG.warning("auth failed from %s", self.client_address[0])
-                self._json(401, {"error": "bad token"})
+        if path == "/power":
+            action = body.get("action")
+            if action == "sleep":
+                do_sleep("api")
+            elif action == "wake":
+                do_wake("api")
+            elif action == "screen_off":
+                do_screen_off()
+            elif action == "poweroff":
+                # WARNING (not INFO) — the single most consequential
+                # action; worth standing out in the journal as an audit trail.
+                LOG.warning("POWEROFF requested from %s — shutting the host down",
+                            self.client_address[0])
+
+                def _do_poweroff() -> None:
+                    # Answer first: the response has to make it back through
+                    # the container before the machine starts going away.
+                    time.sleep(1.5)
+                    # -n: fail fast instead of hanging if the sudoers grant
+                    # is somehow missing.
+                    rc, out = _run(["sudo", "-n", POWEROFF_BIN], timeout=30)
+                    if rc != 0:
+                        LOG.error("poweroff command failed rc=%s: %s", rc, out)
+
+                threading.Thread(target=_do_poweroff, name="poweroff", daemon=True).start()
+            else:
+                self._json(400, {"error": f"unknown power action: {action!r}"})
                 return
-            # Stop whatever's playing (mpv/Firefox alike) before actually
-            # blanking the display — otherwise audio keeps going behind a
-            # dark screen. wake_display()'s DPMS counterpart is what
-            # /open and /screensaver already call, so turning back on is
-            # just "cast or pick a screensaver" — no separate "screen on"
-            # endpoint needed.
-            stopped = stop_active_playback()
-            rc, out = _run(["xset", "dpms", "force", "off"])
-            with _state_lock:
-                _state["screen_off"] = True
-                _state["screensaver"] = None
-            LOG.info("screen off (stopped=[%s] xset rc=%s out=%r)", stopped, rc, out)
             self._json(200, {"status": "ok"})
             return
-        if self.path == "/poweroff":
-            if not _check_auth(self.headers.get("Authorization")):
-                LOG.warning("auth failed from %s", self.client_address[0])
-                self._json(401, {"error": "bad token"})
-                return
-            # WARNING (not INFO) — this is the single most consequential
-            # action the portal can trigger, worth standing out in the
-            # journal as an audit trail on its own.
-            LOG.warning("POWEROFF requested from %s — shutting the host down",
-                        self.client_address[0])
-            # Answer before actually shutting down: the HTTP response has
-            # to make it out (through this container, to the browser)
-            # before the machine starts going away, so the poweroff
-            # itself runs on a short delay in the background rather than
-            # inline before we reply.
-            self._json(200, {"status": "ok", "detail": "powering off"})
 
-            def _do_poweroff() -> None:
-                time.sleep(1.5)
-                # -n: fail fast instead of hanging if the sudoers grant
-                # is somehow missing, rather than silently blocking
-                # forever with no way to observe why nothing happened.
-                rc, out = _run(["sudo", "-n", POWEROFF_BIN], timeout=30)
-                if rc != 0:
-                    LOG.error("poweroff command failed rc=%s: %s", rc, out)
-
-            threading.Thread(target=_do_poweroff, name="poweroff", daemon=True).start()
-            return
-        if self.path != "/open":
-            self._json(404, {"error": "not found"})
-            return
-        if not _check_auth(self.headers.get("Authorization")):
-            LOG.warning("auth failed from %s", self.client_address[0])
-            self._json(401, {"error": "bad token"})
-            return
-        body = self._read_body()
+        # /open
         url = body.get("url", "")
-        if not _check_url(url):
+        if not isinstance(url, str) or not _check_url(url):
             self._json(400, {"error": "bad url"})
             return
         # The caller can force the mpv-direct backend for a URL it has
         # already resolved to a playable media stream (e.g. the
         # container's Jellyfin integration hands us an HLS/stream URL).
-        # Such URLs aren't on a known video host and would otherwise
-        # fall through to Firefox.
         want_backend = body.get("backend", "")
         # Optional display title from the caller (e.g. the container's
-        # Jellyfin integration passes the movie/episode name). YouTube's
-        # title is fetched here by yt-dlp instead; Firefox casts have none.
+        # Jellyfin integration passes the movie/episode name).
         want_title = (body.get("title") or "").strip() or None
-
-        # A real cast always wins over whatever screensaver/screen-off
-        # state was active — the whole point of casting is to take over
-        # the projector. Cleared *before* _cast() runs, not after: it
-        # kicks off a background thread (youtube_go_fullscreen) that
-        # starts locking the new video element's volume via
-        # _effective_volume() almost immediately, and that lock only
-        # ever applies once — clearing "screensaver" too late could
-        # latch the new cast to the screensaver's muted volume.
+        meta = body.get("meta") if isinstance(body.get("meta"), dict) else {}
+        if want_title and not meta.get("title"):
+            meta["title"] = want_title
+        try:
+            start = float(body.get("start") or 0)
+        except (TypeError, ValueError):
+            start = 0.0
+        # A real cast always wins over whatever screensaver / sleep /
+        # screen-off state was active. Cleared *before* _cast() runs: it
+        # kicks off youtube_go_fullscreen, which locks the new element's
+        # volume via _effective_volume() almost immediately, once.
+        media = _media_meta(url, meta)
         with _state_lock:
-            _state["screensaver"] = None
-            _state["screen_off"] = False
-        rc, backend, out = _cast(url, want_backend=want_backend, want_title=want_title)
+            _mark_awake_locked()
+            _clear_media_locked()
+            _state["media"] = media
+        _publish()
+        rc, backend, out = _cast(url, want_backend=want_backend,
+                                 want_title=want_title, start=start)
+        with _state_lock:
+            if _state["media"] is media:
+                if rc != 0:
+                    _clear_media_locked()
+                else:
+                    media["backend"] = backend
+        _publish()
         if rc != 0:
             self._json(502, {"error": f"{backend} failed", "rc": rc, "stderr": out})
             return
@@ -2047,9 +2554,7 @@ def main() -> None:
         raise SystemExit("MEDIACAST_TOKEN unset — refusing to start with an open endpoint")
     # The systemd unit sets DISPLAY/XAUTHORITY but not the session-bus /
     # runtime-dir vars. playerctl (MPRIS over the user D-Bus) and pactl
-    # need them, so fill in the standard per-user defaults if unset. mpv
-    # already injects its own copies at spawn; this just covers the
-    # subprocess helpers that inherit our environment.
+    # need them, so fill in the standard per-user defaults if unset.
     uid = os.getuid()
     os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
     os.environ.setdefault(
@@ -2058,19 +2563,17 @@ def main() -> None:
     # Local YouTube anti-throttle proxy (loopback only). Started before
     # the control server so the first cast can already use it.
     start_proxy()
-    # Idle screensaver watchdog — runs independent of the HTTP server so
-    # it fires even with no one polling the portal.
+    _publish()
+    # One poller owns playback readout + wake detection (see _state_poller).
+    threading.Thread(target=_state_poller, name="state", daemon=True).start()
+    # Idle screensaver watchdog — fires even with no client connected.
     threading.Thread(target=_screensaver_watchdog, name="screensaver", daemon=True).start()
-    # Keep-awake watchdog — stops DPMS/blank from tripping mid-playback
-    # during a long unattended cast (see _keepawake_watchdog).
+    # Keep-awake watchdog — stops DPMS/blank from tripping mid-playback.
     threading.Thread(target=_keepawake_watchdog, name="keepawake", daemon=True).start()
     # 0.0.0.0 so the container reaches us via host.docker.internal.
     # Token is the trust boundary. See module docstring.
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    # The portal polls /control (action=status) roughly once a second;
-    # each poll is its own thread. If one blocks (e.g. a wedged CDP call
-    # to Firefox — see _cdp_eval), non-daemon threads would pile up and
-    # also block a clean restart. Same reasoning as start_proxy() above.
+    # Long-polls park a thread each; daemon threads so a restart is clean.
     server.daemon_threads = True
     LOG.info("mediacast-host listening on :%d (DISPLAY=%s)", PORT, os.environ.get("DISPLAY", "?"))
     server.serve_forever()
