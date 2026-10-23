@@ -91,6 +91,8 @@ FROM alpine:3.20
 # libgcc: provides libgcc_s.so.1 — Rust's panic-unwind path links
 #   against it. Without this the binary fails to load with
 #   "Error relocating ... _Unwind_*: symbol not found".
+# curl + jq: used by onevent.sh (the --onevent hook that posts Spotify
+#   now-playing to mediacast).
 # libpulse: runtime shared lib (libpulse-simple.so / libpulse.so) for
 #   the pulseaudio backend — the client that talks to the host's
 #   PulseAudio server over the bind-mounted unix socket.
@@ -99,7 +101,9 @@ RUN apk add --no-cache \
         alsa-utils \
         avahi-libs \
         ca-certificates \
+        curl \
         dbus-libs \
+        jq \
         libgcc \
         libpulse \
     && adduser -D -u 1000 librespot
@@ -115,7 +119,8 @@ COPY --from=builder /usr/local/cargo/bin/librespot /usr/local/bin/librespot
 # that the user perceives as a hung "Connecting..." in their Spotify
 # app. The keepalive sidesteps that.
 COPY entrypoint.sh /usr/local/bin/librespot-entrypoint.sh
-RUN chmod +x /usr/local/bin/librespot-entrypoint.sh
+COPY onevent.sh /usr/local/bin/librespot-onevent.sh
+RUN chmod +x /usr/local/bin/librespot-entrypoint.sh /usr/local/bin/librespot-onevent.sh
 
 # Access to /dev/snd comes from the host audio GID injected at runtime
 # via docker-compose's group_add (default 29 on Debian). The librespot

@@ -34,12 +34,16 @@ KEEPALIVE_INTERVAL=240   # 4 min — under typical NAT conntrack TCP
     # before the box's own network stack is fully ready post-boot.
     sleep 15
     while true; do
+        # One retry before complaining: ~3% of single probes failed
+        # transiently (checked 2026-10: 109 lines over 9 days, never two
+        # in a row, DNS fine — apresolve has both A and AAAA records and
+        # nc picks IPv4), which only buried librespot's own logs.
         if ! nc -z -w 5 "$KEEPALIVE_HOST" "$KEEPALIVE_PORT" 2>/dev/null; then
-            # Only log failures — success-spam would bury librespot's
-            # own logs. A streak of failures here is a signal that
-            # NordVPN egress is down, not just that librespot will
-            # fail later.
-            echo "librespot-keepalive: $KEEPALIVE_HOST:$KEEPALIVE_PORT probe failed"
+            sleep 5
+            if ! nc -z -w 5 "$KEEPALIVE_HOST" "$KEEPALIVE_PORT" 2>/dev/null; then
+                # Two in a row = egress is really down.
+                echo "librespot-keepalive: $KEEPALIVE_HOST:$KEEPALIVE_PORT probe failed twice"
+            fi
         fi
         sleep "$KEEPALIVE_INTERVAL"
     done
