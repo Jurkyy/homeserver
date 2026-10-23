@@ -2385,6 +2385,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_control(self, body: dict) -> None:
         action = body.get("action", "")
+        if action in ("pause", "toggle", "set_pause", "seek", "seek_to"):
+            with _state_lock:
+                tracked = _state["media"] is not None
+            if not tracked:
+                # Nothing of ours on the projector: don't poke whatever
+                # stale MPRIS player / blanked tab happens to be around.
+                self._json(404, {"error": "no active cast"})
+                return
         if action in ("pause", "toggle"):
             # Legacy "pause" is a toggle (Home Assistant / OpenClaw rely on it).
             rc, out = control_pause()
