@@ -1,0 +1,17 @@
+# Systemd --user unit: upgrade the pipx-installed yt-dlp.
+#
+# Installed into ~/.config/systemd/user/ by bootstrap.sh's
+# install_projector_session() and fired weekly by yt-dlp-update.timer.
+# mediacast-host execs ~/.local/bin/yt-dlp (MEDIACAST_YTDLP_BIN) per
+# request, so an upgrade takes effect on the next cast/scrape without
+# restarting the helper. YouTube rotates its anti-bot signatures often
+# enough that a months-old yt-dlp stops resolving most videos.
+
+[Unit]
+Description=Upgrade yt-dlp (pipx) for mediacast
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/pipx upgrade yt-dlp

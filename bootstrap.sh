@@ -280,9 +280,20 @@ install_projector_session() {
     # version dies on "Sign in to confirm you're not a bot" for most
     # videos. pipx installs into ~/.local/bin/yt-dlp; mpv's
     # ytdl_hook is pointed at that path explicitly by the host
-    # helper (MEDIACAST_YTDLP_BIN).
-    sudo -u "$SUDO_USER" pipx install yt-dlp 2>&1 | tail -3 || \
-        sudo -u "$SUDO_USER" pipx upgrade yt-dlp || true
+    # helper (MEDIACAST_YTDLP_BIN). Kept current by the weekly
+    # yt-dlp-update.timer installed in step 7. `pipx install` is a no-op
+    # (exit 0) when already installed, so upgrade explicitly on re-runs.
+    if sudo -u "$SUDO_USER" pipx list --short 2>/dev/null | grep -q '^yt-dlp '; then
+        sudo -u "$SUDO_USER" pipx upgrade yt-dlp || warn "pipx upgrade yt-dlp failed"
+    else
+        sudo -u "$SUDO_USER" pipx install yt-dlp || warn "pipx install yt-dlp failed"
+    fi
+    # Shadow the distro's stale /usr/bin/yt-dlp on PATH (/usr/local/bin
+    # comes first) so interactive use and anything PATH-resolving gets
+    # the same up-to-date build the helper uses.
+    if [ -x "$user_home/.local/bin/yt-dlp" ]; then
+        ln -sfn "$user_home/.local/bin/yt-dlp" /usr/local/bin/yt-dlp
+    fi
 
     # 2. lightdm auto-login. The drop-in goes in conf.d/ so we don't
     # fight the distro's main lightdm.conf.
@@ -498,6 +509,10 @@ PYEOF
     sudo -u "$SUDO_USER" install -m 0644 \
         "$host_helper_dir/mediacast-host.service" \
         "$user_home/.config/systemd/user/mediacast-host.service"
+    for unit in yt-dlp-update.service yt-dlp-update.timer; do
+        sudo -u "$SUDO_USER" install -m 0644 \
+            "$host_helper_dir/$unit" "$user_home/.config/systemd/user/$unit"
+    done
     if [[ $DISTRO_FAMILY == "arch" ]]; then
         # Arch firefox binary
         sed -i 's|^Environment=MEDIACAST_FIREFOX_BIN=.*|Environment=MEDIACAST_FIREFOX_BIN=firefox|' \
@@ -506,7 +521,7 @@ PYEOF
     loginctl enable-linger "$SUDO_USER"
     sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$SUDO_USER")" \
         systemctl --user daemon-reload || true
-    for unit in mediacast-host.service mediacast-firefox.service; do
+    for unit in mediacast-host.service mediacast-firefox.service yt-dlp-update.timer; do
         sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$SUDO_USER")" \
             systemctl --user enable --now "$unit" || \
             warn "$unit enable failed — likely no user-bus yet; will start on next login"
