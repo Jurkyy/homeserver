@@ -7,7 +7,7 @@ keyboard on the projector — just send, watch.
 ## Pipeline
 
 ```
-   web UI form    ──→ POST :8765/ui-cast (LAN, no token)  ─┐
+   web portal / Android app ──→ /api/v1/* (bearer token)  ─┐
                                                           │
    HTTP Shortcuts ──→ POST :8765/cast (bearer token)    ──┤
    curl / scripts ──→ POST :8765/cast (bearer token)    ──┤
@@ -42,10 +42,20 @@ Firefox, anything.
 > `.local` form. Either way Caddy proxies port 80 to the mediacast
 > container so the `:8765` port number is no longer in the URL.
 
-This endpoint is **token-less** — the trust boundary is "you're on the
-LAN" (the page is never exposed publicly; the WAN side stays
-token-protected via `/cast`). Great for guests: stick the URL or a
-QR code near the projector and they're done.
+The page itself needs no login: the server injects `MEDIACAST_TOKEN`
+into it and every action goes to the token-protected `/api/v1` (see
+`docs/api-v1.md`) with an `Authorization` header. That header forces a
+CORS preflight the server never answers, so another website a LAN
+browser visits can't fire casts or power actions (the old token-less
+`/ui-*` routes could be CSRF'd — they're gone). Trust boundary is still
+"you can load the page" = LAN + Tailscale.
+
+The page is live (Server-Sent Events, no polling), shows artwork /
+progress / Spotify now-playing, and has Sleep / Wake / Screen off /
+Power off plus a **Pair phone** QR code (`mediacast://pair?url=…&token=…`)
+for the Android app. It's an installable PWA over `https://home` /
+`https://homeserver.local` (service workers need HTTPS; plain-http
+pages still work, they just can't be installed).
 
 ## Android share-menu shortcut (optional, for any browser)
 
@@ -95,8 +105,11 @@ How it hangs together:
 - The mediacast **container** logs into Jellyfin with the configured
   (non-admin is fine) credentials and mints a session token on demand.
   The credentials and token **never reach the browser** — the page only
-  talks to the container's `/ui-jellyfin/*` proxy (catalog, poster
-  images, play), same LAN-trust model as `/ui-cast`.
+  talks to the container's `/api/v1/jellyfin/*` proxy (libraries,
+  search, continue watching, next up, poster images, play).
+- Playback is reported back to Jellyfin (`Sessions/Playing`, `/Progress`
+  every 10 s from the mpv position, `/Stopped`), so resume points and
+  "next up" stay correct; "Resume" starts mpv at the saved position.
 - On play, the container asks Jellyfin's `PlaybackInfo` for a stream
   using a device profile that advertises **H.264 only**. Jellyfin
   direct-streams when the source is already H.264, otherwise transcodes
@@ -107,7 +120,8 @@ How it hangs together:
 Quick check from the box:
 
 ```bash
-curl -s http://localhost:8765/ui-jellyfin/items | head -c 300   # catalog JSON
+T=$(grep ^MEDIACAST_TOKEN= ~/homeserver/.env | cut -d= -f2)
+curl -s -H "Authorization: Bearer $T" http://localhost:8765/api/v1/jellyfin/resume | head -c 300
 ```
 
 If the section is missing, confirm the three `MRPFLIX_*` vars are set
@@ -165,6 +179,36 @@ curl http://localhost:8766/health                     # host helper (ssh'd in)
   to the wake path (or use a Pulse-Eight USB-CEC adapter — see
   `docs/smart-home-hardware-guide.md`).
 
+### Soft sleep and wake detection
+
+`POST /api/v1/power {"action":"sleep"}` (portal "Sleep" button) stops
+playback and the screensaver, turns the display off (DPMS) and suspends
+the idle-screensaver watchdog. The screensaver also soft-sleeps the box
+by itself after `SLEEP_AFTER_SCREENSAVER_MIN` (default 180) minutes, so
+it no longer keeps the projector lit forever. Wake happens on:
+
+- `wake`, any cast, screensaver pick or Jellyfin play;
+- **physical mouse/keyboard input** — the host helper polls the X
+  input-idle counter (MIT-SCREEN-SAVER extension via libXss, what
+  `xprintidle` uses) every second and wakes when it goes *down*.
+  Verified on the box: `xset dpms force off/on` don't touch the
+  counter; `xdotool mousemove_relative` (XTEST) and `xset s reset` do —
+  which is why the keep-awake watchdog stays silent while dormant;
+- the display coming back on behind our back (X DPMS state via
+  `DPMSInfo`);
+- **projector hotplug** — best effort, see below.
+
+Hotplug findings (GTX 970, nvidia 550, `nvidia_drm` loaded without
+`modeset=1`): there are no DRM connector nodes in `/sys/class/drm`
+(only `card0`), and `udevadm monitor` shows no drm events — neither for
+DPMS changes nor otherwise — so sysfs/udev can't see the projector. The
+NVIDIA X driver does update RandR on an HDMI hotplug interrupt, so while
+dormant the helper polls `xrandr --current` (no re-probe, cheap) every
+3 s and wakes when an output newly reports `connected`. Whether that
+fires depends on the projector dropping HPD in standby; it couldn't be
+power-cycled during development, so this path is untested. No HDMI-CEC
+on this GPU.
+
 ## Screensaver
 
 The bottom of the portal page has a screensaver picker (🌲 Woods, 💧
@@ -186,17 +230,20 @@ Waterfall, 🔥 Fire by default) and a "⏻ Screen off" button.
   theme URLs — any http(s) URL the normal cast path can play, not just
   YouTube) via `MEDIACAST_SCREENSAVER_*` in `.env` — see `.env.example`.
   Nothing needs to be set for the defaults to work.
-- State (which theme's showing / screen-off) lives entirely on the host
-  helper (`GET /state` on :8766, proxied through the container as
-  `/ui-screensaver-state`) — restarting the container doesn't lose it,
-  restarting `mediacast-host` does (resets to "nothing showing").
+- If the screensaver video ends on its own it is detected and restarted
+  (at most every 5 min).
+- State (power, screen, what's playing, screensaver) lives entirely on
+  the host helper (long-poll `GET /v1/state` on :8766, fanned out by the
+  container as `/api/v1/state` + `/api/v1/events`) — restarting the
+  container doesn't lose it; restarting `mediacast-host` resets it,
+  though running playback is rediscovered within ~10 s.
 
 ## Danger zone: power off the server
 
 The very bottom of the portal has a "⏻ Power off server" button, behind
 a JS `confirm()` dialog — this shuts down the whole machine, not just
-the projector. It POSTs to `/ui-poweroff` → the host helper's
-`/poweroff` (bearer-token authenticated, same as `/open`/`/control`) →
+the projector. It POSTs `/api/v1/power {"action":"poweroff"}` → the host
+helper's `/power` (bearer-token authenticated, same as `/open`/`/control`) →
 `sudo -n /sbin/poweroff` on the box itself.
 
 Requires the account running `mediacast-host` to have passwordless sudo
