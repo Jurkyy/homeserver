@@ -6,9 +6,9 @@
     android:viewportHeight="108">
     <!-- light beam -->
     <path
-        android:fillAlpha="0.28"
+        android:fillAlpha="0.22"
         android:fillColor="#FFB86B"
-        android:pathData="M64,50 L84,30 L88,34 L88,46 L66,56 Z" />
+        android:pathData="M58,54 L80,20 L100,42 L74,59 Z" />
     <!-- projector body -->
     <path
         android:fillColor="#FFB86B"

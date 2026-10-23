@@ -2,6 +2,7 @@ package dev.woto.homeserver.ui.theme
 
 import android.os.Build
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
@@ -62,5 +63,8 @@ fun HomeserverTheme(dynamicColor: Boolean = true, content: @Composable () -> Uni
     } else {
         BrandDark
     }
-    MaterialTheme(colorScheme = colors, typography = AppTypography, content = content)
+    MaterialTheme(colorScheme = colors, typography = AppTypography) {
+        // Root surface so LocalContentColor is onBackground everywhere (text outside cards/bars stays legible).
+        Surface(color = colors.background, contentColor = colors.onBackground, content = content)
+    }
 }

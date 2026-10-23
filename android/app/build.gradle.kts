@@ -38,6 +38,7 @@ android {
     packaging {
         resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
     }
+    testOptions { unitTests { isIncludeAndroidResources = true } }
     lint {
         abortOnError = true
         warningsAsErrors = false
@@ -88,6 +89,10 @@ dependencies {
     implementation(libs.glance.material3)
 
     testImplementation(libs.junit)
+    testImplementation("org.robolectric:robolectric:4.16.1")
+    testImplementation(platform(libs.compose.bom))
+    testImplementation("androidx.compose.ui:ui-test-junit4")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.okhttp.mockwebserver)
 }
