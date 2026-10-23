@@ -81,6 +81,16 @@ data class HealthResponse(val ok: Boolean = false, val version: String? = null)
 data class YouTubeFeed(
     val items: List<YouTubeVideo> = emptyList(),
     @SerialName("updated_at") val updatedAt: Long = 0,
+    /** Unix ms of the last time the feed content changed; 0 = unknown (older servers). */
+    @SerialName("changed_at") val changedAt: Long = 0,
+)
+
+/** Payload of the SSE `event: feed`: [updatedAt] is the feed's last content change (same clock as [YouTubeFeed.changedAt]). */
+@Serializable
+data class FeedSignal(
+    @SerialName("updated_at") val updatedAt: Long = 0,
+    @SerialName("new_count") val newCount: Int = 0,
+    @SerialName("removed_count") val removedCount: Int = 0,
 )
 
 @Serializable

@@ -29,6 +29,53 @@ class SseEventsTest {
     }
 
     @Test
+    fun decodesFeedEvent() {
+        val ev = SseEvents.decode("feed", """{"updated_at":1761200000000,"new_count":3,"removed_count":1,"extra":true}""")
+        assertTrue(ev is ServerEvent.Feed)
+        val sig = (ev as ServerEvent.Feed).signal
+        assertEquals(1761200000000L, sig.updatedAt)
+        assertEquals(3, sig.newCount)
+        assertEquals(1, sig.removedCount)
+        // counts are optional (connect-time event may omit them)
+        assertEquals(FeedSignal(updatedAt = 5), (SseEvents.decode("feed", """{"updated_at":5}""") as ServerEvent.Feed).signal)
+    }
+
+    @Test
+    fun malformedFeedIsIgnored() {
+        assertNull(SseEvents.decode("feed", "{not json"))
+        assertNull(SseEvents.decode("feed", """{"updated_at":"soon"}"""))
+        assertNull(SseEvents.decode("feed", """{"new_count":2}""")) // no usable timestamp
+        assertNull(SseEvents.decode("feed", "[]"))
+        assertNull(SseEvents.decode("feed", ""))
+    }
+
+    @Test
+    fun unknownEventsAroundFeedDoNotBreakTheStream() {
+        val events = mutableListOf<ServerEvent?>()
+        val parser = SseEvents.LineParser { t, d -> events += SseEvents.decode(t, d) }
+        val stream = "event: state\ndata: {\"power\":\"on\"}\n\n" +
+            "event: feed\ndata: {\"updated_at\":42,\"new_count\":0,\"removed_count\":0}\n\n" +
+            "event: shiny\ndata: whatever\n\n" +
+            "event: feed\ndata: garbage\n\n" +
+            "event: feed\ndata: {\"updated_at\":43,\"new_count\":2,\"removed_count\":0}\n\n"
+        stream.split("\n").forEach(parser::feed)
+        assertEquals(5, events.size)
+        assertTrue(events[0] is ServerEvent.State)
+        assertEquals(42L, (events[1] as ServerEvent.Feed).signal.updatedAt)
+        assertTrue(events[2] is ServerEvent.Unknown)
+        assertNull(events[3])
+        assertEquals(2, (events[4] as ServerEvent.Feed).signal.newCount)
+    }
+
+    @Test
+    fun feedModelToleratesMissingChangedAt() {
+        val old = AppJson.decodeFromString(YouTubeFeed.serializer(), """{"items":[],"updated_at":10}""")
+        assertEquals(0L, old.changedAt)
+        val new = AppJson.decodeFromString(YouTubeFeed.serializer(), """{"items":[],"updated_at":10,"changed_at":7}""")
+        assertEquals(7L, new.changedAt)
+    }
+
+    @Test
     fun lineParserHandlesStreamWithPingsAndMultilineData() {
         val events = mutableListOf<Pair<String?, String>>()
         val parser = SseEvents.LineParser { t, d -> events += t to d }

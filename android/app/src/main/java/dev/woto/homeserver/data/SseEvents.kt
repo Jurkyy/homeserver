@@ -3,13 +3,15 @@ package dev.woto.homeserver.data
 /** A decoded server-sent event from `/api/v1/events`. */
 sealed interface ServerEvent {
     data class State(val state: ServerState) : ServerEvent
+    /** `event: feed` — the YouTube feed content changed (or the current change marker, sent once on connect). */
+    data class Feed(val signal: FeedSignal) : ServerEvent
     data class Unknown(val type: String?, val data: String) : ServerEvent
 }
 
 object SseEvents {
     /**
      * Decodes an SSE event. `event: state` (or an unnamed event whose payload parses as a state) yields [ServerEvent.State].
-     * Malformed payloads return null so the stream keeps going.
+     * `event: feed` yields [ServerEvent.Feed]. Malformed payloads return null so the stream keeps going.
      */
     fun decode(type: String?, data: String): ServerEvent? {
         val payload = data.trim()
@@ -17,6 +19,8 @@ object SseEvents {
         return when (type) {
             "state", null, "", "message" -> runCatching { ServerEvent.State(AppJson.decodeFromString(ServerState.serializer(), payload)) }
                 .getOrElse { if (type == "state") null else ServerEvent.Unknown(type, payload) }
+            "feed" -> runCatching { AppJson.decodeFromString(FeedSignal.serializer(), payload) }
+                .getOrNull()?.takeIf { it.updatedAt > 0 }?.let { ServerEvent.Feed(it) }
             else -> ServerEvent.Unknown(type, payload)
         }
     }

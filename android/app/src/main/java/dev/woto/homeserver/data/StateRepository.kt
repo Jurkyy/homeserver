@@ -50,6 +50,10 @@ class StateRepository(
     private val _status = MutableStateFlow(ConnectionStatus.Idle)
     val status: StateFlow<ConnectionStatus> = _status.asStateFlow()
 
+    private val _feedSignal = MutableStateFlow<FeedSignal?>(null)
+    /** Latest `event: feed` from the server (re-sent on every connect), or null if none seen yet / old server. */
+    val feedSignal: StateFlow<FeedSignal?> = _feedSignal.asStateFlow()
+
     private val holders = MutableStateFlow<Set<String>>(emptySet())
     private var job: Job? = null
 
@@ -137,6 +141,7 @@ class StateRepository(
                 override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
                     when (val ev = SseEvents.decode(type, data)) {
                         is ServerEvent.State -> push(ev.state)
+                        is ServerEvent.Feed -> _feedSignal.value = ev.signal
                         else -> Unit
                     }
                 }
