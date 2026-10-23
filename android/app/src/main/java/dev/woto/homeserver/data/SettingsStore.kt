@@ -23,6 +23,7 @@ data class AppSettings(
     val dynamicColor: Boolean = true,
     val hideShorts: Boolean = false,
     val volumeKeys: Boolean = true,
+    val jfLowQuality: Boolean = false,
 ) {
     val credentials: Credentials? get() = if (!baseUrl.isNullOrBlank() && !token.isNullOrBlank()) Credentials(baseUrl, token) else null
     val isPaired: Boolean get() = credentials != null
@@ -40,6 +41,7 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
         val dynamicColor = booleanPreferencesKey("dynamic_color")
         val hideShorts = booleanPreferencesKey("hide_shorts")
         val volumeKeys = booleanPreferencesKey("volume_keys")
+        val jfLowQuality = booleanPreferencesKey("jf_low_quality")
     }
 
     private fun Preferences.toSettings() = AppSettings(
@@ -49,6 +51,7 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
         dynamicColor = this[Keys.dynamicColor] ?: true,
         hideShorts = this[Keys.hideShorts] ?: false,
         volumeKeys = this[Keys.volumeKeys] ?: true,
+        jfLowQuality = this[Keys.jfLowQuality] ?: false,
     )
 
     // Read once synchronously at startup so the first frame knows whether we're paired (tiny file, fast).
@@ -73,4 +76,5 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
     suspend fun setDynamicColor(v: Boolean) = context.dataStore.edit { it[Keys.dynamicColor] = v }
     suspend fun setHideShorts(v: Boolean) = context.dataStore.edit { it[Keys.hideShorts] = v }
     suspend fun setVolumeKeys(v: Boolean) = context.dataStore.edit { it[Keys.volumeKeys] = v }
+    suspend fun setJfLowQuality(v: Boolean) = context.dataStore.edit { it[Keys.jfLowQuality] = v }
 }

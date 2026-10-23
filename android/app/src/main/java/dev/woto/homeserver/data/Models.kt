@@ -58,7 +58,15 @@ data class SpotifyState(
     @SerialName("position_s") val positionS: Double? = null,
     @SerialName("duration_s") val durationS: Double? = null,
     @SerialName("updated_at") val updatedAt: Long = 0,
-)
+) {
+    /** librespot only reports on play/pause/seek/track change, so extrapolate from [updatedAt] (wall clock). */
+    fun positionAt(nowMs: Long = System.currentTimeMillis()): Double? {
+        val p = positionS ?: return null
+        val pos = if (playing && updatedAt > 0) p + (nowMs - updatedAt).coerceAtLeast(0) / 1000.0 else p
+        val d = durationS
+        return if (d != null && d > 0) pos.coerceIn(0.0, d) else pos.coerceAtLeast(0.0)
+    }
+}
 
 @Serializable
 data class OkResponse(val ok: Boolean = false)
@@ -140,7 +148,12 @@ data class ScreensaverRequest(val theme: String?)
 data class PowerRequest(val action: String)
 
 @Serializable
-data class JfPlayRequest(val id: String, val resume: Boolean)
+@OptIn(ExperimentalSerializationApi::class)
+data class JfPlayRequest(
+    val id: String,
+    val resume: Boolean,
+    @SerialName("low_quality") @EncodeDefault(EncodeDefault.Mode.NEVER) val lowQuality: Boolean? = null,
+)
 
 /** Human label for State.source. */
 fun sourceLabel(source: String?): String = when (source) {

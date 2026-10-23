@@ -31,6 +31,7 @@ import androidx.compose.material.icons.rounded.Replay
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilledTonalIconButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -96,13 +97,14 @@ fun JfDetailScreen(graph: AppGraph, id: String, onBack: () -> Unit, onOpenItem: 
     val scope = rememberCoroutineScope()
     val haptic = rememberHaptic()
     var busy by remember { mutableStateOf(false) }
+    val settings by graph.settings.settings.collectAsStateWithLifecycle()
 
     fun play(item: JfItem, resume: Boolean) {
         if (busy) return
         busy = true
         haptic(true)
         scope.launch {
-            graph.actions.playJellyfin(item.id, resume)
+            graph.actions.playJellyfin(item.id, resume, lowQuality = settings.jfLowQuality)
                 .onSuccess { snackbar.showSnackbar("Playing “${item.name}” on the projector") }
                 .onFailure { snackbar.showSnackbar("Couldn't play: ${it.userMessage()}") }
             busy = false
@@ -139,6 +141,14 @@ fun JfDetailScreen(graph: AppGraph, id: String, onBack: () -> Unit, onOpenItem: 
                                     }
                                 }
                             }
+                        }
+                        if (item.isPlayable || item.type == "Season") {
+                            FilterChip(
+                                selected = settings.jfLowQuality,
+                                onClick = { scope.launch { graph.settings.setJfLowQuality(!settings.jfLowQuality) } },
+                                label = { Text("Low bandwidth (~1.2 Mbps)") },
+                                modifier = Modifier.padding(top = 8.dp),
+                            )
                         }
                         item.overview?.takeIf { it.isNotBlank() }?.let {
                             Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 16.dp))

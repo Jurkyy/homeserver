@@ -70,5 +70,6 @@ class RemoteActions(
     }
 
     suspend fun cast(url: String): Result<Unit> = runCatching { api.cast(url); Unit }
-    suspend fun playJellyfin(id: String, resume: Boolean): Result<Unit> = runCatching { api.jfPlay(id, resume); Unit }
+    suspend fun playJellyfin(id: String, resume: Boolean, lowQuality: Boolean = false): Result<Unit> =
+        runCatching { api.jfPlay(id, resume, lowQuality); Unit }
 }

@@ -119,8 +119,8 @@ class ApiClient(
     suspend fun jfResume(): JfList = get("jellyfin/resume", JfList.serializer())
     suspend fun jfNextUp(): JfList = get("jellyfin/nextup", JfList.serializer())
     suspend fun jfItem(id: String): JfItem = get("jellyfin/item/$id", JfItem.serializer())
-    suspend fun jfPlay(id: String, resume: Boolean) =
-        post("jellyfin/play", JfPlayRequest.serializer(), JfPlayRequest(id, resume), OkResponse.serializer())
+    suspend fun jfPlay(id: String, resume: Boolean, lowQuality: Boolean = false) =
+        post("jellyfin/play", JfPlayRequest.serializer(), JfPlayRequest(id, resume, lowQuality.takeIf { it }), OkResponse.serializer())
 
     /** Request for the SSE stream (long-lived). */
     fun eventsRequest(): Request? {

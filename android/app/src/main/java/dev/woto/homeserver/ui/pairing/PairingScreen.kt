@@ -61,6 +61,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import dev.woto.homeserver.AppGraph
 import dev.woto.homeserver.R
+import dev.woto.homeserver.data.ApiException
 import dev.woto.homeserver.data.Credentials
 import dev.woto.homeserver.data.Pairing
 import dev.woto.homeserver.data.PairingInfo
@@ -107,10 +108,12 @@ fun PairingScreen(
             status = PairStatus.Working("Checking token…")
             val creds = Credentials(base, token.trim())
             val state = runCatching { graph.api.stateWith(creds) }.getOrElse {
-                status = PairStatus.Failed(it.userMessage()); return@launch
+                // 502 host_unreachable means auth passed but the projector host helper is down: pair anyway.
+                if (it is ApiException && it.status == 502) null
+                else { status = PairStatus.Failed(it.userMessage()); return@launch }
             }
             graph.settings.pair(base, token.trim())
-            graph.repository.push(state)
+            state?.let(graph.repository::push)
             haptic(true)
             status = PairStatus.Success(health.version)
             onPaired()

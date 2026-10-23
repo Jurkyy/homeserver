@@ -452,6 +452,22 @@ private fun SpotifyCard(sp: SpotifyState) {
                     listOfNotNull(sp.artist, sp.album).joinToString(" · ").ifEmpty { "Control playback from the Spotify app" },
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
+                val dur = sp.durationS?.takeIf { it > 0 }
+                if (dur != null) {
+                    val pos by produceState(sp.positionAt(), sp) {
+                        while (true) {
+                            value = sp.positionAt()
+                            if (!sp.playing) break
+                            delay(1000)
+                        }
+                    }
+                    LinearProgressIndicator(
+                        progress = { ((pos ?: 0.0) / dur).toFloat().coerceIn(0f, 1f) },
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                        color = spotifyGreen,
+                        drawStopIndicator = {},
+                    )
+                }
             }
             FilledTonalButton(
                 onClick = { openSpotify(context) },

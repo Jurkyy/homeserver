@@ -17,6 +17,7 @@ import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import androidx.compose.material.icons.rounded.Dns
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.LinkOff
+import androidx.compose.material.icons.rounded.NetworkCheck
 import androidx.compose.material.icons.rounded.Notifications
 import androidx.compose.material.icons.rounded.Palette
 import androidx.compose.material.icons.rounded.QrCodeScanner
@@ -106,6 +107,11 @@ fun SettingsScreen(graph: AppGraph, onBack: () -> Unit, onRepair: () -> Unit) {
                 "While the app is open, the phone's volume buttons change the projector volume",
                 settings.volumeKeys,
             ) { scope.launch { graph.settings.setVolumeKeys(it) } }
+            Toggle(
+                Icons.Rounded.NetworkCheck, "Low-bandwidth movies",
+                "Cap mrpflix streams at ~1.2 Mbps when the server's connection is slow",
+                settings.jfLowQuality,
+            ) { scope.launch { graph.settings.setJfLowQuality(it) } }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 HorizontalDivider(Modifier.padding(vertical = 8.dp))
                 Header("Appearance")

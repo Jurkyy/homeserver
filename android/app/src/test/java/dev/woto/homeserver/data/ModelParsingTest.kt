@@ -139,4 +139,17 @@ class ModelParsingTest {
         val nullTheme = RequestJson.encodeToString(ScreensaverRequest.serializer(), ScreensaverRequest(null))
         assertEquals("""{"theme":null}""", nullTheme)
     }
+
+    @Test
+    fun spotifyPositionExtrapolatesFromUpdatedAt() {
+        val sp = SpotifyState(active = true, playing = true, positionS = 30.0, durationS = 200.0, updatedAt = 1_000_000)
+        assertEquals(40.0, sp.positionAt(1_010_000)!!, 0.001)
+        assertEquals(30.0, sp.copy(playing = false).positionAt(1_010_000)!!, 0.001)
+    }
+
+    @Test
+    fun encodesJellyfinPlay() {
+        assertEquals("""{"id":"a","resume":true}""", RequestJson.encodeToString(JfPlayRequest.serializer(), JfPlayRequest("a", true)))
+        assertEquals("""{"id":"a","resume":false,"low_quality":true}""", RequestJson.encodeToString(JfPlayRequest.serializer(), JfPlayRequest("a", false, true)))
+    }
 }

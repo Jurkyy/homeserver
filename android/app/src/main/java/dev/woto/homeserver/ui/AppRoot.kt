@@ -8,6 +8,9 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
@@ -149,7 +152,8 @@ fun AppRoot(
                 },
                 contentWindowInsets = WindowInsets(0),
             ) { padding ->
-                Box(Modifier.fillMaxSize().padding(padding)) {
+                val bottomInset = if (showNav && !wide) Modifier else Modifier.windowInsetsPadding(WindowInsets.navigationBars.only(WindowInsetsSides.Bottom))
+                Box(Modifier.fillMaxSize().padding(padding).then(bottomInset)) {
                     NavHost(nav, startDestination = if (startPaired) Routes.REMOTE else Routes.PAIR) {
                         composable(Routes.PAIR) {
                             PairingScreen(
@@ -161,7 +165,7 @@ fun AppRoot(
                                 onBack = { nav.popBackStack() },
                                 onPaired = {
                                     onPaired()
-                                    nav.navigate(Routes.REMOTE) { popUpTo(0) { inclusive = true } }
+                                    nav.navigate(Routes.REMOTE) { popUpTo(nav.graph.id) { inclusive = true } }
                                 },
                             )
                         }
