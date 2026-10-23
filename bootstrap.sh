@@ -1237,7 +1237,19 @@ connect_tailscale() {
     read -p "Connect to Tailscale now? [Y/n]: " connect_ts
     if [[ "$connect_ts" != "n" && "$connect_ts" != "N" ]]; then
         info "Starting Tailscale authentication..."
-        tailscale up
+        # Host tailscaled is the only Tailscale node (the old compose
+        # container was removed). Use TAILSCALE_AUTHKEY from .env if
+        # set, otherwise fall back to interactive browser login.
+        local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        local ts_key=""
+        if [ -f "$script_dir/.env" ]; then
+            ts_key=$(grep -E '^TAILSCALE_AUTHKEY=' "$script_dir/.env" | cut -d= -f2-)
+        fi
+        if [ -n "$ts_key" ] && [[ "$ts_key" != *"..." ]]; then
+            tailscale up --authkey="$ts_key"
+        else
+            tailscale up
+        fi
         success "Tailscale connected"
     fi
 }

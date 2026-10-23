@@ -224,22 +224,3 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
-
-  tailscale:
-    image: tailscale/tailscale:latest
-    container_name: tailscale
-    hostname: homeserver
-    volumes:
-      - /dev/net/tun:/dev/net/tun
-      - tailscale-state:/var/lib/tailscale
-    environment:
-      - TS_AUTHKEY=${TAILSCALE_AUTHKEY}
-      - TS_STATE_DIR=/var/lib/tailscale
-      - TS_EXTRA_ARGS=--advertise-exit-node
-    cap_add:
-      - NET_ADMIN
-      - SYS_MODULE
-    restart: unless-stopped
-
-volumes:
-  tailscale-state:

@@ -207,12 +207,16 @@ docker compose up -d
 
 ### Tailscale
 
-1. **Get Auth Key**:
+Tailscale runs on the host (`tailscaled`, installed by `bootstrap.sh`), not
+in Docker.
+
+1. **Get Auth Key** (optional):
    - Go to [Tailscale Admin Console](https://login.tailscale.com/admin/settings/keys)
    - Generate an auth key (reusable recommended)
-   - Add to `TAILSCALE_AUTHKEY` in `.env`
+   - Add to `TAILSCALE_AUTHKEY` in `.env` — `bootstrap.sh` uses it for
+     `tailscale up --authkey`; leave blank for browser login
 
-2. **Connect Host** (optional, for direct access):
+2. **Connect Host**:
    ```bash
    sudo tailscale up
    ```
