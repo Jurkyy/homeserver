@@ -340,6 +340,14 @@ scrape fails (not logged in). Cookie source override:
 `MEDIACAST_YTDLP_COOKIES_FROM_BROWSER` (default: auto-detected
 `*.default-esr` profile).
 
+The feed itself is rebuilt in the background every `YT_FEED_REFRESH_MIN`
+minutes (default 5), whether or not anyone is looking. Each cycle only
+re-fetches channels whose RSS copy has expired (YouTube sends
+`max-age=900` and no ETag, so ~1/3 of the channels per 5-min cycle),
+reuses the Shorts tag for known video ids (HEAD only for new ones), and
+on a 429/503 stops the cycle and backs off (2×…16× the interval). When
+the set of videos changes, SSE clients get `event: feed` and refetch.
+
 ## Security notes
 
 `POST /cast` opens an arbitrary URL in an auto-logged-in browser

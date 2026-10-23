@@ -76,10 +76,16 @@ YT_CHANNELS_FILE = os.environ.get("YT_CHANNELS_FILE", "/config/yt-channels.txt")
 YT_SUBS_FROM_ACCOUNT = os.environ.get("YT_SUBS_FROM_ACCOUNT", "1") not in ("0", "false", "")
 YT_SUBS_TTL = float(os.environ.get("YT_SUBS_TTL", "21600"))    # re-scrape every 6h
 YT_SUBS_FETCH_TIMEOUT = float(os.environ.get("YT_SUBS_FETCH_TIMEOUT", "100"))
-YT_FEED_TTL = float(os.environ.get("YT_FEED_TTL", "600"))      # cache 10 min
 YT_FEED_LIMIT = int(os.environ.get("YT_FEED_LIMIT", "150"))    # cards cached
 YT_PER_CHANNEL = int(os.environ.get("YT_PER_CHANNEL", "15"))   # recent per channel (RSS max)
 YT_FETCH_CONCURRENCY = int(os.environ.get("YT_FETCH_CONCURRENCY", "12"))
+# Background refresher: rebuild the feed on this cadence whether or not a
+# client is looking, and push `event: feed` over SSE when it changed.
+YT_FEED_REFRESH_MIN = float(os.environ.get("YT_FEED_REFRESH_MIN", "5") or 5)
+# Channel RSS answers `Cache-Control: max-age=900` (and no ETag/Last-
+# Modified, so no conditional GET). We honour max-age, capped here, so each
+# cycle only re-fetches the channels whose copy has expired.
+YT_RSS_MAX_AGE_CAP = float(os.environ.get("YT_RSS_MAX_AGE_CAP", "900"))
 _YT_UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 _UC_RE = re.compile(r"UC[0-9A-Za-z_-]{22}")
 _VID_RE = re.compile(r"[0-9A-Za-z_-]{11}")
@@ -172,10 +178,12 @@ async def lifespan(_app: FastAPI):
     )
     _load_yt_state()
     watcher = asyncio.create_task(_host_watch())
+    yt_refresher = asyncio.create_task(_yt_refresh_loop())
     try:
         yield
     finally:
         watcher.cancel()
+        yt_refresher.cancel()
         await _http.aclose()
 
 
@@ -313,13 +321,21 @@ def _merged_state() -> dict:
     return st
 
 
-def _broadcast() -> None:
-    data = json.dumps(_merged_state(), separators=(",", ":"))
+def _publish(event: str, data: str) -> None:
     for q in list(_subscribers):
         if q.full():
             with contextlib.suppress(asyncio.QueueEmpty):
                 q.get_nowait()   # slow client: drop the stale frame
-        q.put_nowait(data)
+        q.put_nowait((event, data))
+
+
+def _broadcast() -> None:
+    _publish("state", json.dumps(_merged_state(), separators=(",", ":")))
+
+
+def _feed_event(new_count: int = 0, removed_count: int = 0) -> str:
+    return json.dumps({"updated_at": _feed_cache["changed_at"], "new_count": new_count,
+                       "removed_count": removed_count}, separators=(",", ":"))
 
 
 async def _fetch_host_state(since: int, wait: float) -> dict:
@@ -371,17 +387,20 @@ async def api_state() -> dict:
 
 @api.get("/events", dependencies=authed)
 async def api_events(request: Request) -> StreamingResponse:
-    q: asyncio.Queue = asyncio.Queue(maxsize=4)
+    q: asyncio.Queue = asyncio.Queue(maxsize=8)
     _subscribers.add(q)
 
     async def gen():
         try:
             yield "retry: 3000\n"
             yield f"event: state\ndata: {json.dumps(_merged_state(), separators=(',', ':'))}\n\n"
+            if _feed_cache["changed_at"]:
+                # Lets a (re)connecting client tell whether its feed is stale.
+                yield f"event: feed\ndata: {_feed_event()}\n\n"
             while True:
                 try:
-                    data = await asyncio.wait_for(q.get(), timeout=15)
-                    yield f"event: state\ndata: {data}\n\n"
+                    event, data = await asyncio.wait_for(q.get(), timeout=15)
+                    yield f"event: {event}\ndata: {data}\n\n"
                 except asyncio.TimeoutError:
                     if await request.is_disconnected():
                         break
@@ -955,7 +974,12 @@ async def api_jf_play(req: V1JellyfinPlay, request: Request) -> dict:
 
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _YTNS = "{http://www.youtube.com/xml/schemas/2015}"
-_feed_cache: dict = {"ts": 0.0, "items": [], "refreshing": False}
+# ts: last successful build; changed_at: unix ms of the last content change.
+_feed_cache: dict = {"ts": 0.0, "items": [], "changed_at": 0}
+_feed_lock = asyncio.Lock()
+# Per-channel RSS copies: cid -> {"items", "expires"} (in-memory only).
+_rss_cache: dict[str, dict] = {}
+_yt_backoff: dict = {"level": 0, "until": 0.0}
 _subs_cache: dict = {"ts": 0.0, "ids": [], "refreshing": False}
 
 
@@ -994,6 +1018,7 @@ def _load_yt_state() -> None:
     if feed.get("items"):
         _feed_cache["items"] = [_norm_feed_item(i) for i in feed["items"] if i.get("id")]
         _feed_cache["ts"] = feed.get("ts", 0.0)
+        _feed_cache["changed_at"] = int(feed.get("changed_at") or feed.get("ts", 0.0) * 1000)
 
 
 def _save_yt_state() -> None:
@@ -1002,7 +1027,8 @@ def _save_yt_state() -> None:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({
                 "subs": {"ids": _subs_cache["ids"], "ts": _subs_cache["ts"]},
-                "feed": {"items": _feed_cache["items"], "ts": _feed_cache["ts"]},
+                "feed": {"items": _feed_cache["items"], "ts": _feed_cache["ts"],
+                         "changed_at": _feed_cache["changed_at"]},
             }, f)
         os.replace(tmp, YT_STATE_FILE)
     except OSError as exc:
@@ -1024,8 +1050,7 @@ async def _refresh_account_subs() -> None:
                 _save_yt_state()
                 logger.info("account subscriptions: %d channels", len(ids))
                 # Rebuild now if the list changed (cold cache → populated).
-                if changed and not _feed_cache["refreshing"]:
-                    _feed_cache["refreshing"] = True
+                if changed and not _feed_lock.locked():
                     _spawn(_refresh_feed())
             else:
                 logger.warning("account subscriptions returned no ids")
@@ -1116,22 +1141,60 @@ async def _is_short(vid: str) -> bool:
         return False  # fail open: an unknown video stays visible
 
 
+def _max_age(r: httpx.Response) -> float:
+    m = re.search(r"max-age=(\d+)", r.headers.get("cache-control", ""))
+    return min(float(m.group(1)), YT_RSS_MAX_AGE_CAP) if m else 0.0
+
+
+class _Throttled(Exception):
+    """YouTube answered 429/503: stop this cycle and back off."""
+
+
 async def _build_feed() -> list[dict]:
+    """Merge every subscribed channel's RSS. Only channels whose cached copy
+    has expired (per its max-age) are re-fetched; a 429/503 aborts the rest
+    of the cycle (cached copies stand in) and raises the global backoff."""
     ids = await _channel_ids()
     if not ids:
         return []
     sem = asyncio.Semaphore(YT_FETCH_CONCURRENCY)
     known = {it["id"]: it for it in _feed_cache["items"]}
+    # Channels with no RSS copy yet (fresh process) keep their last-known
+    # feed items, so an aborted cycle never shrinks the feed.
+    fallback: dict[str, list[dict]] = {}
+    for it in _feed_cache["items"]:
+        fallback.setdefault(it["channel_id"], []).append(it)
+    now = time.time()
+    stats = {"fetched": 0, "errors": 0, "throttled": None}
 
     async def fetch(cid: str) -> list[dict]:
-        url = f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
+        cached = _rss_cache.get(cid)
+        if cached and cached["expires"] > now + 30:
+            return cached["items"]
+        old = cached["items"] if cached else fallback.get(cid, [])
         async with sem:
+            if stats["throttled"]:
+                return old
             try:
-                r = await http().get(url, headers={"User-Agent": _YT_UA}, timeout=15)
+                r = await http().get(f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}",
+                                     headers={"User-Agent": _YT_UA}, timeout=15)
             except httpx.HTTPError as exc:
+                stats["errors"] += 1
                 logger.warning("yt rss fetch failed for %s: %s", cid, exc)
+                return old
+        stats["fetched"] += 1
+        if r.status_code in (429, 503):
+            stats["throttled"] = stats["throttled"] or r.status_code
+            return old
+        if r.status_code >= 400:   # e.g. 404 for a deleted channel
+            stats["errors"] += 1
+            if r.status_code < 500:
+                _rss_cache[cid] = {"items": [], "expires": time.time() + 3600}
                 return []
-        return _parse_channel_rss(r.text) if r.status_code < 400 else []
+            return old
+        items = _parse_channel_rss(r.text)
+        _rss_cache[cid] = {"items": items, "expires": time.time() + _max_age(r)}
+        return items
 
     async def tag_short(item: dict) -> None:
         if item["id"] in known:   # already checked on an earlier build
@@ -1140,38 +1203,82 @@ async def _build_feed() -> list[dict]:
         async with sem:
             item["is_short"] = await _is_short(item["id"])
 
+    t0 = time.monotonic()
     results = await asyncio.gather(*(fetch(c) for c in ids))
-    items = [v for chan in results for v in chan]
+    for cid in list(_rss_cache):
+        if cid not in ids:
+            del _rss_cache[cid]
+    # Copy: RSS cache entries are shared across builds.
+    items = [dict(v) for chan in results for v in chan]
     # ISO-8601 timestamps share the same offset → string sort is chronological.
     items.sort(key=lambda v: v["published"], reverse=True)
     items = items[:YT_FEED_LIMIT]
+    fresh = sum(1 for it in items if it["id"] not in known)
     await asyncio.gather(*(tag_short(it) for it in items))
+    logger.info("yt feed build: %d channels, %d rss fetched, %d errors, %d new shorts checks, %.1fs%s",
+                len(ids), stats["fetched"], stats["errors"], fresh, time.monotonic() - t0,
+                f", THROTTLED http {stats['throttled']}" if stats["throttled"] else "")
+    if stats["throttled"]:
+        raise _Throttled(items)
     return items
+
+
+def _apply_feed(items: list[dict]) -> None:
+    """Swap in a new feed; on a content change stamp changed_at and tell
+    SSE clients."""
+    old = {it["id"] for it in _feed_cache["items"]}
+    new = {it["id"] for it in items}
+    _feed_cache["items"] = items
+    _feed_cache["ts"] = time.time()
+    if old != new:
+        _feed_cache["changed_at"] = int(time.time() * 1000)
+        added, removed = len(new - old), len(old - new)
+        logger.info("yt feed changed: +%d -%d", added, removed)
+        _publish("feed", _feed_event(added, removed))
+    _save_yt_state()
 
 
 async def _refresh_feed() -> None:
     """Rebuild the feed cache; keeps the last good feed if a refresh comes
-    back empty. Dedup'd via the refreshing flag."""
-    try:
-        items = await _build_feed()
+    back empty. Serialised: a caller arriving mid-refresh waits for the
+    in-flight one instead of starting another."""
+    if _feed_lock.locked():
+        async with _feed_lock:
+            return
+    async with _feed_lock:
+        try:
+            items = await _build_feed()
+            _yt_backoff["level"] = 0
+        except _Throttled as exc:
+            items = exc.args[0]
+            _yt_backoff["level"] = min(_yt_backoff["level"] + 1, 4)
+            pause = YT_FEED_REFRESH_MIN * 60 * (2 ** _yt_backoff["level"])
+            _yt_backoff["until"] = time.time() + pause
+            logger.warning("yt rss throttled; backing off %.0f min", pause / 60)
         if items:
-            _feed_cache["items"] = items
-            _feed_cache["ts"] = time.time()
-            _save_yt_state()
-    finally:
-        _feed_cache["refreshing"] = False
+            _apply_feed(items)
+
+
+async def _yt_refresh_loop() -> None:
+    """Rebuild the feed every YT_FEED_REFRESH_MIN regardless of clients."""
+    interval = max(YT_FEED_REFRESH_MIN, 0.5) * 60
+    await asyncio.sleep(5)   # let the app come up first
+    while True:
+        try:
+            if time.time() >= _yt_backoff["until"] and await _channel_ids():
+                await _refresh_feed()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — keep refreshing no matter what
+            logger.exception("yt background refresh failed")
+        await asyncio.sleep(interval)
 
 
 async def _get_feed(force: bool = False) -> list[dict]:
-    # Stale-while-revalidate: only a cold cache or an explicit refresh
-    # builds inline.
-    stale = (time.time() - _feed_cache["ts"]) >= YT_FEED_TTL
-    if force or (stale and not _feed_cache["items"]):
-        _feed_cache["refreshing"] = True
+    # The background loop keeps the cache warm; only a cold cache or an
+    # explicit refresh builds inline (sharing the lock with the loop).
+    if force or not _feed_cache["items"]:
         await _refresh_feed()
-    elif stale and not _feed_cache["refreshing"]:
-        _feed_cache["refreshing"] = True
-        _spawn(_refresh_feed())
     return _feed_cache["items"]
 
 
@@ -1182,7 +1289,8 @@ async def api_youtube_feed(refresh: int = 0, shorts: int = 1) -> dict:
     items = await _get_feed(force=bool(refresh))
     if not shorts:
         items = [it for it in items if not it["is_short"]]
-    return {"items": items, "updated_at": int(_feed_cache["ts"] * 1000)}
+    return {"items": items, "updated_at": int(_feed_cache["ts"] * 1000),
+            "changed_at": _feed_cache["changed_at"]}
 
 
 app.include_router(api)

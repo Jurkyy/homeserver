@@ -25,6 +25,7 @@ The backend owns this file; any change must be reflected in both clients.
 
 `GET /api/v1/events` → Server-Sent Events. Sends `event: state` + `data: <State JSON>` immediately on connect and
 on every change; a `: ping` comment every 15 s. Clients reconnect with backoff.
+It also carries `event: feed` (see [YouTube](#youtube)); clients must ignore event types they don't know.
 
 ```jsonc
 State = {
@@ -91,7 +92,23 @@ Notes:
 ## YouTube
 
 `GET /api/v1/youtube/feed?refresh=0|1&shorts=0|1` (default `shorts=1`: Shorts included, flagged by `is_short`; `shorts=0` drops them) →
-`{ "items": [ { "id", "url", "title", "channel", "channel_id", "published" (ISO 8601), "thumbnail", "duration_s"?: number|null, "is_short": boolean } ], "updated_at": number }`
+`{ "items": [ { "id", "url", "title", "channel", "channel_id", "published" (ISO 8601), "thumbnail", "duration_s"?: number|null, "is_short": boolean } ], "updated_at": number, "changed_at": number }`
+— `updated_at`: unix ms of the last successful rebuild; `changed_at`: unix ms of the last time the set of videos changed (0 = unknown).
+
+The server rebuilds the feed in the background every `YT_FEED_REFRESH_MIN` minutes (default 5), so clients never need
+to poll. `refresh=1` rebuilds now (or waits for an in-flight rebuild instead of starting a second one); channels whose
+RSS copy is still within YouTube's `max-age` (~15 min) are served from cache.
+
+When a rebuild changes the set of videos, `GET /api/v1/events` emits
+
+```
+event: feed
+data: {"updated_at": number, "new_count": number, "removed_count": number}
+```
+
+`updated_at` equals the feed's `changed_at`. The same event (counts 0) is sent once right after connect, so a
+(re)connecting client can compare it with the `changed_at` of the feed it holds and refetch only if it advanced.
+Clients should refetch silently and compute "N new" themselves (ids not seen before).
 
 ## Jellyfin (mrpflix)
 
