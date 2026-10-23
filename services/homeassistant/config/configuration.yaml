@@ -89,41 +89,46 @@ history:
 logbook:
 
 # -----------------------------------------------------------------------------
-# REST Commands - OpenClaw Integration
+# REST Commands - OpenClaw Integration (DISABLED)
 # -----------------------------------------------------------------------------
-# These commands allow HA to communicate with the OpenClaw AI agent.
-# Update the URL to match your OpenClaw deployment.
-rest_command:
-  # Send a notification/message to OpenClaw
-  openclaw_notify:
-    url: "http://openclaw:8080/api/notify"
-    method: POST
-    headers:
-      Content-Type: "application/json"
-      # Authorization: "Bearer {{ states('input_text.openclaw_api_key') }}"
-    payload: >-
-      {"message": "{{ message }}", "source": "homeassistant", "priority": "{{ priority | default('normal') }}"}
-    timeout: 10
-
-  # Request OpenClaw to perform an action
-  openclaw_action:
-    url: "http://openclaw:8080/api/action"
-    method: POST
-    headers:
-      Content-Type: "application/json"
-    payload: >-
-      {"action": "{{ action }}", "parameters": {{ parameters | default('{}') }}}
-    timeout: 15
-
-  # Query OpenClaw for a status or recommendation
-  openclaw_query:
-    url: "http://openclaw:8080/api/query"
-    method: POST
-    headers:
-      Content-Type: "application/json"
-    payload: >-
-      {"query": "{{ query }}"}
-    timeout: 10
+# These pointed at http://openclaw:8080/api/{notify,action,query}, but the
+# OpenClaw gateway listens on 18789 (services/openclaw/config/openclaw.json)
+# and exposes no /api/notify|action|query routes, so every call failed.
+# Kept commented out for reference rather than guessing at a replacement
+# (OpenClaw's real inbound HTTP surface is its webhook /hooks/* endpoints,
+# which need hooks.enabled + a token in openclaw.json). The callers in
+# scripts.yaml (notify_openclaw) and automations.yaml are disabled too.
+# rest_command:
+#   # Send a notification/message to OpenClaw
+#   openclaw_notify:
+#     url: "http://openclaw:8080/api/notify"
+#     method: POST
+#     headers:
+#       Content-Type: "application/json"
+#       # Authorization: "Bearer {{ states('input_text.openclaw_api_key') }}"
+#     payload: >-
+#       {"message": "{{ message }}", "source": "homeassistant", "priority": "{{ priority | default('normal') }}"}
+#     timeout: 10
+#
+#   # Request OpenClaw to perform an action
+#   openclaw_action:
+#     url: "http://openclaw:8080/api/action"
+#     method: POST
+#     headers:
+#       Content-Type: "application/json"
+#     payload: >-
+#       {"action": "{{ action }}", "parameters": {{ parameters | default('{}') }}}
+#     timeout: 15
+#
+#   # Query OpenClaw for a status or recommendation
+#   openclaw_query:
+#     url: "http://openclaw:8080/api/query"
+#     method: POST
+#     headers:
+#       Content-Type: "application/json"
+#     payload: >-
+#       {"query": "{{ query }}"}
+#     timeout: 10
 
 # -----------------------------------------------------------------------------
 # Spotify Integration

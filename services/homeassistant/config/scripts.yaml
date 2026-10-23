@@ -148,38 +148,41 @@ spotify_play_pause:
 # =============================================================================
 # Sends a message to the OpenClaw AI agent via the REST API.
 # Wraps the REST command with sensible defaults and error handling.
-notify_openclaw:
-  alias: "Notify OpenClaw"
-  description: >
-    Sends a notification to the OpenClaw agent. Accepts a message
-    and an optional priority level (low, normal, high, urgent).
-  icon: mdi:robot
-  fields:
-    message:
-      description: "The message to send to OpenClaw"
-      required: true
-      example: "Motion detected in the hallway"
-      selector:
-        text:
-    priority:
-      description: "Priority level for the notification"
-      required: false
-      default: "normal"
-      example: "high"
-      selector:
-        select:
-          options:
-            - "low"
-            - "normal"
-            - "high"
-            - "urgent"
-  sequence:
-    - service: rest_command.openclaw_notify
-      data:
-        message: "{{ message }}"
-        priority: "{{ priority | default('normal') }}"
-  mode: queued
-  max: 10
+# DISABLED: depends on rest_command.openclaw_notify, which is commented out in
+# configuration.yaml (OpenClaw's gateway has no /api/notify route).
+# Uncomment both once a real OpenClaw HA endpoint exists.
+# notify_openclaw:
+#   alias: "Notify OpenClaw"
+#   description: >
+#     Sends a notification to the OpenClaw agent. Accepts a message
+#     and an optional priority level (low, normal, high, urgent).
+#   icon: mdi:robot
+#   fields:
+#     message:
+#       description: "The message to send to OpenClaw"
+#       required: true
+#       example: "Motion detected in the hallway"
+#       selector:
+#         text:
+#     priority:
+#       description: "Priority level for the notification"
+#       required: false
+#       default: "normal"
+#       example: "high"
+#       selector:
+#         select:
+#           options:
+#             - "low"
+#             - "normal"
+#             - "high"
+#             - "urgent"
+#   sequence:
+#     - service: rest_command.openclaw_notify
+#       data:
+#         message: "{{ message }}"
+#         priority: "{{ priority | default('normal') }}"
+#   mode: queued
+#   max: 10
 
 # =============================================================================
 # 4. Gradual Brightness Transition

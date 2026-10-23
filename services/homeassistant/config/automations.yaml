@@ -394,10 +394,12 @@ x_anchors:
               target:
                 entity_id: scene.jungle_evening
     # Notify OpenClaw about arrival
-    - service: rest_command.openclaw_notify
-      data:
-        message: "Welcome home! Lights are on and ready."
-        priority: "low"
+    # DISABLED: rest_command.openclaw_notify is commented out in
+    # configuration.yaml (OpenClaw's gateway has no /api/notify route).
+    # - service: rest_command.openclaw_notify
+    #   data:
+    #     message: "Welcome home! Lights are on and ready."
+    #     priority: "low"
   mode: single
 
 # =============================================================================
@@ -488,10 +490,12 @@ x_anchors:
       target:
         entity_id: all
     # Notify via OpenClaw
-    - service: rest_command.openclaw_notify
-      data:
-        message: "Away mode activated. Non-essential systems powered down."
-        priority: "low"
+    # DISABLED: rest_command.openclaw_notify is commented out in
+    # configuration.yaml (OpenClaw's gateway has no /api/notify route).
+    # - service: rest_command.openclaw_notify
+    #   data:
+    #     message: "Away mode activated. Non-essential systems powered down."
+    #     priority: "low"
   mode: single
 
 # =============================================================================
@@ -532,10 +536,12 @@ x_anchors:
         message: "Time to check on your jungle! Today's tip: {{ today_tip }}"
         notification_id: plant_care_daily
     # Also notify OpenClaw if configured
-    - service: rest_command.openclaw_notify
-      data:
-        message: "Plant care reminder: {{ today_tip }}"
-        priority: "low"
+    # DISABLED: rest_command.openclaw_notify is commented out in
+    # configuration.yaml (OpenClaw's gateway has no /api/notify route).
+    # - service: rest_command.openclaw_notify
+    #   data:
+    #     message: "Plant care reminder: {{ today_tip }}"
+    #     priority: "low"
   mode: single
 
 # =============================================================================
