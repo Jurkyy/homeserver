@@ -219,6 +219,9 @@ SCREENSAVER_POLL_INTERVAL = float(os.environ.get("MEDIACAST_SCREENSAVER_POLL_INT
 # counter so the DPMS/blank timeout (bootstrap.sh step 6, input-idle only)
 # doesn't trip mid-playback. Independent of the screensaver feature above —
 # runs even with SCREENSAVER_IDLE_TIMEOUT=0.
+# X idle blank/DPMS timeout re-applied on every wake (see wake_display);
+# matches the `xset s/dpms 3600` in bootstrap's .xprofile. 0 = leave alone.
+IDLE_BLANK_S = float(os.environ.get("MEDIACAST_IDLE_BLANK_S", "3600"))
 KEEPAWAKE_POLL_INTERVAL = float(os.environ.get("MEDIACAST_KEEPAWAKE_POLL_INTERVAL", "30"))
 
 
@@ -248,6 +251,14 @@ def wake_display() -> str:
     # complain more loudly and surface a useful error).
     rc1, out1 = _run(["xset", "dpms", "force", "on"])
     rc2, out2 = _run(["xset", "s", "reset"])
+    # `xset dpms force off` (sleep / screen-off) silently *enables* X DPMS
+    # with whatever timeouts are loaded (xfce leaves 600 s), which then
+    # blanks the projector after 10 idle minutes. Re-assert the intended
+    # input-idle policy (bootstrap's .xprofile: 1 h) on every wake.
+    if IDLE_BLANK_S > 0:
+        n = str(int(IDLE_BLANK_S))
+        _run(["xset", "s", n, n])
+        _run(["xset", "dpms", n, n, n])
     return f"xset dpms rc={rc1} ({out1!r}); xset s rc={rc2} ({out2!r})"
 
 
