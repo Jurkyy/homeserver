@@ -1,0 +1,12 @@
+# Installed by bootstrap.sh (install_host_power_policy). See resume.sh.
+[Unit]
+Description=homeserver post-resume fixups (Wi-Fi power save, librespot)
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/homeserver-resume
+TimeoutStartSec=180
+
+[Install]
+WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target

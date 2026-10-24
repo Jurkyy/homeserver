@@ -1,0 +1,14 @@
+# Installed by bootstrap.sh (install_host_power_policy). See wifi-watchdog.sh.
+[Unit]
+Description=Wi-Fi link watchdog (re-activate a silently stalled wlp4s0)
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/homeserver-wifi-watchdog
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target

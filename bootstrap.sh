@@ -532,6 +532,133 @@ PYEOF
     info "Cast endpoint: POST http://<lan-ip>:8765/cast with bearer MEDIACAST_TOKEN"
 }
 
+# Host power policy for the projector box (Wi-Fi only, no Wake-on-LAN).
+#
+# Only mediacast-host's night scheduler (and its deep_sleep API action) may
+# suspend this machine — see docs/projector-cast.md "Night deep sleep". This
+# pins every other idle-suspend path off, keeps the Wi-Fi from power-saving
+# itself into a stall, and installs what the deep-sleep flow needs:
+#   - logind IdleAction=ignore (drop-in)
+#   - xfce4-power-manager: never inactivity-suspend, no lock on suspend
+#   - NetworkManager wifi.powersave=2 (off) + iwlwifi/iwlmvm power save off
+#   - wifi-watchdog.service: re-activates a silently stalled link (the
+#     2026-10-24 outage: associated, but no traffic, no NM event)
+#   - homeserver-resume.service: post-resume Wi-Fi + librespot restart
+#   - scoped NOPASSWD sudo for `systemctl suspend` + `rtcwake` (RTC alarm)
+# Idempotent.
+install_host_power_policy() {
+    if [ -z "$SUDO_USER" ]; then
+        warn "No SUDO_USER — skipping host power policy"
+        return
+    fi
+    info "Installing host power policy (no idle suspend, Wi-Fi power save off, night deep-sleep support)..."
+    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local hp="$script_dir/services/host-power"
+    local user_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    local uid=$(id -u "$SUDO_USER")
+
+    # 1. logind: never act on idle.
+    mkdir -p /etc/systemd/logind.conf.d
+    cat > /etc/systemd/logind.conf.d/10-homeserver-no-idle.conf <<'EOF'
+# Installed by bootstrap.sh (install_host_power_policy). Only mediacast-host's
+# night scheduler suspends this box; logind must never do it on idle.
+[Login]
+IdleAction=ignore
+EOF
+    systemctl kill -s HUP systemd-logind 2>/dev/null || true   # reload config, keeps sessions
+
+    # 2. Wi-Fi power save off (NetworkManager per-connection default + driver).
+    if [ -d /etc/NetworkManager/conf.d ]; then
+        cat > /etc/NetworkManager/conf.d/20-homeserver-wifi-powersave-off.conf <<'EOF'
+# Installed by bootstrap.sh (install_host_power_policy). 2 = disable.
+# iwlwifi power save made the link stall/lag (ping ~280 ms) on this Wi-Fi-only box.
+[connection]
+wifi.powersave = 2
+EOF
+        nmcli general reload conf 2>/dev/null || true
+    fi
+    cat > /etc/modprobe.d/homeserver-iwlwifi.conf <<'EOF'
+# Installed by bootstrap.sh (install_host_power_policy): no Wi-Fi power save.
+options iwlwifi power_save=0
+options iwlmvm power_scheme=1
+EOF
+    for dev in $(iw dev 2>/dev/null | awk '/Interface/{print $2}'); do
+        iw dev "$dev" set power_save off 2>/dev/null || true
+    done
+
+    # 3. Wi-Fi watchdog + post-resume fixups.
+    if command -v iw >/dev/null 2>&1 && command -v nmcli >/dev/null 2>&1; then
+        install -m 0755 "$hp/wifi-watchdog.sh" /usr/local/sbin/homeserver-wifi-watchdog
+        install -m 0644 "$hp/wifi-watchdog.service" /etc/systemd/system/wifi-watchdog.service
+    fi
+    install -m 0755 "$hp/resume.sh" /usr/local/sbin/homeserver-resume
+    install -m 0644 "$hp/homeserver-resume.service" /etc/systemd/system/homeserver-resume.service
+    systemctl daemon-reload
+    systemctl enable homeserver-resume.service >/dev/null 2>&1 || warn "homeserver-resume enable failed"
+    if [ -f /etc/systemd/system/wifi-watchdog.service ]; then
+        systemctl enable --now wifi-watchdog.service >/dev/null 2>&1 || warn "wifi-watchdog enable failed"
+        systemctl restart wifi-watchdog.service 2>/dev/null || true
+    fi
+
+    # 4. Scoped sudo for the deep-sleep flow (mediacast-host runs headless).
+    local systemctl_bin rtcwake_bin
+    systemctl_bin=$(command -v systemctl || echo /usr/bin/systemctl)
+    rtcwake_bin=$(command -v rtcwake || echo /usr/sbin/rtcwake)
+    local sudoers_file=/etc/sudoers.d/mediacast-suspend
+    cat > "$sudoers_file" <<EOF
+# Installed by bootstrap.sh (install_host_power_policy) — lets mediacast-host
+# suspend the box overnight and set the RTC wake alarm. Nothing broader.
+$SUDO_USER ALL=(root) NOPASSWD: $systemctl_bin suspend, $rtcwake_bin -m no -u -t *
+EOF
+    chmod 440 "$sudoers_file"
+    if visudo -cf "$sudoers_file" >/dev/null 2>&1; then
+        success "suspend/rtcwake sudo rule installed for $SUDO_USER"
+    else
+        rm -f "$sudoers_file"
+        warn "suspend sudoers rule failed validation — night deep sleep won't work"
+    fi
+
+    # 5. xfce4-power-manager: never suspend on inactivity, don't lock on
+    # suspend. Written to the channel file (works before first login) and,
+    # if the session is up, applied live via xfconf-query.
+    local power_xml="$user_home/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-power-manager.xml"
+    sudo -u "$SUDO_USER" mkdir -p "$(dirname "$power_xml")"
+    sudo -u "$SUDO_USER" python3 - "$power_xml" <<'PYEOF2'
+import sys
+import xml.etree.ElementTree as ET
+path = sys.argv[1]
+DESIRED = {
+    "inactivity-on-ac": ("uint", "14"),          # 14 = "Never" in xfpm
+    "inactivity-on-battery": ("uint", "14"),
+    "inactivity-sleep-mode-on-ac": ("uint", "1"),  # 1 = suspend (moot: never)
+    "lock-screen-suspend-hibernate": ("bool", "false"),
+}
+try:
+    tree = ET.parse(path); root = tree.getroot()
+except (FileNotFoundError, ET.ParseError):
+    root = ET.Element("channel", {"name": "xfce4-power-manager", "version": "1.0"})
+    tree = ET.ElementTree(root)
+top = root.find("./property[@name='xfce4-power-manager']")
+if top is None:
+    top = ET.SubElement(root, "property", {"name": "xfce4-power-manager", "type": "empty"})
+for name, (ptype, value) in DESIRED.items():
+    prop = top.find(f"./property[@name='{name}']")
+    if prop is None:
+        prop = ET.SubElement(top, "property", {"name": name})
+    prop.set("type", ptype); prop.set("value", value)
+tree.write(path, encoding="UTF-8", xml_declaration=True)
+PYEOF2
+    if [ -S "/run/user/$uid/bus" ]; then
+        local xq="sudo -u $SUDO_USER DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus xfconf-query -c xfce4-power-manager"
+        $xq -p /xfce4-power-manager/inactivity-on-ac -n -t uint -s 14 2>/dev/null || true
+        $xq -p /xfce4-power-manager/inactivity-on-battery -n -t uint -s 14 2>/dev/null || true
+        $xq -p /xfce4-power-manager/inactivity-sleep-mode-on-ac -n -t uint -s 1 2>/dev/null || true
+        $xq -p /xfce4-power-manager/lock-screen-suspend-hibernate -n -t bool -s false 2>/dev/null || true
+    fi
+
+    success "Host power policy installed"
+}
+
 # Install basic tools
 install_basic_tools() {
     info "Installing basic tools..."
@@ -1492,6 +1619,7 @@ main() {
     install_power_tuning
 
     install_projector_session
+    install_host_power_policy
 
     start_services
 
@@ -1520,4 +1648,8 @@ main() {
     echo ""
 }
 
-main "$@"
+# Run only when executed, so single steps can be re-applied with
+#   sudo bash -c 'source ./bootstrap.sh; detect_distro; install_host_power_policy'
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
