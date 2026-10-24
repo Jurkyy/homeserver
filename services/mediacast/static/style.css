@@ -103,6 +103,14 @@ h2 { font-size: 1.05rem; margin: 0 0 .6rem; font-weight: 650; }
   background: rgba(99, 102, 241, .12); border: 1px solid rgba(99, 102, 241, .4);
 }
 
+/* Bedtime countdown + night chip */
+.banner.bedtime { background: rgba(239, 68, 68, .14); border-color: rgba(239, 68, 68, .55); font-weight: 600; font-size: 1.05rem; }
+.night-chip {
+  display: inline-block; margin: 0 0 10px; padding: .3rem .8rem; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--surface); color: var(--muted); font-size: .85rem;
+}
+.night-chip[hidden] { display: none; }
+
 /* Now playing */
 .now-main { display: flex; gap: 14px; align-items: center; min-width: 0; }
 .art {

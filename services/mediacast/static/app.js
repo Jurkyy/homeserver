@@ -147,6 +147,8 @@
     $('power-banner').classList.toggle('hidden', !(asleep || screenOff));
     $('power-text').textContent = asleep ? 'Projector is asleep' : 'Screen is off';
 
+    renderNight();
+
     // Now playing
     const idle = s.activity === 'idle' || !s.activity;
     $('now-activity').textContent = ACTIVITY[s.activity] || s.activity || '';
@@ -233,6 +235,49 @@
     $('sp-time').textContent = dur ? `${fmtTime(pos)} / ${fmtTime(dur)}` : '';
   }
 
+  // ---------------------------------------------------------------- night deep sleep
+
+  // `state.night` is null/absent on older hosts; tolerate partial objects too.
+  function nightInfo() {
+    const n = state && state.night;
+    return n && typeof n === 'object' ? n : null;
+  }
+
+  function fmtClock(ms) {
+    const d = new Date(ms);
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  }
+
+  function renderNight() {
+    const n = nightInfo();
+    const chip = $('night-chip');
+    if (n && n.enabled) {
+      let t = `🌙 Deep sleep ${n.start || '?'}–${n.end || '?'}`;
+      if (n.pending && n.in_window) {
+        t += ' · pending';
+        if (typeof n.next_check_at === 'number' && n.next_check_at > Date.now()) t += ` · next check ${fmtClock(n.next_check_at)}`;
+      }
+      chip.textContent = t;
+      chip.hidden = false;
+    } else {
+      chip.hidden = true;
+    }
+    renderBedtime();
+  }
+
+  // Countdown banner; ticked locally every second while it runs.
+  function renderBedtime() {
+    const n = nightInfo();
+    const until = n && typeof n.countdown_until === 'number' ? n.countdown_until : 0;
+    const left = Math.ceil((until - Date.now()) / 1000);
+    const on = left > 0;
+    $('bedtime-banner').classList.toggle('hidden', !on);
+    if (on) $('bedtime-text').textContent = `🌙 Going to sleep in ${left}s`;
+  }
+  setInterval(() => { if (state) renderBedtime(); }, 1000);
+
+  $('bedtime-cancel').addEventListener('click', () => act('POST', '/power', { action: 'bedtime_cancel' }, 'Bedtime postponed'));
+
   // Local tick between pushes (no polling — just re-render the clock).
   setInterval(() => {
     if (document.hidden || !state) return;
@@ -310,7 +355,7 @@
 
   // ---------------------------------------------------------------- power
 
-  const POWER_MSG = { sleep: 'Going to sleep', wake: 'Waking up', screen_off: 'Screen off', poweroff: 'Server shutting down' };
+  const POWER_MSG = { sleep: 'Going to sleep', wake: 'Waking up', screen_off: 'Screen off', deep_sleep: 'Server going to deep sleep', poweroff: 'Server shutting down' };
   document.querySelectorAll('[data-power]').forEach((b) => {
     b.addEventListener('click', () => {
       const action = b.dataset.power;
@@ -318,6 +363,11 @@
         'Power off the WHOLE SERVER?\n\nThis shuts down the machine, not just the projector: ' +
         'mrpflix, Home Assistant, music and this page all go down. ' +
         'Only pressing the physical power button brings it back.')) return;
+      if (action === 'deep_sleep') {
+        const n = nightInfo();
+        if (!confirm('Put the server into deep sleep? Spotify and this app will be unreachable until you move the mouse, ' +
+          `press the power button, or ${(n && n.end) || '08:00'}.`)) return;
+      }
       act('POST', '/power', { action }, POWER_MSG[action]);
     });
   });

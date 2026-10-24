@@ -28,6 +28,11 @@
     <button type="button" class="btn primary" id="wake-btn">Wake</button>
   </div>
 
+  <div class="banner bedtime hidden" id="bedtime-banner" role="alert">
+    <span id="bedtime-text">Going to sleep</span>
+    <button type="button" class="btn primary" id="bedtime-cancel">Cancel</button>
+  </div>
+
   <!-- Now playing -->
   <section class="card now" id="now" aria-labelledby="now-h">
     <h2 id="now-h" class="sr-only">Now playing</h2>
@@ -131,10 +136,12 @@
   <!-- Power -->
   <section class="section" aria-labelledby="pw-h">
     <h2 id="pw-h">Power</h2>
+    <p class="night-chip" id="night-chip" hidden></p>
     <div class="btn-row">
       <button type="button" class="btn" data-power="sleep">Sleep</button>
       <button type="button" class="btn" data-power="wake">Wake</button>
       <button type="button" class="btn" data-power="screen_off">Screen off</button>
+      <button type="button" class="btn" data-power="deep_sleep">Deep sleep</button>
       <button type="button" class="btn danger" data-power="poweroff">Power off server</button>
     </div>
   </section>
