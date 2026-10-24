@@ -1,5 +1,8 @@
 package dev.woto.homeserver.data
 
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import kotlinx.serialization.EncodeDefault
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
@@ -22,6 +25,8 @@ data class ServerState(
     val item: PlayingItem? = null,
     val screensaver: ScreensaverState? = null,
     val spotify: SpotifyState? = null,
+    /** Overnight deep sleep (real suspend); null on older hosts. */
+    val night: NightState? = null,
     @SerialName("updated_at") val updatedAt: Long = 0,
 ) {
     val isSleeping: Boolean get() = power == "sleeping"
@@ -65,6 +70,51 @@ data class SpotifyState(
         val pos = if (playing && updatedAt > 0) p + (nowMs - updatedAt).coerceAtLeast(0) / 1000.0 else p
         val d = durationS
         return if (d != null && d > 0) pos.coerceIn(0.0, d) else pos.coerceAtLeast(0.0)
+    }
+}
+
+/** `state.night`: overnight deep-sleep schedule and any running bedtime countdown (docs/api-v1.md). */
+@Serializable
+data class NightState(
+    val enabled: Boolean = false,
+    /** Local "HH:MM". */
+    val start: String? = null,
+    /** Local "HH:MM". */
+    val end: String? = null,
+    @SerialName("in_window") val inWindow: Boolean = false,
+    val pending: Boolean = false,
+    /** Unix ms of the next idle check, or null. */
+    @SerialName("next_check_at") val nextCheckAt: Long? = null,
+    /** Unix ms when a running "going to sleep" countdown suspends the box, or null. */
+    @SerialName("countdown_until") val countdownUntil: Long? = null,
+) {
+    /** Wake time shown to the user; the host defaults to 08:00. */
+    val endLabel: String get() = end?.takeIf { it.isNotBlank() } ?: DEFAULT_END
+
+    /** Whole seconds left on the bedtime countdown (rounded up), or null when none is running at [nowMs]. */
+    fun countdownSecondsLeft(nowMs: Long): Long? {
+        val until = countdownUntil ?: return null
+        val left = until - nowMs
+        return if (left > 0) (left + 999) / 1000 else null
+    }
+
+    /** Chip text, e.g. "🌙 Deep sleep 23:00–08:00 · pending · next check 01:00"; null when disabled. */
+    fun chipLabel(zone: ZoneId = ZoneId.systemDefault()): String? {
+        if (!enabled) return null
+        val sb = StringBuilder("\uD83C\uDF19 Deep sleep")
+        val st = start?.takeIf { it.isNotBlank() }
+        if (st != null) sb.append(' ').append(st).append('\u2013').append(endLabel)
+        if (pending && inWindow) {
+            sb.append(" · pending")
+            nextCheckAt?.let { sb.append(" · next check ").append(formatClock(it, zone)) }
+        }
+        return sb.toString()
+    }
+
+    companion object {
+        const val DEFAULT_END = "08:00"
+        private val CLOCK = DateTimeFormatter.ofPattern("HH:mm")
+        fun formatClock(ms: Long, zone: ZoneId): String = Instant.ofEpochMilli(ms).atZone(zone).format(CLOCK)
     }
 }
 

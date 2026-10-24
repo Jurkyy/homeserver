@@ -41,6 +41,7 @@ import androidx.compose.material.icons.rounded.Forward10
 import androidx.compose.material.icons.rounded.Forward30
 import androidx.compose.material.icons.rounded.LightMode
 import androidx.compose.material.icons.rounded.MusicNote
+import androidx.compose.material.icons.rounded.NightsStay
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.PowerSettingsNew
@@ -98,6 +99,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import dev.woto.homeserver.AppGraph
 import dev.woto.homeserver.data.ConnectionStatus
+import dev.woto.homeserver.data.NightState
 import dev.woto.homeserver.data.ServerState
 import dev.woto.homeserver.data.SpotifyState
 import dev.woto.homeserver.data.StateSnapshot
@@ -160,6 +162,7 @@ fun RemoteScreen(graph: AppGraph, onOpenSettings: () -> Unit) {
 
 @Composable
 private fun Extras(graph: AppGraph, state: ServerState) {
+    state.night?.let { NightSection(graph, it) }
     state.spotify?.takeIf { it.active }?.let { SpotifyCard(it) }
     ScreensaverSection(graph, state)
     PowerSection(graph, state)
@@ -519,8 +522,57 @@ private fun ScreensaverSection(graph: AppGraph, s: ServerState) {
 }
 
 @Composable
+private fun NightSection(graph: AppGraph, night: NightState) {
+    val haptic = rememberHaptic()
+    val until = night.countdownUntil
+    // Tick locally once a second while a bedtime countdown is running.
+    val now by produceState(System.currentTimeMillis(), until) {
+        value = System.currentTimeMillis()
+        while (until != null && value < until) {
+            delay(1000 - (System.currentTimeMillis() % 1000))
+            value = System.currentTimeMillis()
+        }
+    }
+    val secondsLeft = night.countdownSecondsLeft(now)
+    val chip = night.chipLabel()
+    if (secondsLeft == null && chip == null) return
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        if (secondsLeft != null) {
+            Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer),
+                shape = RoundedCornerShape(24.dp),
+            ) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Rounded.NightsStay, null, Modifier.size(32.dp), tint = MaterialTheme.colorScheme.onTertiaryContainer)
+                    Spacer(Modifier.width(16.dp))
+                    Text(
+                        "Going to sleep in ${secondsLeft}s",
+                        style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Button(onClick = { haptic(true); graph.actions.power("bedtime_cancel") }) { Text("Cancel") }
+                }
+            }
+        }
+        if (chip != null) {
+            Surface(shape = CircleShape, color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.8f)) {
+                Text(
+                    chip,
+                    style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun PowerSection(graph: AppGraph, s: ServerState) {
     var confirmPowerOff by remember { mutableStateOf(false) }
+    var confirmDeepSleep by remember { mutableStateOf(false) }
     val haptic = rememberHaptic()
     Column {
         SectionTitle("Power")
@@ -542,6 +594,26 @@ private fun PowerSection(graph: AppGraph, s: ServerState) {
                 Icon(Icons.Rounded.PowerSettingsNew, null); Spacer(Modifier.width(8.dp)); Text("Power off")
             }
         }
+        OutlinedButton(onClick = { confirmDeepSleep = true }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+            Icon(Icons.Rounded.NightsStay, null); Spacer(Modifier.width(8.dp)); Text("Deep sleep")
+        }
+    }
+    if (confirmDeepSleep) {
+        val wakeAt = s.night?.endLabel ?: NightState.DEFAULT_END
+        AlertDialog(
+            onDismissRequest = { confirmDeepSleep = false },
+            icon = { Icon(Icons.Rounded.NightsStay, null) },
+            title = { Text("Deep sleep") },
+            text = {
+                Text("Put the server into deep sleep? Spotify and this app will be unreachable until you move the mouse, press the power button, or $wakeAt.")
+            },
+            confirmButton = {
+                TextButton(onClick = { confirmDeepSleep = false; haptic(true); graph.actions.power("deep_sleep") }) {
+                    Text("Deep sleep", fontWeight = FontWeight.SemiBold)
+                }
+            },
+            dismissButton = { TextButton(onClick = { confirmDeepSleep = false }) { Text("Cancel") } },
+        )
     }
     if (confirmPowerOff) {
         AlertDialog(

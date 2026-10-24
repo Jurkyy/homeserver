@@ -5,6 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import java.time.ZoneOffset
 import org.junit.Test
 
 class ModelParsingTest {
@@ -151,5 +152,66 @@ class ModelParsingTest {
     fun encodesJellyfinPlay() {
         assertEquals("""{"id":"a","resume":true}""", RequestJson.encodeToString(JfPlayRequest.serializer(), JfPlayRequest("a", true)))
         assertEquals("""{"id":"a","resume":false,"low_quality":true}""", RequestJson.encodeToString(JfPlayRequest.serializer(), JfPlayRequest("a", false, true)))
+    }
+
+    private fun night(json: String): ServerState = AppJson.decodeFromString(ServerState.serializer(), json)
+
+    @Test
+    fun nightAbsentOrNullIsNull() {
+        assertNull(night("""{"power":"on"}""").night)
+        assertNull(night("""{"power":"on","night":null}""").night)
+    }
+
+    @Test
+    fun parsesFullNight() {
+        val n = night(
+            """{"night":{"enabled":true,"start":"23:00","end":"08:00","in_window":true,"pending":true,
+                "next_check_at":1761343200000,"countdown_until":null}}""",
+        ).night!!
+        assertTrue(n.enabled)
+        assertEquals("23:00", n.start)
+        assertEquals("08:00", n.end)
+        assertTrue(n.inWindow)
+        assertTrue(n.pending)
+        assertEquals(1761343200000, n.nextCheckAt)
+        assertNull(n.countdownUntil)
+        assertNull(n.countdownSecondsLeft(0))
+        // 1761343200000 = 2025-10-24T22:00:00Z
+        assertEquals("\uD83C\uDF19 Deep sleep 23:00\u201308:00 · pending · next check 22:00", n.chipLabel(ZoneOffset.UTC))
+    }
+
+    @Test
+    fun toleratesPartialAndNullNightFields() {
+        val n = night("""{"night":{"enabled":true,"start":null,"in_window":null,"next_check_at":null}}""").night!!
+        assertTrue(n.enabled)
+        assertNull(n.start)
+        assertNull(n.end)
+        assertFalse(n.inWindow)
+        assertFalse(n.pending)
+        assertNull(n.nextCheckAt)
+        assertEquals("08:00", n.endLabel)
+        assertEquals("\uD83C\uDF19 Deep sleep", n.chipLabel(ZoneOffset.UTC))
+
+        val empty = night("""{"night":{}}""").night!!
+        assertFalse(empty.enabled)
+        assertNull(empty.chipLabel(ZoneOffset.UTC))
+    }
+
+    @Test
+    fun chipShowsPendingOnlyInsideWindow() {
+        val n = NightState(enabled = true, start = "23:00", end = "07:30", inWindow = false, pending = true)
+        assertEquals("\uD83C\uDF19 Deep sleep 23:00\u201307:30", n.chipLabel(ZoneOffset.UTC))
+        assertEquals("\uD83C\uDF19 Deep sleep 23:00\u201307:30 · pending", n.copy(inWindow = true).chipLabel(ZoneOffset.UTC))
+    }
+
+    @Test
+    fun countdownSecondsLeft() {
+        val n = night("""{"night":{"enabled":true,"countdown_until":1700000060000}}""").night!!
+        assertEquals(1700000060000, n.countdownUntil)
+        assertEquals(60L, n.countdownSecondsLeft(1700000000000))
+        assertEquals(1L, n.countdownSecondsLeft(1700000059999))
+        assertEquals(2L, n.countdownSecondsLeft(1700000058500))
+        assertNull(n.countdownSecondsLeft(1700000060000))
+        assertNull(n.countdownSecondsLeft(1700000099000))
     }
 }
