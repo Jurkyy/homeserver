@@ -8,13 +8,28 @@
 # until a reboot. NetworkManager only reacts to a *disassociation*, so this
 # pings the default gateway and, when it stops answering, re-activates the
 # connection (then, if that doesn't help, reloads the driver).
+#
+# Second failure mode (2026-10-24, AP 5 GHz BSSID on DFS ch 120): unicast to
+# the gateway worked but *no broadcast/multicast frame* from any other host
+# arrived — phones' ARP for us never got through (LAN "Destination Host
+# Unreachable"), mDNS / Spotify Connect discovery broke. The iwlwifi netdev
+# multicast counter is always 0, so it can't be used; instead, every
+# ~MCAST_EVERY checks we sniff for one broadcast/multicast frame not sent by
+# us (a home LAN emits ARP/mDNS/SSDP every few seconds). Several silent
+# windows in a row → re-activate the connection.
 set -u
 IFACE="${WIFI_WATCHDOG_IFACE:-wlp4s0}"
 INTERVAL="${WIFI_WATCHDOG_INTERVAL:-20}"
 FAILS_RECONNECT="${WIFI_WATCHDOG_FAILS_RECONNECT:-3}"   # ~1 min of dead link
 FAILS_RELOAD="${WIFI_WATCHDOG_FAILS_RELOAD:-9}"         # ~3 min
 
+MCAST_EVERY="${WIFI_WATCHDOG_MCAST_EVERY:-5}"            # ~every 100 s
+MCAST_WINDOW="${WIFI_WATCHDOG_MCAST_WINDOW:-45}"        # s to wait for one frame
+MCAST_FAILS="${WIFI_WATCHDOG_MCAST_FAILS:-3}"           # silent windows → reconnect
+
 fails=0
+mcast_fails=0
+n=0
 log() { echo "wifi-watchdog: $*"; }
 
 while true; do
@@ -26,6 +41,23 @@ while true; do
     elif ping -c 3 -i 0.3 -W 2 -I "$IFACE" "$gw" >/dev/null 2>&1; then
         [ "$fails" -gt 0 ] && log "gateway $gw reachable again after $fails failed checks"
         fails=0
+        n=$((n + 1))
+        if [ $((n % MCAST_EVERY)) -eq 0 ] && command -v tcpdump >/dev/null 2>&1; then
+            mac=$(cat "/sys/class/net/$IFACE/address" 2>/dev/null)
+            if timeout "$MCAST_WINDOW" tcpdump -i "$IFACE" -c 1 -nn -q -p \
+                    "(ether broadcast or ether multicast) and not ether src $mac" >/dev/null 2>&1; then
+                [ "$mcast_fails" -gt 0 ] && log "broadcast/multicast frames arriving again"
+                mcast_fails=0
+            else
+                mcast_fails=$((mcast_fails + 1))
+                log "no broadcast/multicast frame from the LAN in ${MCAST_WINDOW}s ($mcast_fails/$MCAST_FAILS)"
+                if [ "$mcast_fails" -ge "$MCAST_FAILS" ]; then
+                    log "broadcast path dead — re-activating $IFACE via NetworkManager"
+                    nmcli device connect "$IFACE" || log "nmcli device connect failed"
+                    mcast_fails=0
+                fi
+            fi
+        fi
         continue
     else
         fails=$((fails + 1))

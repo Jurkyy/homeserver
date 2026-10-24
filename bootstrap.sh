@@ -577,6 +577,32 @@ wifi.powersave = 2
 EOF
         nmcli general reload conf 2>/dev/null || true
     fi
+    # Pin the Wi-Fi connection to 2.4 GHz. On 2026-10-24 the AP's 5 GHz
+    # BSSID (DFS ch 120) delivered no broadcast/multicast frames to this
+    # box at all — phones' ARP for it never arrived (LAN "Destination Host
+    # Unreachable"), mDNS/Spotify Connect discovery broke — and a radar
+    # channel switch had already dropped the link once. 2.4 GHz (ch 6)
+    # worked immediately. Pin the band (not a BSSID) so roaming between
+    # 2.4 GHz APs still works; HOMESERVER_WIFI_BAND= (empty) to skip.
+    # Takes effect on the next (re)connect — not forced here, so running
+    # this over SSH-on-Wi-Fi doesn't cut the session.
+    local wifi_band="${HOMESERVER_WIFI_BAND-bg}"
+    if command -v nmcli >/dev/null 2>&1; then
+        local wdev wcon
+        for wdev in $(nmcli -g DEVICE,TYPE device 2>/dev/null | awk -F: '$2=="wifi"{print $1}'); do
+            wcon=$(nmcli -g GENERAL.CONNECTION device show "$wdev" 2>/dev/null)
+            [ -n "$wcon" ] || continue
+            if [ -n "$wifi_band" ]; then
+                nmcli connection modify "$wcon" 802-11-wireless.band "$wifi_band" \
+                    802-11-wireless.bssid "" 802-11-wireless.powersave 2 \
+                    && success "Wi-Fi '$wcon' ($wdev): band=$wifi_band, no BSSID pin, powersave off" \
+                    || warn "nmcli modify of '$wcon' failed"
+            else
+                nmcli connection modify "$wcon" 802-11-wireless.powersave 2 || true
+            fi
+        done
+    fi
+    install_packages tcpdump   # wifi-watchdog's broadcast/multicast check
     cat > /etc/modprobe.d/homeserver-iwlwifi.conf <<'EOF'
 # Installed by bootstrap.sh (install_host_power_policy): no Wi-Fi power save.
 options iwlwifi power_save=0

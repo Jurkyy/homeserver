@@ -256,10 +256,27 @@ timing out; librespot couldn't load the next track) until a reboot.
 (NetworkManager `wifi.powersave = 2` + iwlwifi/iwlmvm module options) and
 installs `wifi-watchdog.service`: it pings the gateway every 20 s, after
 ~1 min of silence re-activates the connection (`nmcli device connect`),
-after ~3 min reloads the driver. The AP's 5 GHz radio sits on DFS channel
-120 (5600 MHz); a radar channel switch already dropped the link once
-("driver channel switch failed"), so a non-DFS channel (36–48) on the
-router is more robust.
+after ~3 min reloads the driver.
+
+Second, worse failure on the AP's 5 GHz BSSID (DFS channel 120, 5600 MHz):
+unicast to the gateway worked, but the box received **zero
+broadcast/multicast frames** (tcpdump: nothing not sent by itself). Phones'
+ARP requests for 192.168.0.22 never arrived ("Destination Host
+Unreachable" from the LAN, while a host the server talked to first still
+worked), and mDNS / Spotify Connect discovery broke. A reconnect didn't
+help; 2.4 GHz (channel 6) fixed it at once. A radar channel switch on that
+channel had also dropped the link earlier ("driver channel switch failed").
+So:
+
+- `install_host_power_policy` pins the Wi-Fi connection (name detected via
+  nmcli) to `802-11-wireless.band bg`, clears any BSSID pin, keeps
+  `powersave 2`. Applies on the next (re)connect. `HOMESERVER_WIFI_BAND=`
+  (empty) skips the band pin.
+- The watchdog also checks the broadcast path: every ~100 s it waits up to
+  45 s for one broadcast/multicast frame from another host (`tcpdump -c 1`;
+  a home LAN emits ARP/mDNS/SSDP every few seconds — the netdev multicast
+  counter is always 0 on iwlwifi, so it can't be used). Three silent
+  windows in a row → `nmcli device connect`.
 
 ## Screensaver
 
