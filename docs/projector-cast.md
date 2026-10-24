@@ -204,10 +204,62 @@ Hotplug findings (GTX 970, nvidia 550, `nvidia_drm` loaded without
 DPMS changes nor otherwise — so sysfs/udev can't see the projector. The
 NVIDIA X driver does update RandR on an HDMI hotplug interrupt, so while
 dormant the helper polls `xrandr --current` (no re-probe, cheap) every
-3 s and wakes when an output newly reports `connected`. Whether that
-fires depends on the projector dropping HPD in standby; it couldn't be
-power-cycled during development, so this path is untested. No HDMI-CEC
-on this GPU.
+3 s and wakes when an output newly reports `connected` **after having
+been disconnected for at least `MEDIACAST_HOTPLUG_MIN_ABSENT_S` (20 s)**.
+Observed 2026-10-23: ~90 s after soft sleep the projector, going to
+standby on no signal, blips HPD (`HDMI-0` gone → back 3 s later). That
+used to count as a wake, so the box was silently "on" again and the idle
+screensaver started in the dark room 15 min later. No HDMI-CEC on this GPU.
+
+## Night deep sleep
+
+Soft sleep only blanks the display; overnight the box now really
+suspends (S3) and comes back by itself in the morning. Configured in
+`.env` (`NIGHT_DEEP_SLEEP=1`, `NIGHT_START=23:00`, `NIGHT_END=08:00`,
+`NIGHT_RECHECK_MIN=60`, see `.env.example`), run by the host helper:
+
+- At `NIGHT_START`: if idle (no cast playing/paused — the screensaver
+  doesn't count — and Spotify not playing; soft sleep is idle) a 60 s
+  countdown overlay appears on the projector ("Going to sleep — move the
+  mouse or press Wake to cancel"), then `rtcwake -m no -u -t <next
+  NIGHT_END>` + `systemctl suspend` (scoped sudo rule from bootstrap).
+- If busy: a ~8 s "Bedtime 🌙 — I'll sleep once you're done" overlay
+  (mpv OSD for mpv casts, a DOM overlay injected over CDP for Firefox;
+  Spotify-only just logs), then a re-check every hour. Cancelling the
+  countdown (mouse/keyboard, Wake, portal/app Cancel, any cast) postpones
+  to the next check.
+- Spotify detection: an uncorked librespot stream in PulseAudio, plus the
+  container forwarding `state.spotify` to the helper (`POST /spotify`).
+- Wake: RTC alarm at `NIGHT_END` (comes back soft-sleeping, projector
+  stays dark), mouse/keyboard (USB wakeup enabled on the mouse) or the
+  power button (comes back on). The helper detects the resume itself
+  (CLOCK_BOOTTIME vs CLOCK_MONOTONIC gap) and restores its state;
+  `homeserver-resume.service` turns Wi-Fi power save off again and
+  restarts librespot once the gateway answers.
+- Woken mid-night: the same flow re-arms after the normal idle period
+  (`NIGHT_GRACE_MIN`, default 15), never instantly. The idle screensaver
+  never auto-starts inside the night window.
+- Portal / app: 🌙 chip with the window and "pending", a countdown banner
+  with Cancel (`bedtime_cancel`) and a "Deep sleep" button
+  (`deep_sleep`: suspend now until `NIGHT_END`).
+- Nothing else may suspend the box: `install_host_power_policy` pins
+  logind `IdleAction=ignore` and xfce4-power-manager inactivity to
+  "never".
+
+## Wi-Fi
+
+The box is Wi-Fi only (Intel 7260 / iwlwifi), so there's no Wake-on-LAN.
+On 2026-10-24 the link silently stopped passing traffic for ~25 min
+(associated, no NetworkManager/wpa_supplicant event; DNS to the router
+timing out; librespot couldn't load the next track) until a reboot.
+`install_host_power_policy` therefore turns Wi-Fi power save off
+(NetworkManager `wifi.powersave = 2` + iwlwifi/iwlmvm module options) and
+installs `wifi-watchdog.service`: it pings the gateway every 20 s, after
+~1 min of silence re-activates the connection (`nmcli device connect`),
+after ~3 min reloads the driver. The AP's 5 GHz radio sits on DFS channel
+120 (5600 MHz); a radar channel switch already dropped the link once
+("driver channel switch failed"), so a non-DFS channel (36–48) on the
+router is more robust.
 
 ## Screensaver
 
@@ -230,6 +282,14 @@ Waterfall, 🔥 Fire by default) and a "⏻ Screen off" button.
   theme URLs — any http(s) URL the normal cast path can play, not just
   YouTube) via `MEDIACAST_SCREENSAVER_*` in `.env` — see `.env.example`.
   Nothing needs to be set for the defaults to work.
+- The screensaver is silent from its first frame: the helper mutes
+  Firefox's PulseAudio stream while it shows (10 Hz guard right after
+  start; stream-restore then creates the next Firefox stream muted), the
+  element is muted + volume-locked over CDP, and mpv gets `--mute=yes`.
+  Raising the volume during a screensaver unmutes it; a real cast keeps
+  Firefox's stream unmuted.
+- The idle screensaver never auto-starts while soft-sleeping or inside
+  the night deep-sleep window.
 - If the screensaver video ends on its own it is detected and restarted
   (at most every 5 min).
 - State (power, screen, what's playing, screensaver) lives entirely on

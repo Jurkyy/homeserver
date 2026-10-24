@@ -310,6 +310,7 @@ _OFFLINE_STATE = {
     "subtitle": None, "artwork_url": None, "position_s": None, "duration_s": None,
     "volume": 0, "muted": False, "item": None,
     "screensaver": {"active": False, "theme": None, "themes": [], "idle_minutes": 0},
+    "night": None,
     "updated_at": 0,
 }
 
@@ -515,14 +516,14 @@ async def api_screensaver(req: V1Screensaver) -> dict:
 
 @api.post("/power", dependencies=authed)
 async def api_power(req: V1Power, request: Request) -> dict:
-    if req.action not in ("sleep", "wake", "screen_off", "poweroff"):
+    if req.action not in ("sleep", "wake", "screen_off", "deep_sleep", "bedtime_cancel", "poweroff"):
         raise ApiError(400, f"unknown power action {req.action!r}", "bad_action")
     client = request.client.host if request.client else "?"
-    if req.action == "poweroff":
-        logger.warning("POWEROFF requested from=%s", client)
+    if req.action in ("poweroff", "deep_sleep"):
+        logger.warning("%s requested from=%s", req.action.upper(), client)
     else:
         logger.info("power %s from=%s", req.action, client)
-    if req.action in ("sleep", "screen_off"):
+    if req.action in ("sleep", "screen_off", "deep_sleep"):
         await _jf_stop_session()
     await _host_post("/power", {"action": req.action}, timeout=15)
     return {"ok": True}
@@ -612,7 +613,29 @@ async def api_spotify_event(ev: SpotifyEvent) -> dict:
     sp["updated_at"] = now_ms
     _spotify = sp
     _broadcast()
+    # The host helper's night deep-sleep idle check needs to know whether
+    # Spotify is playing (it also watches PulseAudio, this is the fallback).
+    _bg(_host_spotify(sp))
     return {"ok": True}
+
+
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def _bg(coro) -> None:
+    t = asyncio.create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+
+
+async def _host_spotify(sp: dict) -> None:
+    try:
+        await http().post(f"{HOST_BASE}/spotify", headers=_HOST_AUTH, timeout=5, json={
+            "playing": bool(sp.get("playing")), "updated_at": sp.get("updated_at"),
+            "position_s": sp.get("position_s"), "duration_s": sp.get("duration_s"),
+        })
+    except httpx.HTTPError as exc:
+        logger.debug("host /spotify push failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------

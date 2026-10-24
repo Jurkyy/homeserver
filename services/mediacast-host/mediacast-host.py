@@ -24,6 +24,7 @@ and survives Python upgrades without breaking.
 from __future__ import annotations
 
 import base64
+import datetime
 import glob
 import hmac
 import json
@@ -332,6 +333,9 @@ def open_in_mpv(
         # showing — see _effective_volume.
         f"--volume={_effective_volume()}",
     ]
+    if _screensaver_silent():
+        # Screensaver: muted from the very first frame, not just volume 0.
+        args.append("--mute=yes")
     if start and start > 0:
         # Resume offset (Jellyfin "continue watching"). mpv seeks before
         # the first frame; for Jellyfin HLS transcodes the server restarts
@@ -755,6 +759,9 @@ def _mc_lock_volume_js(v_expr: str, desired_expr: str) -> str:
         f"get(){{return d.get.call({v_expr});}},"
         f"set(x){{d.set.call({v_expr},{v_expr}.__mcVol);}}}});"
         f"}}"
+        # Silent screensaver: also hard-mute the element (every poll — a
+        # mute is cheap and YouTube may unmute on its own player re-init).
+        + (f"{v_expr}.muted=true;" if _screensaver_silent() else "")
     )
 
 
@@ -768,6 +775,7 @@ def _mc_set_volume_js(v_expr: str, pct_expr: str) -> str:
         f"{v_expr}.__mcVol=Math.max(0,Math.min(1,({pct_expr})/100));"
         f"{v_expr}.__mcDesc.set.call({v_expr},{v_expr}.__mcVol);"
         f"}}else{{{v_expr}.volume=Math.max(0,Math.min(1,({pct_expr})/100));}}"
+        f"if(({pct_expr})>0){v_expr}.muted=false;"
     )
 
 
@@ -1464,6 +1472,10 @@ def control_volume(*, absolute: int | None = None, delta: int | None = None) -> 
     """Set or nudge the portal's remembered cast volume, applying it live
     to whichever backend is currently playing (see _desired_volume)."""
     global _desired_volume
+    with _state_lock:
+        if _state["screensaver"] and ((absolute is not None and int(absolute) > 0)
+                                      or (delta is not None and int(delta) > 0)):
+            _state["ss_sound"] = True   # explicit request for screensaver sound
     if absolute is not None:
         _desired_volume = max(0, min(100, int(absolute)))
     elif delta is not None:
@@ -1660,6 +1672,9 @@ STATE_POLL_INTERVAL = float(os.environ.get("MEDIACAST_STATE_POLL_INTERVAL", "1.0
 # While sleeping / screen-off: how often to look for the projector being
 # (re)connected via `xrandr --current` (cheap, no re-probe).
 HOTPLUG_POLL_INTERVAL = float(os.environ.get("MEDIACAST_HOTPLUG_POLL_INTERVAL", "3.0"))
+# An output must have been disconnected at least this long before its
+# reconnect counts as a hotplug wake (filters the projector's standby blip).
+HOTPLUG_MIN_ABSENT_S = float(os.environ.get("MEDIACAST_HOTPLUG_MIN_ABSENT_S", "20"))
 # A cast with no readable playback for this long (after this many
 # consecutive empty polls) is considered over.
 MEDIA_GRACE_S = 30.0
@@ -1671,6 +1686,7 @@ _state_lock = threading.Lock()
 _state: dict = {
     "screensaver": None,       # theme key currently showing, or None
     "screensaver_since": 0.0,  # when it started (auto-sleep timer)
+    "ss_sound": False,         # user raised the volume during this screensaver
     "screen_off": False,       # display explicitly turned off via screen_off
     "screen_off_at": 0.0,
     "power": "on",             # "on" | "sleeping" (soft sleep)
@@ -1698,10 +1714,15 @@ def _effective_volume() -> int:
     _cdp_set_volume calls bypass this and move the real element volume;
     this only governs the level a *freshly appearing* video element
     gets locked to."""
-    with _state_lock:
-        if _state["screensaver"]:
-            return 0
+    if _screensaver_silent():
+        return 0
     return _desired_volume
+
+
+def _screensaver_silent() -> bool:
+    """A screensaver is showing and nobody has turned its sound up."""
+    with _state_lock:
+        return bool(_state["screensaver"]) and not _state["ss_sound"]
 
 
 def _yt_artwork(vid: str | None) -> str | None:
@@ -1888,12 +1909,33 @@ class _XMonitor:
         self.ok = True
 
     def _ensure(self) -> bool:
+        """Connect to X lazily, retrying with backoff (1 s → 30 s).
+
+        At boot the user manager (linger) can start us before lightdm has
+        written a valid ~/.Xauthority ("Invalid MIT-MAGIC-COOKIE-1 key");
+        the unit's ExecStartPre waits for X, and this keeps retrying in
+        case X goes away/comes back later instead of running degraded.
+        (A connection *lost* mid-run makes Xlib exit() the process;
+        systemd restarts us and ExecStartPre waits for X again.)"""
         if not self.ok:
             return False
         if self.d is None:
+            now = time.monotonic()
+            if now < getattr(self, "next_try", 0.0):
+                return False
             d = self.x11.XOpenDisplay(None)
             if not d:
+                self.backoff = min(30.0, getattr(self, "backoff", 0.5) * 2)
+                self.next_try = now + self.backoff
+                if not getattr(self, "warned", False):
+                    LOG.warning("X display %s not available yet — retrying with backoff",
+                                os.environ.get("DISPLAY", "?"))
+                    self.warned = True
                 return False
+            if getattr(self, "warned", False):
+                LOG.info("X display connected")
+            self.warned = False
+            self.backoff = 0.5
             self.d = d
             self.root = self.x11.XDefaultRootWindow(d)
             self.info = self.xss.XScreenSaverAllocInfo()
@@ -1994,6 +2036,7 @@ def _build_snapshot() -> dict:
     if live and snap["activity"] != "idle":
         snap["position_s"] = _round(pb.get("position"))
         snap["duration_s"] = _round(pb.get("duration"))
+    snap["night"] = _night_snapshot()
     return snap
 
 
@@ -2022,6 +2065,7 @@ def _wait_state(since: int, timeout: float) -> dict:
 def _clear_media_locked() -> None:
     _state["media"] = None
     _state["screensaver"] = None
+    _state["ss_sound"] = False
     _pb.clear()
 
 
@@ -2063,6 +2107,7 @@ def _mark_awake_locked() -> bool:
 def do_wake(reason: str) -> None:
     with _state_lock:
         was = _mark_awake_locked()
+    _night_cancel(f"wake:{reason}")
     out = wake_display()
     LOG.info("wake reason=%s (was dormant=%s) %s", reason, was, out)
     _publish()
@@ -2158,7 +2203,7 @@ def _screensaver_watchdog() -> None:
             dormant = _state["screen_off"] or _state["power"] == "sleeping"
             already = _state["screensaver"]
             woke_at = _state["woke_at"]
-        if dormant or already or _activity_live():
+        if dormant or already or _activity_live() or _night_blocks_screensaver():
             idle_since = None
             continue
         now = time.time()
@@ -2276,7 +2321,20 @@ def _poll_dormant(now: float, state: dict, xmon: _XMonitor, idle: int | None) ->
         outs = _connected_outputs()
         before = _poller_mem.get("outputs")
         if outs is not None:
-            if before is not None and outs - before and settled:
+            gone = _poller_mem.setdefault("outputs_gone", {})
+            for o in (before or set()) - outs:
+                gone[o] = now
+            back = outs - before if before is not None else set()
+            # The projector itself blips HPD (disconnect → reconnect ~3 s
+            # later) about 90 s after losing signal, as it goes to standby —
+            # that spurious "hotplug" woke the box on 2026-10-23 and the idle
+            # screensaver started in the dark room 15 min later. Only a
+            # reconnect after the output was really gone (re-plugged /
+            # power-cycled) counts as a wake.
+            real = {o for o in back if now - gone.get(o, now) >= HOTPLUG_MIN_ABSENT_S}
+            for o in back:
+                gone.pop(o, None)
+            if real and settled:
                 LOG.info("hotplug: outputs %s -> %s", sorted(before), sorted(outs))
                 _poller_mem["outputs"] = outs
                 do_wake("hotplug")
@@ -2288,8 +2346,16 @@ def _poll_dormant(now: float, state: dict, xmon: _XMonitor, idle: int | None) ->
 
 def _state_poller() -> None:
     xmon = _XMonitor()
+    clocks = (time.clock_gettime(time.CLOCK_BOOTTIME), time.monotonic())
     while True:
         try:
+            # System suspend: CLOCK_BOOTTIME keeps counting through it,
+            # CLOCK_MONOTONIC doesn't — a gap between the two = we slept.
+            boot, mono = time.clock_gettime(time.CLOCK_BOOTTIME), time.monotonic()
+            slept = (boot - clocks[0]) - (mono - clocks[1])
+            clocks = (boot, mono)
+            if slept > 5:
+                _on_resume(slept)
             now = time.time()
             idle = xmon.idle_ms()
             _xstate["dpms_off"] = xmon.dpms_off()
@@ -2302,6 +2368,9 @@ def _state_poller() -> None:
                 _poll_dormant(now, state, xmon, idle)
             else:
                 _poller_mem.pop("outputs", None)
+                prev = _poller_mem.get("idle")
+                if idle is not None and prev is not None and idle + 400 < prev:
+                    _night_cancel("input")   # someone moved the mouse
                 if state["media"] is not None:
                     _poll_media(now, state)
                 elif not state["screensaver"]:
@@ -2314,6 +2383,410 @@ def _state_poller() -> None:
         except Exception:  # noqa: BLE001 — the poller must never die
             LOG.exception("state poll failed")
         time.sleep(STATE_POLL_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
+# Screensaver audio guard (PulseAudio)
+# ---------------------------------------------------------------------------
+# The in-page volume lock (_mc_lock_volume_js) only lands once CDP has seen
+# the new <video> — after YouTube's autoplay has already started at the
+# account's saved volume, so the first second(s) of an (unattended, often
+# night-time) screensaver could be loud. This guard mutes Firefox's
+# PulseAudio streams while a silent screensaver is showing, polling at
+# 10 Hz right after a change. Muting also teaches module-stream-restore,
+# which then creates the *next* Firefox stream already muted — so the
+# screensaver is silent from its first frame. The flip side (a later real
+# cast's stream being restored muted) is handled by the same guard: while
+# a real cast is tracked, Firefox streams are kept unmuted.
+
+def _pulse_inputs() -> list[dict] | None:
+    rc, out = _run(["pactl", "-f", "json", "list", "sink-inputs"], timeout=4)
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(out or "[]")
+    except ValueError:
+        return None
+    return data if isinstance(data, list) else None
+
+
+def _pulse_app(inp: dict) -> str:
+    props = inp.get("properties") or {}
+    return " ".join(str(props.get(k, "")) for k in (
+        "application.name", "application.process.binary", "application.id")).lower()
+
+
+def _pulse_guard() -> None:
+    while True:
+        fast = False
+        try:
+            with _state_lock:
+                ss = _state["screensaver"]
+                silent = bool(ss) and not _state["ss_sound"]
+                media = _state["media"]
+                since = _state["screensaver_since"] if ss else (media or {}).get("started", 0)
+            want = True if silent else (False if media is not None and not ss else None)
+            fast = time.time() - (since or 0) < 30
+            if want is not None:
+                for inp in _pulse_inputs() or []:
+                    if "firefox" in _pulse_app(inp) and bool(inp.get("mute")) != want:
+                        _run(["pactl", "set-sink-input-mute", str(inp.get("index")),
+                              "1" if want else "0"], timeout=4)
+                        LOG.info("pulse guard: firefox sink-input %s mute=%s",
+                                 inp.get("index"), want)
+        except Exception:  # noqa: BLE001 — never die
+            LOG.exception("pulse guard failed")
+        time.sleep(0.1 if fast else 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Spotify activity (for the night idle check)
+# ---------------------------------------------------------------------------
+# Primary signal: an uncorked librespot stream in PulseAudio (librespot
+# closes its stream on pause). Fallback/extra: the container forwards
+# state.spotify (POST /spotify) — trusted while fresh: within the rest of
+# the current track + SPOTIFY_STALE_S.
+SPOTIFY_STALE_S = float(os.environ.get("NIGHT_SPOTIFY_STALE_S", "300"))
+_spotify_hint: dict = {}
+
+
+def _spotify_playing() -> bool:
+    for inp in _pulse_inputs() or []:
+        if "librespot" in _pulse_app(inp) and not inp.get("corked"):
+            return True
+    h = dict(_spotify_hint)
+    if not h.get("playing"):
+        return False
+    remaining = 0.0
+    if isinstance(h.get("duration_s"), (int, float)) and isinstance(h.get("position_s"), (int, float)):
+        remaining = max(0.0, h["duration_s"] - h["position_s"])
+    return time.time() - h.get("received_at", 0) < remaining + SPOTIFY_STALE_S
+
+
+# ---------------------------------------------------------------------------
+# Night deep sleep (real suspend + RTC wake)
+# ---------------------------------------------------------------------------
+# Only this scheduler (and the explicit deep_sleep API action) ever suspends
+# the machine — bootstrap pins xfce4-power-manager / logind idle actions off.
+
+def _env_flag(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _hhmm(name: str, default: str) -> tuple[int, int]:
+    raw = os.environ.get(name, default).strip()
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", raw)
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        LOG.warning("%s=%r is not HH:MM — using %s", name, raw, default)
+        m = re.fullmatch(r"(\d{1,2}):(\d{2})", default)
+    return int(m.group(1)), int(m.group(2))
+
+
+NIGHT_DEEP_SLEEP = _env_flag("NIGHT_DEEP_SLEEP", "1")
+NIGHT_START = _hhmm("NIGHT_START", "23:00")
+NIGHT_END = _hhmm("NIGHT_END", "08:00")
+NIGHT_RECHECK_S = float(os.environ.get("NIGHT_RECHECK_MIN", "60")) * 60
+NIGHT_COUNTDOWN_S = float(os.environ.get("NIGHT_COUNTDOWN_S", "60"))
+NIGHT_BUSY_OVERLAY_S = float(os.environ.get("NIGHT_BUSY_OVERLAY_S", "8"))
+# After a resume / helper start inside the window, wait this long before
+# the first idle check (never suspend again instantly).
+NIGHT_GRACE_S = float(os.environ.get(
+    "NIGHT_GRACE_MIN", str(max(1.0, SCREENSAVER_IDLE_TIMEOUT / 60 or 15)))) * 60
+SUDO_SYSTEMCTL = os.environ.get("MEDIACAST_SYSTEMCTL_BIN", "/usr/bin/systemctl")
+RTCWAKE_BIN = os.environ.get("MEDIACAST_RTCWAKE_BIN", "/usr/sbin/rtcwake")
+
+_STARTED_AT = time.time()
+_night: dict = {
+    "key": None,             # date the current window started (None = outside)
+    "pending": False,        # bedtime reached, postponed (busy / cancelled)
+    "next_check": None,      # epoch s of the next idle check
+    "countdown_until": None,  # epoch s: suspend then unless cancelled
+    "busy_notified": False,  # bedtime overlay shown tonight
+    "alarm_at": None,        # RTC wake alarm of the suspend in progress
+    "suspending": False,
+}
+
+
+def _fmt(hm: tuple[int, int]) -> str:
+    return f"{hm[0]:02d}:{hm[1]:02d}"
+
+
+def _in_window(dt: datetime.datetime) -> bool:
+    x = dt.hour * 60 + dt.minute
+    s, e = NIGHT_START[0] * 60 + NIGHT_START[1], NIGHT_END[0] * 60 + NIGHT_END[1]
+    if s == e:
+        return False
+    return s <= x < e if s < e else (x >= s or x < e)
+
+
+def _window_key(dt: datetime.datetime) -> datetime.date:
+    x = dt.hour * 60 + dt.minute
+    s = NIGHT_START[0] * 60 + NIGHT_START[1]
+    return dt.date() - datetime.timedelta(days=1) if x < s else dt.date()
+
+
+def _next_end_epoch(now: float) -> float:
+    """Epoch of the next NIGHT_END (local time), at least 30 s ahead."""
+    dt = datetime.datetime.fromtimestamp(now)
+    cand = dt.replace(hour=NIGHT_END[0], minute=NIGHT_END[1], second=0, microsecond=0)
+    if cand.timestamp() <= now + 30:
+        cand += datetime.timedelta(days=1)
+    return cand.timestamp()
+
+
+def _ms(t):
+    return int(t * 1000) if t else None
+
+
+def _night_snapshot() -> dict:
+    inw = _in_window(datetime.datetime.now())
+    with _state_lock:
+        n = dict(_night)
+    return {
+        "enabled": NIGHT_DEEP_SLEEP,
+        "start": _fmt(NIGHT_START), "end": _fmt(NIGHT_END),
+        "in_window": inw,
+        "pending": bool(n["pending"]) and inw,
+        "next_check_at": _ms(n["next_check"]) if inw else None,
+        "countdown_until": _ms(n["countdown_until"]),
+    }
+
+
+def _night_blocks_screensaver() -> bool:
+    """No idle screensaver during the night window — the night flow (or
+    plain soft sleep) owns an idle box then."""
+    return NIGHT_DEEP_SLEEP and _in_window(datetime.datetime.now())
+
+
+def _night_idle() -> tuple[bool, str]:
+    """Idle for bedtime purposes: nothing of ours playing or paused with
+    content (the screensaver doesn't count; soft sleep is idle) and
+    Spotify not playing."""
+    with _state_lock:
+        media = _state["media"]
+        ss = _state["screensaver"]
+    if media is not None and not ss:
+        if _activity_live() or time.time() - media["started"] < MEDIA_GRACE_S:
+            return False, f"cast ({media['source']})"
+    if _spotify_playing():
+        return False, "spotify"
+    return True, ""
+
+
+# -- overlays ---------------------------------------------------------------
+
+_OVERLAY_ID = "__mcNight"
+
+
+def _overlay_js(title: str, sub: str, until_ms: int | None, hide_ms: int | None) -> str:
+    t, sb = json.dumps(title), json.dumps(sub)
+    return (
+        "(()=>{const I=" + json.dumps(_OVERLAY_ID) + ";"
+        "const o=document.getElementById(I);if(o){clearInterval(o.__t);o.remove();}"
+        "const host=document.fullscreenElement||document.body||document.documentElement;"
+        "if(!host)return false;"
+        "const d=document.createElement('div');d.id=I;"
+        "d.style.cssText='position:fixed;left:50%;bottom:8%;transform:translateX(-50%);"
+        "z-index:2147483647;background:rgba(8,10,24,.86);color:#fff;padding:22px 34px;"
+        "border-radius:18px;font:600 30px system-ui,sans-serif;text-align:center;"
+        "box-shadow:0 8px 40px rgba(0,0,0,.6);pointer-events:none;max-width:80vw';"
+        "const a=document.createElement('div');a.textContent=" + t + ";"
+        "const b=document.createElement('div');b.style.cssText='font-weight:400;font-size:20px;"
+        "opacity:.8;margin-top:8px';b.textContent=" + sb + ";d.append(a,b);host.appendChild(d);"
+        + (("const U=" + str(until_ms) + ";const tick=()=>{const s=Math.max(0,Math.ceil((U-Date.now())/1000));"
+            "a.textContent=" + t + ".replace('{s}',s);if(s<=0)clearInterval(d.__t);};"
+            "tick();d.__t=setInterval(tick,500);") if until_ms else "")
+        + (("setTimeout(()=>{clearInterval(d.__t);d.remove();}," + str(hide_ms) + ");") if hide_ms else "")
+        + "return true})()"
+    )
+
+
+def _overlay_remove_js() -> str:
+    return ("(()=>{const o=document.getElementById(" + json.dumps(_OVERLAY_ID) + ");"
+            "if(o){clearInterval(o.__t);o.remove();}return true})()")
+
+
+def _show_overlay(title: str, sub: str, *, until: float | None = None,
+                  seconds: float | None = None) -> str:
+    """Best effort on-projector message: mpv OSD if mpv is up, else a DOM
+    overlay injected into the visible Firefox tab over CDP."""
+    with _state_lock:
+        if _state["power"] == "sleeping" or _state["screen_off"]:
+            return "dark (no overlay)"
+    dur = seconds if seconds else (max(1.0, until - time.time()) if until else 8.0)
+    if os.path.exists(MPV_IPC_SOCK):
+        text = title.replace("{s}", str(int(dur))) + "\n" + sub
+        rc, out = _mpv_command(["show-text", text, int(dur * 1000)])
+        if rc == 0:
+            return "mpv osd"
+    ok = _cdp_eval(_overlay_js(title, sub, _ms(until), int(dur * 1000)))
+    return "cdp overlay" if ok is True else "no overlay target"
+
+
+def _hide_overlay() -> None:
+    if os.path.exists(MPV_IPC_SOCK):
+        _mpv_command(["show-text", "", 1])
+    _cdp_eval(_overlay_remove_js())
+
+
+# -- flow -------------------------------------------------------------------
+
+def _night_cancel(reason: str, postpone: bool = True) -> bool:
+    """Cancel a running bedtime countdown (→ next check in NIGHT_RECHECK)."""
+    with _state_lock:
+        if not _night["countdown_until"]:
+            return False
+        _night["countdown_until"] = None
+        _night["pending"] = True
+        if postpone:
+            _night["next_check"] = time.time() + NIGHT_RECHECK_S
+    LOG.info("night: bedtime countdown cancelled (%s), next check in %.0f min",
+             reason, NIGHT_RECHECK_S / 60)
+    threading.Thread(target=_hide_overlay, name="night-hide", daemon=True).start()
+    _publish()
+    return True
+
+
+def night_postpone(reason: str) -> None:
+    """bedtime_cancel: stop a countdown, or push the next check out."""
+    if not _night_cancel(reason):
+        with _state_lock:
+            if _night["key"] is not None:
+                _night["pending"] = True
+                _night["next_check"] = time.time() + NIGHT_RECHECK_S
+        _publish()
+
+
+def _night_tick(now: float) -> None:
+    dt = datetime.datetime.fromtimestamp(now)
+    if not _in_window(dt):
+        with _state_lock:
+            was = _night["key"] is not None
+            _night.update(key=None, pending=False, next_check=None, busy_notified=False)
+        if was:
+            _night_cancel("window over", postpone=False)
+            _publish()
+        return
+    key = _window_key(dt)
+    with _state_lock:
+        if _night["suspending"]:
+            return
+        if _night["key"] != key:
+            # Entering tonight's window. Started (or resumed) mid-window →
+            # give it the grace period instead of checking instantly.
+            fresh = now - _STARTED_AT < 60
+            _night.update(key=key, pending=False, busy_notified=False, countdown_until=None,
+                          next_check=now + NIGHT_GRACE_S if fresh else now)
+            LOG.info("night: window %s–%s started, first check at %s", _fmt(NIGHT_START),
+                     _fmt(NIGHT_END), time.strftime("%H:%M", time.localtime(_night["next_check"])))
+        cd, nxt = _night["countdown_until"], _night["next_check"]
+    if cd:
+        idle, why = _night_idle()
+        if not idle:
+            _night_cancel(f"busy: {why}")
+        elif now >= cd:
+            with _state_lock:
+                _night["countdown_until"] = None
+            do_deep_sleep("night")
+        return
+    if nxt is None or now < nxt:
+        return
+    idle, why = _night_idle()
+    if idle:
+        with _state_lock:
+            _night["countdown_until"] = now + NIGHT_COUNTDOWN_S
+            _night["pending"] = True
+        where = _show_overlay("Going to sleep in {s} s 🌙",
+                              "Move the mouse or press Wake to cancel",
+                              until=now + NIGHT_COUNTDOWN_S)
+        LOG.info("night: idle at bedtime — suspending in %.0f s (%s)", NIGHT_COUNTDOWN_S, where)
+    else:
+        with _state_lock:
+            _night["pending"] = True
+            _night["next_check"] = now + NIGHT_RECHECK_S
+            notify = not _night["busy_notified"]
+            _night["busy_notified"] = True
+        where = "-"
+        if notify and why != "spotify":
+            where = _show_overlay("Bedtime 🌙", "I'll go to sleep once you're done",
+                                  seconds=NIGHT_BUSY_OVERLAY_S)
+        LOG.info("night: busy (%s) — re-checking at %s (overlay: %s)", why,
+                 time.strftime("%H:%M", time.localtime(now + NIGHT_RECHECK_S)), where)
+    _publish()
+
+
+def _night_watchdog() -> None:
+    if not NIGHT_DEEP_SLEEP:
+        return
+    while True:
+        time.sleep(2)
+        try:
+            _night_tick(time.time())
+        except Exception:  # noqa: BLE001
+            LOG.exception("night tick failed")
+
+
+def do_deep_sleep(reason: str) -> None:
+    """Real suspend (S3) with an RTC wake alarm at the next NIGHT_END."""
+    now = time.time()
+    with _state_lock:
+        if _night["suspending"]:
+            return
+        _night["suspending"] = True
+        _night["countdown_until"] = None
+    wake_at = _next_end_epoch(now)
+    stopped = stop_active_playback()
+    with _state_lock:
+        _clear_media_locked()
+        _state["power"] = "sleeping"
+        _state["sleep_at"] = now
+        _state["screen_off"] = False
+        _night["alarm_at"] = wake_at
+    _publish()
+    _run(["xset", "dpms", "force", "off"])
+    # RTC runs in UTC on this box (timedatectl: "RTC in local TZ: no") → -u;
+    # -t takes an epoch, so it's TZ-agnostic anyway.
+    rc, out = _run(["sudo", "-n", RTCWAKE_BIN, "-m", "no", "-u", "-t", str(int(wake_at))], timeout=15)
+    LOG.warning("DEEP SLEEP reason=%s stopped=[%s] rtc wake at %s (rtcwake rc=%s %s)", reason,
+                stopped, time.strftime("%Y-%m-%d %H:%M", time.localtime(wake_at)), rc, out[-200:])
+    time.sleep(1.0)   # let the log line + state publish get out first
+    rc, out = _run(["sudo", "-n", SUDO_SYSTEMCTL, "suspend"], timeout=30)
+    if rc != 0:
+        LOG.error("suspend failed rc=%s: %s — staying soft-asleep", rc, out)
+        with _state_lock:
+            _night["suspending"] = False
+            _night["alarm_at"] = None
+
+
+def _on_resume(slept: float) -> None:
+    now = time.time()
+    with _state_lock:
+        alarm = _night["alarm_at"]
+        _night["suspending"] = False
+        _night["alarm_at"] = None
+        _night["countdown_until"] = None
+    _poller_mem.pop("idle", None)       # fresh input baseline
+    _poller_mem.pop("outputs", None)
+    rtc = alarm is not None and now >= alarm - 90
+    LOG.info("resumed after %.0f s of system sleep (rtc alarm=%s)", slept, rtc)
+    if rtc:
+        # Morning alarm: stay dark (don't light the projector at 08:00),
+        # soft-sleeping until input / wake / a cast.
+        with _state_lock:
+            _state["power"] = "sleeping"
+            _state["sleep_at"] = now
+            _state["screen_off"] = False
+        wake_display()                       # re-assert the xset idle policy...
+        _run(["xset", "dpms", "force", "off"])  # ...but keep it dark
+    else:
+        do_wake("resume")
+        with _state_lock:
+            if _in_window(datetime.datetime.now()):
+                # Someone woke it during the night: same flow again, but
+                # only after the normal idle period.
+                _night.update(pending=True, next_check=now + NIGHT_GRACE_S,
+                              key=_window_key(datetime.datetime.now()))
+    _publish()
 
 
 # ---------------------------------------------------------------------------
@@ -2464,12 +2937,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
-        if path not in ("/control", "/screensaver", "/power", "/open"):
+        if path not in ("/control", "/screensaver", "/power", "/open", "/spotify"):
             self._json(404, {"error": "not found"})
             return
         if not self._authed():
             return
         body = self._read_body()
+        if path == "/spotify":
+            # Container → host: librespot state for the night idle check.
+            _spotify_hint.clear()
+            _spotify_hint.update({k: body.get(k) for k in ("playing", "position_s", "duration_s")})
+            _spotify_hint["received_at"] = time.time()
+            if body.get("playing"):
+                _night_cancel("spotify playing")
+            self._json(200, {"status": "ok"})
+            return
+        if path == "/open" or (path == "/screensaver" and body.get("theme") not in (None, "", "off")):
+            _night_cancel(path.strip("/"))   # someone is using it: not bedtime yet
         if path == "/control":
             self._do_control(body)
             return
@@ -2497,6 +2981,16 @@ class Handler(BaseHTTPRequestHandler):
                 do_wake("api")
             elif action == "screen_off":
                 do_screen_off()
+            elif action == "bedtime_cancel":
+                night_postpone("api")
+            elif action == "deep_sleep":
+                LOG.warning("DEEP SLEEP requested from %s", self.client_address[0])
+
+                def _later() -> None:
+                    time.sleep(2.0)   # answer first, then go
+                    do_deep_sleep("api")
+
+                threading.Thread(target=_later, name="deep-sleep", daemon=True).start()
             elif action == "poweroff":
                 # WARNING (not INFO) — the single most consequential
                 # action; worth standing out in the journal as an audit trail.
@@ -2589,6 +3083,10 @@ def main() -> None:
     threading.Thread(target=_screensaver_watchdog, name="screensaver", daemon=True).start()
     # Keep-awake watchdog — stops DPMS/blank from tripping mid-playback.
     threading.Thread(target=_keepawake_watchdog, name="keepawake", daemon=True).start()
+    # Screensaver mute at the PulseAudio level (first-frame silence).
+    threading.Thread(target=_pulse_guard, name="pulse-guard", daemon=True).start()
+    # Overnight deep sleep scheduler.
+    threading.Thread(target=_night_watchdog, name="night", daemon=True).start()
     # 0.0.0.0 so the container reaches us via host.docker.internal.
     # Token is the trust boundary. See module docstring.
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
