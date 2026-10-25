@@ -32,6 +32,25 @@ mcast_fails=0
 n=0
 log() { echo "wifi-watchdog: $*"; }
 
+# Remember the Wi-Fi connection profile while it's up: after a suspend or a
+# dead link `nmcli device connect` fails ("A 'wireless' setting is required
+# if no AP path was given", seen 2026-10-25), so re-activate the profile.
+CON=""
+remember_con() {
+    local c
+    c=$(nmcli -g GENERAL.CONNECTION device show "$IFACE" 2>/dev/null)
+    [ -n "$c" ] && [ "$c" != "--" ] && CON="$c"
+}
+reconnect() {
+    remember_con
+    if [ -n "$CON" ]; then
+        nmcli connection up "$CON" ifname "$IFACE" >/dev/null 2>&1 && return 0
+        log "nmcli connection up '$CON' failed"
+    fi
+    nmcli device connect "$IFACE" >/dev/null 2>&1 || log "nmcli device connect failed"
+}
+remember_con
+
 while true; do
     sleep "$INTERVAL"
     gw=$(ip -4 route show default dev "$IFACE" 2>/dev/null | awk '{print $3; exit}')
@@ -41,6 +60,7 @@ while true; do
     elif ping -c 3 -i 0.3 -W 2 -I "$IFACE" "$gw" >/dev/null 2>&1; then
         [ "$fails" -gt 0 ] && log "gateway $gw reachable again after $fails failed checks"
         fails=0
+        remember_con
         n=$((n + 1))
         if [ $((n % MCAST_EVERY)) -eq 0 ] && command -v tcpdump >/dev/null 2>&1; then
             mac=$(cat "/sys/class/net/$IFACE/address" 2>/dev/null)
@@ -53,7 +73,7 @@ while true; do
                 log "no broadcast/multicast frame from the LAN in ${MCAST_WINDOW}s ($mcast_fails/$MCAST_FAILS)"
                 if [ "$mcast_fails" -ge "$MCAST_FAILS" ]; then
                     log "broadcast path dead — re-activating $IFACE via NetworkManager"
-                    nmcli device connect "$IFACE" || log "nmcli device connect failed"
+                    reconnect
                     mcast_fails=0
                 fi
             fi
@@ -67,7 +87,7 @@ while true; do
     iw dev "$IFACE" set power_save off 2>/dev/null || true
     if [ "$fails" -eq "$FAILS_RECONNECT" ]; then
         log "re-activating $IFACE via NetworkManager"
-        nmcli device connect "$IFACE" || log "nmcli device connect failed"
+        reconnect
     elif [ "$fails" -ge "$FAILS_RELOAD" ]; then
         log "still dead — reloading iwlwifi driver"
         modprobe -r iwlmvm iwlwifi && modprobe iwlwifi || log "driver reload failed"

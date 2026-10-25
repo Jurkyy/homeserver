@@ -678,8 +678,10 @@ import sys
 import xml.etree.ElementTree as ET
 path = sys.argv[1]
 DESIRED = {
-    "inactivity-on-ac": ("uint", "14"),          # 14 = "Never" in xfpm
-    "inactivity-on-battery": ("uint", "14"),
+    # 0 = never. NOT 14: xfpm 4.20 treats 14 as 14 minutes and suspended
+    # the box 14 min after boot on 2026-10-25.
+    "inactivity-on-ac": ("uint", "0"),
+    "inactivity-on-battery": ("uint", "0"),
     "inactivity-sleep-mode-on-ac": ("uint", "1"),  # 1 = suspend (moot: never)
     "lock-screen-suspend-hibernate": ("bool", "false"),
 }
@@ -700,10 +702,23 @@ tree.write(path, encoding="UTF-8", xml_declaration=True)
 PYEOF2
     if [ -S "/run/user/$uid/bus" ]; then
         local xq="sudo -u $SUDO_USER DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus xfconf-query -c xfce4-power-manager"
-        $xq -p /xfce4-power-manager/inactivity-on-ac -n -t uint -s 14 2>/dev/null || true
-        $xq -p /xfce4-power-manager/inactivity-on-battery -n -t uint -s 14 2>/dev/null || true
+        $xq -p /xfce4-power-manager/inactivity-on-ac -n -t uint -s 0 2>/dev/null || true
+        $xq -p /xfce4-power-manager/inactivity-on-battery -n -t uint -s 0 2>/dev/null || true
         $xq -p /xfce4-power-manager/inactivity-sleep-mode-on-ac -n -t uint -s 1 2>/dev/null || true
         $xq -p /xfce4-power-manager/lock-screen-suspend-hibernate -n -t bool -s false 2>/dev/null || true
+    fi
+
+    # 6. NVIDIA (GTX 970 / driver 550) never survives S3: the display engine
+    # fails to restore and Xorg hangs (verified twice on 2026-10-25, also with
+    # PreserveVideoMemoryAllocations=1). Mask the sleep targets so *nothing*
+    # (xfpm, a stray power key, logind) can suspend this box. Opt back in with
+    # MEDIACAST_ALLOW_NVIDIA_SUSPEND=1 (e.g. after a driver/GPU change).
+    local sleep_units="sleep.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target"
+    if [ -e /proc/driver/nvidia/params ] && [ "${MEDIACAST_ALLOW_NVIDIA_SUSPEND:-0}" != "1" ]; then
+        systemctl mask $sleep_units >/dev/null 2>&1 || true
+        info "NVIDIA GPU detected — system sleep masked (S3 resume hangs X)"
+    else
+        systemctl unmask $sleep_units >/dev/null 2>&1 || true
     fi
 
     success "Host power policy installed"
