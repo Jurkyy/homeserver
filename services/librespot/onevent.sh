@@ -2,7 +2,7 @@
 # librespot --onevent hook: forward each player event to mediacast so the
 # portal / Android app can show Spotify now-playing (state.spotify).
 #
-# librespot 0.8 passes the event in env vars: PLAYER_EVENT always; then
+# librespot (0.8 / pinned dev rev) passes the event in env vars: PLAYER_EVENT always; then
 # depending on the event TRACK_ID, NAME, ARTISTS / COVERS (newline-
 # separated), ALBUM, DURATION_MS, POSITION_MS. librespot runs on the host
 # network, so mediacast's published port is reachable on loopback.

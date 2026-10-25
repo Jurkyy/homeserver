@@ -76,7 +76,22 @@ ENV RUSTFLAGS="-C target-feature=-crt-static"
 # at build time, which broke 0.8.0 against current vergen-lib (two
 # resolved versions, trait impls didn't match → librespot-core build
 # script wouldn't compile).
+#
+# Pinned to a librespot `dev` commit, not the crates.io release. 0.8.0
+# (still the latest release as of 2026-10) resolves a Connect `skip_to`
+# by track_uri first; current Spotify apps send `"track_uri": ""` next to
+# the track_uid that names the picked track, so 0.8.0 fails the lookup
+# ("Failed to resolve index by Some(Uri(""))") and falls back to index 0
+# — tapping any song in a playlist played the playlist's FIRST track.
+# Fixed upstream in librespot-org/librespot#1795 (merged to dev
+# 2026-10-16, see also #1841). 99b6088 = dev HEAD 2026-10-21, includes
+# it. Move back to `cargo install librespot --version =X.Y.Z` once a
+# release (> 0.8.0) ships the fix. Same features, CLI flags and
+# --onevent env vars as 0.8.0 (dev only adds CONTEXT_URI etc.).
+ARG LIBRESPOT_REV=99b6088bf3ea028f90192676ac1a337fa4b2ed12
 RUN cargo install librespot \
+        --git https://github.com/librespot-org/librespot \
+        --rev "$LIBRESPOT_REV" \
         --locked \
         --no-default-features \
         --features alsa-backend,pulseaudio-backend,with-avahi,rustls-tls-webpki-roots
