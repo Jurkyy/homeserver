@@ -2733,17 +2733,21 @@ def _suspend_unsafe() -> str:
     NVreg_PreserveVideoMemoryAllocations=0 the GPU isn't restored after S3
     (nv_restore_user_channels WARN, "Failed to allocate display engine core
     DMA push buffer") and Xorg wedges — the projector stays dead until X is
-    restarted. bootstrap's install_host_power_policy sets it to 1 (active
-    after the next reboot); until then we refuse and soft-sleep instead."""
+    restarted.
+
+    Re-tested 2026-10-25 with PreserveVideoMemoryAllocations=1 and the
+    nvidia-suspend/resume units via `systemctl suspend`: the GTX 970 on
+    driver 550 still fails ("Failed to allocate display engine core DMA push
+    buffer") and X hangs. So any loaded NVIDIA driver is treated as unsafe;
+    set MEDIACAST_ALLOW_NVIDIA_SUSPEND=1 to retry on other hardware/drivers."""
     try:
         with open("/proc/driver/nvidia/params") as f:
-            params = f.read()
+            f.read()
     except OSError:
         return ""   # no NVIDIA driver loaded
-    m = re.search(r"^PreserveVideoMemoryAllocations:\s*(\d+)", params, re.M)
-    if m and m.group(1) == "0":
-        return "nvidia PreserveVideoMemoryAllocations=0 (X would not survive resume)"
-    return ""
+    if os.environ.get("MEDIACAST_ALLOW_NVIDIA_SUSPEND") == "1":
+        return ""
+    return "nvidia GPU does not survive S3 resume (X would hang)"
 
 
 def do_deep_sleep(reason: str) -> None:
