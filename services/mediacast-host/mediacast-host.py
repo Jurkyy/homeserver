@@ -2726,8 +2726,33 @@ def _night_watchdog() -> None:
             LOG.exception("night tick failed")
 
 
+def _suspend_unsafe() -> str:
+    """Why a real suspend would break the box, or "" if it's safe.
+
+    Verified 2026-10-25: with the proprietary NVIDIA driver and
+    NVreg_PreserveVideoMemoryAllocations=0 the GPU isn't restored after S3
+    (nv_restore_user_channels WARN, "Failed to allocate display engine core
+    DMA push buffer") and Xorg wedges — the projector stays dead until X is
+    restarted. bootstrap's install_host_power_policy sets it to 1 (active
+    after the next reboot); until then we refuse and soft-sleep instead."""
+    try:
+        with open("/proc/driver/nvidia/params") as f:
+            params = f.read()
+    except OSError:
+        return ""   # no NVIDIA driver loaded
+    m = re.search(r"^PreserveVideoMemoryAllocations:\s*(\d+)", params, re.M)
+    if m and m.group(1) == "0":
+        return "nvidia PreserveVideoMemoryAllocations=0 (X would not survive resume)"
+    return ""
+
+
 def do_deep_sleep(reason: str) -> None:
     """Real suspend (S3) with an RTC wake alarm at the next NIGHT_END."""
+    unsafe = _suspend_unsafe()
+    if unsafe:
+        LOG.error("deep sleep refused (%s): %s — soft-sleeping instead", reason, unsafe)
+        do_sleep(f"deep sleep unavailable ({reason})")
+        return
     now = time.time()
     with _state_lock:
         if _night["suspending"]:

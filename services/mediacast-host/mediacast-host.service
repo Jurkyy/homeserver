@@ -39,7 +39,7 @@ Environment=XAUTHORITY=%h/.Xauthority
 # MIT-MAGIC-COOKIE-1 key", 2026-10-24) and graphical-session.target is
 # never reached by Xfce here. Wait (≤2 min) until X actually accepts us.
 # The helper also retries its own X connection with backoff.
-ExecStartPre=/bin/sh -c 'for i in $$(seq 1 120); do xset q >/dev/null 2>&1 && exit 0; sleep 1; done; echo "X :0 not ready after 120s" >&2; exit 1'
+ExecStartPre=/bin/sh -c 'for i in $$(seq 1 120); do timeout 3 xset q >/dev/null 2>&1 && exit 0; sleep 1; done; echo "X :0 not ready after 120s" >&2; exit 1'
 TimeoutStartSec=150
 ExecStart=/usr/bin/python3 %h/homeserver/services/mediacast-host/mediacast-host.py
 Restart=on-failure

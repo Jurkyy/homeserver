@@ -612,6 +612,30 @@ EOF
         iw dev "$dev" set power_save off 2>/dev/null || true
     done
 
+    # 2b. NVIDIA proprietary driver + S3: without
+    # PreserveVideoMemoryAllocations the GPU isn't restored on resume
+    # (verified 2026-10-25: nv_restore_user_channels WARN, "Failed to
+    # allocate display engine core DMA push buffer", Xorg wedged). Debian's
+    # module is nvidia-current; nvidia-suspend/-resume.service (enabled by
+    # the package) do the save/restore. Effective after the next reboot;
+    # mediacast-host refuses to suspend while the live value is still 0.
+    if [ -e /proc/driver/nvidia/params ] || modinfo nvidia-current >/dev/null 2>&1; then
+        cat > /etc/modprobe.d/homeserver-nvidia-suspend.conf <<'EOF'
+# Installed by bootstrap.sh (install_host_power_policy): keep video memory
+# across suspend so X survives resume (night deep sleep).
+options nvidia-current NVreg_PreserveVideoMemoryAllocations=1 NVreg_TemporaryFilePath=/var/tmp
+EOF
+        for u in nvidia-suspend.service nvidia-resume.service; do
+            systemctl enable "$u" >/dev/null 2>&1 || true
+        done
+        if command -v update-initramfs >/dev/null 2>&1; then
+            update-initramfs -u >/dev/null 2>&1 || warn "update-initramfs failed"
+        fi
+        if grep -q '^PreserveVideoMemoryAllocations: 0' /proc/driver/nvidia/params 2>/dev/null; then
+            warn "NVIDIA PreserveVideoMemoryAllocations=1 takes effect after a reboot — night deep sleep stays soft until then"
+        fi
+    fi
+
     # 3. Wi-Fi watchdog + post-resume fixups.
     if command -v iw >/dev/null 2>&1 && command -v nmcli >/dev/null 2>&1; then
         install -m 0755 "$hp/wifi-watchdog.sh" /usr/local/sbin/homeserver-wifi-watchdog

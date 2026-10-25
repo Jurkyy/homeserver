@@ -39,7 +39,7 @@ Environment=XAUTHORITY=%h/.Xauthority
 # user.js (FF140 defaults to BiDi-only). The token-gated portal is the
 # only local client; same trust model as mpv's IPC socket.
 # Same boot race as mediacast-host.service: wait for X to accept us.
-ExecStartPre=/bin/sh -c 'for i in $$(seq 1 120); do xset q >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
+ExecStartPre=/bin/sh -c 'for i in $$(seq 1 120); do timeout 3 xset q >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
 TimeoutStartSec=150
 ExecStart=/usr/bin/firefox-esr --remote-debugging-port=9222 --remote-allow-hosts=localhost
 # Restart=always so a clean SIGTERM (debug session, accidental pkill,

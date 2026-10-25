@@ -242,6 +242,16 @@ suspends (S3) and comes back by itself in the morning. Configured in
 - Portal / app: 🌙 chip with the window and "pending", a countdown banner
   with Cancel (`bedtime_cancel`) and a "Deep sleep" button
   (`deep_sleep`: suspend now until `NIGHT_END`).
+- **NVIDIA:** with the proprietary 550 driver and the default
+  `NVreg_PreserveVideoMemoryAllocations=0`, the GPU wasn't restored after
+  the first real S3 test (2026-10-25: `nv_restore_user_channels` WARN,
+  "Failed to allocate display engine core DMA push buffer") and Xorg
+  wedged — the projector stayed dead until X was restarted, though
+  network, Spotify and the API came back fine. `install_host_power_policy`
+  sets `options nvidia-current NVreg_PreserveVideoMemoryAllocations=1
+  NVreg_TemporaryFilePath=/var/tmp` (+ initramfs update); it applies after
+  a reboot. Until the live value (`/proc/driver/nvidia/params`) is 1,
+  mediacast-host refuses to suspend and soft-sleeps instead.
 - Nothing else may suspend the box: `install_host_power_policy` pins
   logind `IdleAction=ignore` and xfce4-power-manager inactivity to
   "never".
