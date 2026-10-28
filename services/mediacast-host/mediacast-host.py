@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import select
 import socket
 import struct
 import subprocess
@@ -2113,6 +2114,11 @@ def _mark_awake_locked() -> bool:
 def do_wake(reason: str) -> None:
     with _state_lock:
         was = _mark_awake_locked()
+        if was and _night["key"] is not None and _in_window(datetime.datetime.now()):
+            # Woken during the night: bedtime again only after the normal
+            # idle period, not at whatever check happened to be scheduled.
+            _night["pending"] = True
+            _night["next_check"] = max(_night["next_check"] or 0, time.time() + NIGHT_GRACE_S)
     _night_cancel(f"wake:{reason}")
     out = wake_display()
     LOG.info("wake reason=%s (was dormant=%s) %s", reason, was, out)
@@ -2501,25 +2507,95 @@ def _pulse_guard() -> None:
 # ---------------------------------------------------------------------------
 # Spotify activity (for the night idle check)
 # ---------------------------------------------------------------------------
-# Primary signal: an uncorked librespot stream in PulseAudio (librespot
-# closes its stream on pause). Fallback/extra: the container forwards
-# state.spotify (POST /spotify) — trusted while fresh: within the rest of
-# the current track + SPOTIFY_STALE_S.
+# "Busy" means Spotify audio is actually coming out, not merely that a
+# session exists. Two sources:
+#  * PulseAudio: librespot closes its stream on pause/stop, so no uncorked
+#    librespot sink-input → not playing. The converse doesn't hold: when the
+#    Connect session dies mid-track (Spirc "unexpected shutdown", phone gone,
+#    network drop) librespot keeps the stream open and uncorked but silent,
+#    with no paused/stopped event — night of 2026-10-27 that kept the box
+#    "busy (spotify)" from 23:00 to 08:00.
+#  * state.spotify, forwarded by the container (POST /spotify) on every
+#    librespot event: authoritative while fresh. A continuously playing
+#    session emits events at least once per track, so "playing" is trusted
+#    for the rest of the current track + SPOTIFY_STALE_S after the event.
+# When the hint is missing (host restarted since the last event) or stale
+# but still says playing, sample the stream itself: real playback carries
+# audio, an orphaned stream carries nothing.
 SPOTIFY_STALE_S = float(os.environ.get("NIGHT_SPOTIFY_STALE_S", "300"))
+SPOTIFY_PROBE_S = 0.5
+SPOTIFY_PROBE_PEAK = 16       # s16 peak; above librespot's ±1-2 LSB dither
 _spotify_hint: dict = {}
 
 
-def _spotify_playing() -> bool:
-    for inp in _pulse_inputs() or []:
-        if "librespot" in _pulse_app(inp) and not inp.get("corked"):
-            return True
-    h = dict(_spotify_hint)
-    if not h.get("playing"):
+def _stream_audible(index) -> bool | None:
+    """Sample a sink-input for SPOTIFY_PROBE_S via its monitor; True if it
+    carries real audio, None if it couldn't be sampled."""
+    want = int(44100 * 4 * SPOTIFY_PROBE_S)
+    try:
+        proc = subprocess.Popen(
+            ["parec", f"--monitor-stream={int(index)}", "--raw", "--format=s16le",
+             "--channels=2", "--rate=44100", "--latency-msec=50"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except (OSError, ValueError, TypeError):
+        return None
+    buf = bytearray()
+    deadline = time.time() + SPOTIFY_PROBE_S + 1.0
+    try:
+        while len(buf) < want and time.time() < deadline:
+            r, _, _ = select.select([proc.stdout], [], [], max(0.0, deadline - time.time()))
+            if not r:
+                break
+            chunk = os.read(proc.stdout.fileno(), want - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        proc.kill()
+        proc.wait()
+    if not buf and proc.returncode not in (0, -9):
+        return None
+    n = len(buf) // 2
+    if not n:
         return False
+    peak = max(abs(v) for v in struct.unpack(f"<{n}h", bytes(buf[:n * 2])))
+    return peak > SPOTIFY_PROBE_PEAK
+
+
+def _spotify_hint_state() -> str:
+    """"none" (no event since start), "idle" (paused/stopped/disconnected),
+    "playing" (fresh) or "stale" (says playing, but no event for longer than
+    the rest of the track + SPOTIFY_STALE_S)."""
+    h = dict(_spotify_hint)
+    if not h:
+        return "none"
+    if not h.get("playing"):
+        return "idle"
     remaining = 0.0
     if isinstance(h.get("duration_s"), (int, float)) and isinstance(h.get("position_s"), (int, float)):
         remaining = max(0.0, h["duration_s"] - h["position_s"])
-    return time.time() - h.get("received_at", 0) < remaining + SPOTIFY_STALE_S
+    fresh = time.time() - h.get("received_at", 0) < remaining + SPOTIFY_STALE_S
+    return "playing" if fresh else "stale"
+
+
+def _spotify_playing() -> bool:
+    inputs = _pulse_inputs()
+    streams = [i for i in inputs or [] if "librespot" in _pulse_app(i) and not i.get("corked")]
+    if inputs is not None and not streams:
+        return False                 # no open stream → nothing audible
+    hint = _spotify_hint_state()
+    if hint in ("playing", "idle"):
+        return hint == "playing"
+    if not streams:                  # pulse unreadable and no usable hint
+        return False
+    heard = [_stream_audible(i.get("index")) for i in streams]
+    if any(heard):
+        return True
+    if None in heard:
+        # Couldn't sample: with no hint at all err on "someone's listening";
+        # a stale "playing" hint alone must not block bedtime.
+        return hint == "none"
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -2744,11 +2820,25 @@ def _night_tick(now: float) -> None:
         if not idle:
             _night_cancel(f"busy: {why}")
         elif now >= cd:
+            # Arm the next check before acting: when deep sleep falls back to
+            # soft sleep (NVIDIA) or suspend fails, we're still running, and
+            # a next_check left in the past made the 2 s watchdog start a new
+            # countdown straight away — a sleep every ~62 s all night.
             with _state_lock:
                 _night["countdown_until"] = None
+                _night["next_check"] = now + NIGHT_RECHECK_S
             do_deep_sleep("night")
         return
     if nxt is None or now < nxt:
+        return
+    with _state_lock:
+        asleep = _state["power"] == "sleeping"
+    if asleep and _suspend_unsafe():
+        # Already soft-asleep and a real suspend isn't possible: the night
+        # flow has nothing to add. Look again later (a wake re-arms it).
+        with _state_lock:
+            _night["pending"] = True
+            _night["next_check"] = now + NIGHT_RECHECK_S
         return
     idle, why = _night_idle()
     if idle:
