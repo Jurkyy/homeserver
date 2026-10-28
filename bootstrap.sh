@@ -502,6 +502,65 @@ for name, (ptype, value) in DESIRED.items():
 tree.write(path, encoding="UTF-8", xml_declaration=True)
 PYEOF
 
+    # 6d. Keep Xfce's desktop chrome off the fullscreen video.
+    #   - displays/Notify=0: on every projector hotplug (it re-appears after
+    #     a DPMS/standby wake) xfsettingsd popped `xfce4-display-settings -m`
+    #     ("Display" dialog). That dialog grabs focus, and xfwm4 only keeps
+    #     a fullscreen window above DOCK windows while it is focused — so
+    #     both panels *and* the dialog landed on top of the playing video
+    #     (2026-10-28). 0 = do nothing on new outputs; AutoEnableProfiles
+    #     still applies the saved layout.
+    #   - Every xfce4-panel autohides always (autohide-behavior=2), so even
+    #     a stray focus change can't show a bar over the picture. Panel ids
+    #     only exist once xfce4-panel has written its config on first login,
+    #     so this runs from an autostart entry on every login (and live
+    #     below when a session is up).
+    local displays_xml="$xfconf_dir/displays.xml"
+    sudo -u "$SUDO_USER" python3 - "$displays_xml" <<'PYEOF'
+import sys
+import xml.etree.ElementTree as ET
+
+path = sys.argv[1]
+try:
+    tree = ET.parse(path)
+    root = tree.getroot()
+except (FileNotFoundError, ET.ParseError):
+    root = ET.Element("channel", {"name": "displays", "version": "1.0"})
+    tree = ET.ElementTree(root)
+prop = root.find("./property[@name='Notify']")
+if prop is None:
+    prop = ET.SubElement(root, "property", {"name": "Notify"})
+prop.set("type", "int")
+prop.set("value", "0")
+tree.write(path, encoding="UTF-8", xml_declaration=True)
+PYEOF
+    local kiosk_sh="$user_home/.local/bin/homeserver-xfce-kiosk"
+    sudo -u "$SUDO_USER" mkdir -p "$(dirname "$kiosk_sh")"
+    sudo -u "$SUDO_USER" tee "$kiosk_sh" >/dev/null <<'EOF'
+#!/bin/sh
+# Installed by homeserver bootstrap.sh (6d): no Xfce chrome over the video.
+sleep 5   # let xfce4-panel/xfconfd come up
+xfconf-query -c displays -p /Notify -n -t int -s 0
+for p in $(xfconf-query -c xfce4-panel -p /panels 2>/dev/null | grep -Eo '^[0-9]+$'); do
+    xfconf-query -c xfce4-panel -p "/panels/panel-$p/autohide-behavior" -n -t uint -s 2
+done
+EOF
+    chmod 0755 "$kiosk_sh"
+    sudo -u "$SUDO_USER" tee "$user_home/.config/autostart/homeserver-xfce-kiosk.desktop" >/dev/null <<EOF
+[Desktop Entry]
+Type=Application
+Name=homeserver kiosk chrome
+Comment=homeserver: autohide panels, no display-hotplug dialog over the projector
+Exec=$kiosk_sh
+X-GNOME-Autostart-enabled=true
+EOF
+    local kuid
+    kuid=$(id -u "$SUDO_USER")
+    if [ -S "/run/user/$kuid/bus" ]; then
+        sudo -u "$SUDO_USER" DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$kuid/bus" \
+            sh -c "sed 's/^sleep 5.*//' '$kiosk_sh' | sh" 2>/dev/null || true
+    fi
+
     # 7. Systemd --user unit for the host helper, plus linger so it
     # runs across SSH disconnects (and starts on boot once the user
     # session exists).
