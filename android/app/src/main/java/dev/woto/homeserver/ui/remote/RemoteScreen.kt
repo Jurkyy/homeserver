@@ -48,6 +48,8 @@ import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material.icons.rounded.Replay10
 import androidx.compose.material.icons.rounded.Replay30
 import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.SkipNext
+import androidx.compose.material.icons.rounded.SkipPrevious
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material.icons.rounded.Wallpaper
@@ -65,10 +67,12 @@ import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderColors
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -163,7 +167,7 @@ fun RemoteScreen(graph: AppGraph, onOpenSettings: () -> Unit) {
 @Composable
 private fun Extras(graph: AppGraph, state: ServerState) {
     state.night?.let { NightSection(graph, it) }
-    state.spotify?.takeIf { it.active }?.let { SpotifyCard(it) }
+    state.spotify?.takeIf { it.active }?.let { SpotifyCard(graph, it) }
     ScreensaverSection(graph, state)
     PowerSection(graph, state)
 }
@@ -292,8 +296,6 @@ private fun PlayerCard(graph: AppGraph, snap: StateSnapshot) {
             delay(250)
         }
     }
-    var dragging by remember { mutableStateOf<Float?>(null) }
-
     Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
         Box(
             Modifier.fillMaxWidth().aspectRatio(16f / 9f).clip(RoundedCornerShape(24.dp))
@@ -331,22 +333,7 @@ private fun PlayerCard(graph: AppGraph, snap: StateSnapshot) {
         // Seek bar
         val dur = s.durationS?.takeIf { it > 0 }
         if (dur != null) {
-            val frac = dragging ?: ((position ?: 0.0) / dur).toFloat().coerceIn(0f, 1f)
-            Slider(
-                value = frac,
-                onValueChange = { dragging = it },
-                onValueChangeFinished = {
-                    dragging?.let { graph.actions.seekTo(it * dur) }
-                    dragging = null
-                    haptic(false)
-                },
-                modifier = Modifier.padding(top = 8.dp),
-            )
-            Row(Modifier.fillMaxWidth()) {
-                Text(formatDuration(dragging?.let { it * dur } ?: position), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Spacer(Modifier.weight(1f))
-                Text(formatDuration(dur), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
+            SeekBar(position, dur, Modifier.padding(top = 8.dp)) { graph.actions.seekTo(it) }
         } else {
             LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 20.dp, bottom = 8.dp))
         }
@@ -383,6 +370,37 @@ private fun PlayerCard(graph: AppGraph, snap: StateSnapshot) {
     }
 }
 
+/** Scrubbable position slider with elapsed / total labels; [onSeekTo] fires once on release (absolute seconds). */
+@Composable
+private fun SeekBar(
+    position: Double?,
+    duration: Double,
+    modifier: Modifier = Modifier,
+    colors: SliderColors = SliderDefaults.colors(),
+    onSeekTo: (Double) -> Unit,
+) {
+    val haptic = rememberHaptic()
+    var dragging by remember { mutableStateOf<Float?>(null) }
+    val frac = dragging ?: ((position ?: 0.0) / duration).toFloat().coerceIn(0f, 1f)
+    Column(modifier) {
+        Slider(
+            value = frac,
+            onValueChange = { dragging = it },
+            onValueChangeFinished = {
+                dragging?.let { onSeekTo(it * duration) }
+                dragging = null
+                haptic(false)
+            },
+            colors = colors,
+        )
+        Row(Modifier.fillMaxWidth()) {
+            Text(formatDuration(dragging?.let { it * duration } ?: position), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.weight(1f))
+            Text(formatDuration(duration), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
 @Composable
 private fun TransportButton(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, onClick: () -> Unit) {
     FilledTonalIconButton(onClick = onClick, modifier = Modifier.size(52.dp)) {
@@ -392,23 +410,35 @@ private fun TransportButton(icon: androidx.compose.ui.graphics.vector.ImageVecto
 
 @Composable
 private fun VolumeRow(graph: AppGraph, s: ServerState, modifier: Modifier = Modifier) {
+    VolumeSlider(s.volume, s.muted, modifier) { graph.actions.setVolume(it) }
+}
+
+/** 0–100 volume slider; [onSetVolume] fires once on release. */
+@Composable
+private fun VolumeSlider(
+    volume: Double,
+    muted: Boolean,
+    modifier: Modifier = Modifier,
+    color: Color = MaterialTheme.colorScheme.secondary,
+    onSetVolume: (Double) -> Unit,
+) {
     var dragging by remember { mutableStateOf<Float?>(null) }
-    val value = dragging ?: s.volume.toFloat()
+    val value = dragging ?: volume.toFloat()
     Row(modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Icon(
-            if (s.muted || value <= 0f) Icons.AutoMirrored.Rounded.VolumeOff else Icons.AutoMirrored.Rounded.VolumeUp,
+            if (muted || value <= 0f) Icons.AutoMirrored.Rounded.VolumeOff else Icons.AutoMirrored.Rounded.VolumeUp,
             "Volume", tint = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Slider(
             value = value,
             onValueChange = { dragging = it },
             onValueChangeFinished = {
-                dragging?.let { graph.actions.setVolume(it.toDouble()) }
+                dragging?.let { onSetVolume(it.toDouble()) }
                 dragging = null
             },
             valueRange = 0f..100f,
             modifier = Modifier.weight(1f).padding(horizontal = 12.dp),
-            colors = SliderDefaults.colors(thumbColor = MaterialTheme.colorScheme.secondary, activeTrackColor = MaterialTheme.colorScheme.secondary),
+            colors = SliderDefaults.colors(thumbColor = color, activeTrackColor = color),
         )
         Text("${value.toInt()}", style = MaterialTheme.typography.labelLarge, modifier = Modifier.width(32.dp))
     }
@@ -431,10 +461,20 @@ private fun SectionTitle(text: String) {
 }
 
 @Composable
-private fun SpotifyCard(sp: SpotifyState) {
+private fun SpotifyCard(graph: AppGraph, sp: SpotifyState) {
     val context = LocalContext.current
+    val haptic = rememberHaptic()
     val art = rememberImageUrl(sp.artworkUrl)
     val spotifyGreen = Color(0xFF1DB954)
+    val dur = sp.durationS?.takeIf { it > 0 }
+    // librespot only reports on changes, so extrapolate the position locally while playing.
+    val pos by produceState(sp.positionAt(), sp) {
+        while (true) {
+            value = sp.positionAt()
+            if (!sp.playing) break
+            delay(if (sp.controllable) 250 else 1000)
+        }
+    }
     Card(
         Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(24.dp),
@@ -451,19 +491,15 @@ private fun SpotifyCard(sp: SpotifyState) {
                     style = MaterialTheme.typography.labelMedium, color = spotifyGreen,
                 )
                 Text(sp.title ?: "Connected", style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(
-                    listOfNotNull(sp.artist, sp.album).joinToString(" · ").ifEmpty { "Control playback from the Spotify app" },
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                )
-                val dur = sp.durationS?.takeIf { it > 0 }
-                if (dur != null) {
-                    val pos by produceState(sp.positionAt(), sp) {
-                        while (true) {
-                            value = sp.positionAt()
-                            if (!sp.playing) break
-                            delay(1000)
-                        }
-                    }
+                val details = listOfNotNull(sp.artist, sp.album).joinToString(" · ")
+                    .ifEmpty { if (sp.controllable) "" else "Control playback from the Spotify app" }
+                if (details.isNotEmpty()) {
+                    Text(
+                        details,
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                if (dur != null && !sp.controllable) {
                     LinearProgressIndicator(
                         progress = { ((pos ?: 0.0) / dur).toFloat().coerceIn(0f, 1f) },
                         modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
@@ -476,6 +512,36 @@ private fun SpotifyCard(sp: SpotifyState) {
                 onClick = { openSpotify(context) },
                 colors = ButtonDefaults.filledTonalButtonColors(containerColor = spotifyGreen.copy(alpha = 0.2f), contentColor = spotifyGreen),
             ) { Text("Open") }
+        }
+        if (sp.controllable) {
+            Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 12.dp)) {
+                if (dur != null) {
+                    SeekBar(
+                        pos, dur,
+                        colors = SliderDefaults.colors(thumbColor = spotifyGreen, activeTrackColor = spotifyGreen),
+                    ) { graph.actions.spotifySeekTo(it) }
+                }
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TransportButton(Icons.Rounded.SkipPrevious, "Previous track") { haptic(false); graph.actions.spotifyPrevious() }
+                    FilledIconButton(
+                        onClick = { haptic(true); graph.actions.spotifyToggle() },
+                        modifier = Modifier.size(64.dp),
+                        shape = RoundedCornerShape(if (sp.playing) 20.dp else 32.dp),
+                        colors = IconButtonDefaults.filledIconButtonColors(containerColor = spotifyGreen, contentColor = Color.Black),
+                    ) {
+                        Icon(if (sp.playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, if (sp.playing) "Pause" else "Play", Modifier.size(36.dp))
+                    }
+                    TransportButton(Icons.Rounded.SkipNext, "Next track") { haptic(false); graph.actions.spotifyNext() }
+                }
+                // Volume is only known once librespot has reported it.
+                sp.volume?.let { v ->
+                    VolumeSlider(v, muted = false, modifier = Modifier.padding(top = 8.dp), color = spotifyGreen) { graph.actions.spotifySetVolume(it) }
+                }
+            }
         }
     }
 }

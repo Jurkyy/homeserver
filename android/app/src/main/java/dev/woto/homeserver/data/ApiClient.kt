@@ -96,6 +96,10 @@ class ApiClient(
     suspend fun control(action: String, value: Double? = null) =
         post("control", ControlRequest.serializer(), ControlRequest(action, value), OkResponse.serializer())
 
+    /** Drive librespot: toggle/play/pause/next/previous/seek/seek_to/volume/volume_delta (docs/api-v1.md). */
+    suspend fun spotifyControl(action: String, value: Double? = null) =
+        post("spotify/control", ControlRequest.serializer(), ControlRequest(action, value), OkResponse.serializer())
+
     suspend fun screensaver(theme: String?) =
         post("screensaver", ScreensaverRequest.serializer(), ScreensaverRequest(theme), OkResponse.serializer())
 

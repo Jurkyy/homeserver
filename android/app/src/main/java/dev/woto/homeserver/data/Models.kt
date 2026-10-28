@@ -34,7 +34,23 @@ data class ServerState(
     val isPaused: Boolean get() = activity == "paused"
     /** Something is loaded in the cast player (playing or paused). */
     val hasMedia: Boolean get() = activity == "playing" || activity == "paused"
+
+    /** Spotify session the phone can drive (active on the Homeserver device and controllable by the server). */
+    val controllableSpotify: SpotifyState? get() = spotify?.takeIf { it.active && it.controllable }
+
+    /**
+     * What the media notification / widget transport controls drive: the cast player wins (same precedence as
+     * the Remote screen), otherwise a controllable Spotify session.
+     */
+    val mediaTarget: MediaTarget
+        get() = when {
+            hasMedia && !isSleeping -> MediaTarget.Cast
+            controllableSpotify != null -> MediaTarget.Spotify
+            else -> MediaTarget.None
+        }
 }
+
+enum class MediaTarget { None, Cast, Spotify }
 
 @Serializable
 data class PlayingItem(val kind: String? = null, val id: String? = null)
@@ -63,7 +79,15 @@ data class SpotifyState(
     @SerialName("position_s") val positionS: Double? = null,
     @SerialName("duration_s") val durationS: Double? = null,
     @SerialName("updated_at") val updatedAt: Long = 0,
+    /** Spotify volume 0-100; null until librespot has reported one. */
+    val volume: Double? = null,
+    /** The server can drive librespot (POST /api/v1/spotify/control); false on older hosts. */
+    val controllable: Boolean = false,
 ) {
+    /** Copy re-anchored at [nowMs] (position frozen there) — for optimistic play/pause/seek updates. */
+    fun rebased(nowMs: Long = System.currentTimeMillis(), playing: Boolean = this.playing, positionS: Double? = positionAt(nowMs)): SpotifyState =
+        copy(playing = playing, positionS = positionS, updatedAt = nowMs)
+
     /** librespot only reports on play/pause/seek/track change, so extrapolate from [updatedAt] (wall clock). */
     fun positionAt(nowMs: Long = System.currentTimeMillis()): Double? {
         val p = positionS ?: return null

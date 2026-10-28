@@ -47,6 +47,32 @@ class ApiClientTest {
     }
 
     @Test
+    fun postsSpotifyControlJson() = runBlocking {
+        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
+        api.spotifyControl("volume", 40.0)
+        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
+        api.spotifyControl("next")
+        val req = server.takeRequest()
+        assertEquals("POST", req.method)
+        assertEquals("/api/v1/spotify/control", req.path)
+        assertEquals("Bearer secret", req.getHeader("Authorization"))
+        assertEquals("""{"action":"volume","value":40.0}""", req.body.readUtf8())
+        assertEquals("""{"action":"next"}""", server.takeRequest().body.readUtf8())
+    }
+
+    @Test
+    fun surfacesSpotifyErrors() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(409).setBody("""{"error":"Spotify isn't playing on Homeserver","code":"spotify_error"}"""))
+        try {
+            api.spotifyControl("toggle")
+            fail("expected exception")
+        } catch (e: ApiException) {
+            assertEquals(409, e.status)
+            assertEquals("spotify_error", e.code)
+        }
+    }
+
+    @Test
     fun buildsQueryParams() = runBlocking {
         server.enqueue(MockResponse().setBody("""{"items":[],"total":0}"""))
         api.jfItems(parentId = "p 1", search = null, start = 60, limit = 60)

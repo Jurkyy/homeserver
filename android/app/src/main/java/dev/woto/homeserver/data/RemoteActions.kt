@@ -59,6 +59,46 @@ class RemoteActions(
         launch { api.control("volume_delta", delta) }
     }
 
+    // --- Spotify (librespot on the host) -------------------------------------------------------------------
+
+    private fun spotifyOptimistic(transform: (SpotifyState) -> SpotifyState) =
+        repo.optimistic { s -> s.spotify?.let { s.copy(spotify = transform(it)) } ?: s }
+
+    fun spotifyToggle() {
+        spotifyOptimistic { it.rebased(playing = !it.playing) }
+        launch { api.spotifyControl("toggle") }
+    }
+
+    fun spotifyPlay() {
+        spotifyOptimistic { it.rebased(playing = true) }
+        launch { api.spotifyControl("play") }
+    }
+
+    fun spotifyPause() {
+        spotifyOptimistic { it.rebased(playing = false) }
+        launch { api.spotifyControl("pause") }
+    }
+
+    fun spotifyNext() = launch { api.spotifyControl("next") }
+    fun spotifyPrevious() = launch { api.spotifyControl("previous") }
+
+    fun spotifySeekTo(seconds: Double) {
+        val s = seconds.coerceAtLeast(0.0)
+        spotifyOptimistic { it.rebased(positionS = s) }
+        launch { api.spotifyControl("seek_to", s) }
+    }
+
+    fun spotifySetVolume(volume: Double) {
+        val v = volume.coerceIn(0.0, 100.0)
+        spotifyOptimistic { it.copy(volume = v) }
+        launch { api.spotifyControl("volume", v) }
+    }
+
+    fun spotifyVolumeDelta(delta: Double) {
+        spotifyOptimistic { sp -> sp.copy(volume = sp.volume?.let { (it + delta).coerceIn(0.0, 100.0) }) }
+        launch { api.spotifyControl("volume_delta", delta) }
+    }
+
     fun screensaver(theme: String?) = launch { api.screensaver(theme) }
 
     fun power(action: String) {

@@ -15,6 +15,7 @@ import coil3.SingletonImageLoader
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import coil3.request.crossfade
 import dev.woto.homeserver.data.ApiClient
+import dev.woto.homeserver.data.MediaTarget
 import dev.woto.homeserver.data.RemoteActions
 import dev.woto.homeserver.data.SettingsStore
 import dev.woto.homeserver.data.StateRepository
@@ -53,10 +54,10 @@ class HomeserverApp : Application(), SingletonImageLoader.Factory {
             override fun onStop(owner: LifecycleOwner) = graph.repository.release(KEY_FOREGROUND)
         })
 
-        // Start the media notification service whenever something is loaded on the projector.
+        // Start the media notification service whenever something is loaded on the projector (or Spotify is controllable).
         graph.scope.launch {
             combine(graph.repository.snapshot, graph.settings.settings) { snap, s ->
-                s.mediaNotification && s.isPaired && snap != null && snap.state.hasMedia && !snap.state.isSleeping
+                s.mediaNotification && s.isPaired && snap != null && snap.state.mediaTarget != MediaTarget.None
             }.distinctUntilChanged().collect { wanted ->
                 if (wanted && !PlaybackService.running) startPlaybackService()
             }

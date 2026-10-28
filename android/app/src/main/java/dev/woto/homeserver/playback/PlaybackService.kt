@@ -6,6 +6,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import dev.woto.homeserver.MainActivity
+import dev.woto.homeserver.data.MediaTarget
 import dev.woto.homeserver.graph
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -18,7 +19,8 @@ import kotlinx.coroutines.launch
 
 /**
  * Media notification + lock-screen controls mirroring the projector. Runs only while something is loaded
- * on the projector and the setting is enabled; stops itself when the projector goes idle or to sleep.
+ * on the projector or a controllable Spotify session is active ([dev.woto.homeserver.data.ServerState.mediaTarget])
+ * and the setting is enabled; stops itself when neither is the case any more.
  */
 @UnstableApi
 class PlaybackService : MediaSessionService() {
@@ -48,7 +50,7 @@ class PlaybackService : MediaSessionService() {
             combine(g.repository.snapshot, g.settings.settings) { snap, settings -> snap to settings }.collect { (snap, settings) ->
                 p.refresh()
                 val s = snap?.state
-                val keep = settings.mediaNotification && settings.isPaired && (s == null || (s.hasMedia && !s.isSleeping))
+                val keep = settings.mediaNotification && settings.isPaired && (s == null || s.mediaTarget != MediaTarget.None)
                 if (keep) {
                     stopJob?.cancel(); stopJob = null
                 } else if (stopJob == null) {
@@ -72,7 +74,12 @@ class PlaybackService : MediaSessionService() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         val s = graph.repository.state
-        if (s == null || !s.isPlaying) shutdown()
+        val playing = when (s?.mediaTarget) {
+            MediaTarget.Cast -> s.isPlaying
+            MediaTarget.Spotify -> s.controllableSpotify?.playing == true
+            else -> false
+        }
+        if (!playing) shutdown()
     }
 
     override fun onDestroy() {

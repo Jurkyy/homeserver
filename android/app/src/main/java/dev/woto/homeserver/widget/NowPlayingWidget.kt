@@ -40,6 +40,7 @@ import coil3.request.allowHardware
 import coil3.toBitmap
 import dev.woto.homeserver.MainActivity
 import dev.woto.homeserver.R
+import dev.woto.homeserver.data.MediaTarget
 import dev.woto.homeserver.data.ServerState
 import dev.woto.homeserver.data.Urls
 import dev.woto.homeserver.graph
@@ -48,9 +49,15 @@ import dev.woto.homeserver.data.sourceLabel
 class NowPlayingWidget : GlanceAppWidget() {
 
     /** The fields the widget shows; used to avoid needless widget updates. */
-    data class Key(val title: String?, val subtitle: String?, val activity: String, val power: String, val artwork: String?) {
+    data class Key(
+        val title: String?, val subtitle: String?, val activity: String, val power: String, val artwork: String?,
+        val target: MediaTarget, val spotifyTitle: String?, val spotifyArtist: String?, val spotifyPlaying: Boolean, val spotifyArtwork: String?,
+    ) {
         companion object {
-            fun of(s: ServerState) = Key(s.title, s.subtitle, s.activity, s.power, s.artworkUrl)
+            fun of(s: ServerState): Key {
+                val sp = s.controllableSpotify
+                return Key(s.title, s.subtitle, s.activity, s.power, s.artworkUrl, s.mediaTarget, sp?.title, sp?.artist, sp?.playing == true, sp?.artworkUrl)
+            }
         }
     }
 
@@ -58,7 +65,12 @@ class NowPlayingWidget : GlanceAppWidget() {
         val g = context.graph
         val paired = g.settings.current.isPaired
         val state = g.repository.state ?: if (paired) g.repository.refresh().getOrNull() else null
-        val art = state?.takeIf { it.hasMedia }?.artworkUrl?.let { loadBitmap(context, Urls.resolve(g.settings.current.baseUrl, it)) }
+        val artwork = when (state?.mediaTarget) {
+            MediaTarget.Cast -> state.artworkUrl
+            MediaTarget.Spotify -> state.controllableSpotify?.artworkUrl
+            else -> null
+        }
+        val art = artwork?.let { loadBitmap(context, Urls.resolve(g.settings.current.baseUrl, it)) }
         provideContent {
             GlanceTheme {
                 Content(state, paired, art)
@@ -76,18 +88,23 @@ class NowPlayingWidget : GlanceAppWidget() {
 
     @Composable
     private fun Content(state: ServerState?, paired: Boolean, art: Bitmap?) {
+        val target = state?.mediaTarget ?: MediaTarget.None
+        val spotify = state?.controllableSpotify
         val title = when {
             !paired -> "Not paired"
             state == null -> "Projector offline"
+            target == MediaTarget.Cast -> state.title ?: "Playing"
+            target == MediaTarget.Spotify -> spotify?.title ?: "Spotify"
             state.isSleeping -> "Projector sleeping"
-            state.hasMedia -> state.title ?: "Playing"
             state.activity == "screensaver" -> "Screensaver"
             else -> "Nothing playing"
         }
-        val subtitle = when {
-            state == null || !state.hasMedia -> "Homeserver"
-            else -> state.subtitle ?: sourceLabel(state.source)
+        val subtitle = when (target) {
+            MediaTarget.Cast -> state?.subtitle ?: sourceLabel(state?.source)
+            MediaTarget.Spotify -> listOfNotNull("Spotify", spotify?.artist).joinToString(" · ")
+            MediaTarget.None -> "Homeserver"
         }
+        val playing = if (target == MediaTarget.Spotify) spotify?.playing == true else state?.isPlaying == true
         Row(
             modifier = GlanceModifier.fillMaxSize().background(GlanceTheme.colors.widgetBackground).cornerRadius(24.dp).padding(12.dp)
                 .clickable(actionStartActivity<MainActivity>()),
@@ -106,15 +123,15 @@ class NowPlayingWidget : GlanceAppWidget() {
                 Text(title, maxLines = 1, style = TextStyle(color = GlanceTheme.colors.onSurface, fontWeight = FontWeight.Medium, fontSize = 15.sp))
                 Text(subtitle, maxLines = 1, style = TextStyle(color = GlanceTheme.colors.onSurfaceVariant, fontSize = 13.sp))
             }
-            if (state != null && state.hasMedia) {
+            if (target != MediaTarget.None) {
                 Spacer(GlanceModifier.width(8.dp))
                 Box(
                     GlanceModifier.size(48.dp).cornerRadius(24.dp).background(GlanceTheme.colors.primary).clickable(actionRunCallback<TogglePlayAction>()),
                     contentAlignment = Alignment.Center,
                 ) {
                     Image(
-                        ImageProvider(if (state.isPlaying) R.drawable.ic_pause else R.drawable.ic_play),
-                        contentDescription = if (state.isPlaying) "Pause" else "Play",
+                        ImageProvider(if (playing) R.drawable.ic_pause else R.drawable.ic_play),
+                        contentDescription = if (playing) "Pause" else "Play",
                         modifier = GlanceModifier.size(24.dp),
                         colorFilter = ColorFilter.tint(GlanceTheme.colors.onPrimary),
                     )
@@ -134,7 +151,11 @@ class NowPlayingWidget : GlanceAppWidget() {
 class TogglePlayAction : ActionCallback {
     override suspend fun onAction(context: Context, glanceId: GlanceId, parameters: ActionParameters) {
         val g = context.graph
-        runCatching { g.api.control("toggle") }
+        // Same routing as the media notification: the cast player wins, else a controllable Spotify session.
+        val state = g.repository.state ?: g.repository.refresh().getOrNull()
+        runCatching {
+            if (state?.mediaTarget == MediaTarget.Spotify) g.api.spotifyControl("toggle") else g.api.control("toggle")
+        }
         g.repository.refresh()
         NowPlayingWidget().updateAll(context)
     }

@@ -149,6 +149,45 @@ class ModelParsingTest {
     }
 
     @Test
+    fun parsesSpotifyControllableAndVolume() {
+        val s = AppJson.decodeFromString(
+            ServerState.serializer(),
+            """{"spotify":{"active":true,"playing":false,"title":"T","volume":55,"controllable":true,"updated_at":1}}""",
+        )
+        assertTrue(s.spotify!!.controllable)
+        assertEquals(55.0, s.spotify?.volume!!, 0.0)
+        // Older hosts: neither field present; volume may also be explicitly null.
+        val old = AppJson.decodeFromString(ServerState.serializer(), fullState).spotify!!
+        assertFalse(old.controllable)
+        assertNull(old.volume)
+        val nullVol = AppJson.decodeFromString(SpotifyState.serializer(), """{"active":true,"volume":null,"controllable":true}""")
+        assertNull(nullVol.volume)
+    }
+
+    @Test
+    fun mediaTargetPrefersCastThenControllableSpotify() {
+        val sp = SpotifyState(active = true, playing = true, controllable = true)
+        assertEquals(MediaTarget.Cast, ServerState(activity = "playing", spotify = sp).mediaTarget)
+        assertEquals(MediaTarget.Spotify, ServerState(activity = "idle", spotify = sp).mediaTarget)
+        // A sleeping projector doesn't stop librespot, but the cast player is not a target then.
+        assertEquals(MediaTarget.Spotify, ServerState(power = "sleeping", activity = "paused", spotify = sp).mediaTarget)
+        assertEquals(MediaTarget.None, ServerState(activity = "idle", spotify = sp.copy(controllable = false)).mediaTarget)
+        assertEquals(MediaTarget.None, ServerState(activity = "idle", spotify = sp.copy(active = false)).mediaTarget)
+        assertEquals(MediaTarget.None, ServerState(activity = "idle").mediaTarget)
+    }
+
+    @Test
+    fun spotifyRebaseFreezesExtrapolatedPosition() {
+        val sp = SpotifyState(active = true, playing = true, positionS = 30.0, durationS = 200.0, updatedAt = 1_000_000)
+        val paused = sp.rebased(nowMs = 1_005_000, playing = false)
+        assertFalse(paused.playing)
+        assertEquals(35.0, paused.positionS!!, 0.001)
+        assertEquals(35.0, paused.positionAt(1_100_000)!!, 0.001)
+        val seeked = sp.rebased(nowMs = 1_005_000, positionS = 100.0)
+        assertEquals(101.0, seeked.positionAt(1_006_000)!!, 0.001)
+    }
+
+    @Test
     fun encodesJellyfinPlay() {
         assertEquals("""{"id":"a","resume":true}""", RequestJson.encodeToString(JfPlayRequest.serializer(), JfPlayRequest("a", true)))
         assertEquals("""{"id":"a","resume":false,"low_quality":true}""", RequestJson.encodeToString(JfPlayRequest.serializer(), JfPlayRequest("a", false, true)))

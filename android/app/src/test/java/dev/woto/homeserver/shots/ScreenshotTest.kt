@@ -48,6 +48,19 @@ class ScreenshotTest {
         save("remote_playing")
     }
 
+    @Test fun remoteSpotify() {
+        val g = rule.activity.graph
+        g.repository.push(
+            playing.copy(
+                activity = "idle", source = null, title = null, subtitle = null, positionS = null, durationS = null,
+                spotify = playing.spotify!!.copy(controllable = true, volume = 45.0),
+            ),
+        )
+        rule.setContent { HomeserverTheme(dynamicColor = false) { RemoteScreen(g) {} } }
+        rule.waitForIdle()
+        save("remote_spotify")
+    }
+
     @Test fun remoteSleeping() {
         val g = rule.activity.graph
         g.repository.push(playing.copy(power = "sleeping", activity = "idle", spotify = null))
