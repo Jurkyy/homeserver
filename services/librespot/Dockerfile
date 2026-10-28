@@ -24,6 +24,7 @@ FROM rust:alpine AS builder
 RUN apk add --no-cache \
         alsa-lib-dev \
         avahi-dev \
+        git \
         musl-dev \
         pkgconfig \
         pulseaudio-dev
@@ -85,13 +86,25 @@ ENV RUSTFLAGS="-C target-feature=-crt-static"
 # — tapping any song in a playlist played the playlist's FIRST track.
 # Fixed upstream in librespot-org/librespot#1795 (merged to dev
 # 2026-10-16, see also #1841). 99b6088 = dev HEAD 2026-10-21, includes
-# it. Move back to `cargo install librespot --version =X.Y.Z` once a
-# release (> 0.8.0) ships the fix. Same features, CLI flags and
+# it. Move the pin to a release tag (> 0.8.0) once one ships the fix
+# (DON'T go back to 0.8.0 — that brings the bug back). Same features, CLI flags and
 # --onevent env vars as 0.8.0 (dev only adds CONTEXT_URI etc.).
+#
+# Plus one local patch (control.rs + control.patch): a token-protected
+# control socket on the live Spirc (play/pause/next/prev/seek/volume),
+# because librespot itself has no control API — no MPRIS/D-Bus, no HTTP.
+# mediacast's POST /api/v1/spotify/control talks to it. The patch only
+# adds a module and one select! arm in main.rs, so it should re-apply
+# cleanly when the pin moves; `git apply` fails the build loudly if not.
 ARG LIBRESPOT_REV=99b6088bf3ea028f90192676ac1a337fa4b2ed12
-RUN cargo install librespot \
-        --git https://github.com/librespot-org/librespot \
-        --rev "$LIBRESPOT_REV" \
+WORKDIR /src/librespot
+RUN git init -q . \
+    && git fetch -q --depth 1 https://github.com/librespot-org/librespot "$LIBRESPOT_REV" \
+    && git checkout -q FETCH_HEAD
+COPY control.patch control.rs /src/homeserver/
+RUN git apply /src/homeserver/control.patch \
+    && cp /src/homeserver/control.rs src/control.rs \
+    && cargo install --path . \
         --locked \
         --no-default-features \
         --features alsa-backend,pulseaudio-backend,with-avahi,rustls-tls-webpki-roots

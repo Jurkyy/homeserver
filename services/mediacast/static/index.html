@@ -78,8 +78,21 @@
       <div class="badges"><span class="badge sp">Spotify</span><span class="activity" id="sp-state"></span></div>
       <div class="sp-title" id="sp-title"></div>
       <div class="now-sub" id="sp-sub"></div>
-      <div class="progress thin"><div class="progress-fill" id="sp-fill"></div></div>
-      <div class="sp-foot"><span class="t" id="sp-time"></span><span class="muted">Control from the Spotify app</span></div>
+      <div class="progress thin" id="sp-progress" aria-label="Spotify seek"
+           aria-valuemin="0" aria-valuemax="0" aria-valuenow="0">
+        <div class="progress-fill" id="sp-fill"></div>
+        <div class="progress-knob" id="sp-knob" hidden></div>
+      </div>
+      <div class="sp-foot"><span class="t" id="sp-time"></span><span class="muted" id="sp-hint">Control from the Spotify app</span></div>
+    </div>
+    <div class="sp-controls" id="sp-controls" hidden>
+      <button type="button" class="btn icon" id="sp-prev" aria-label="Previous track">⏮</button>
+      <button type="button" class="btn icon play" id="sp-toggle" aria-label="Play">▶</button>
+      <button type="button" class="btn icon" id="sp-next" aria-label="Next track">⏭</button>
+      <div class="sp-vol">
+        <input type="range" id="sp-vol" min="0" max="100" step="1" value="50" aria-label="Spotify volume">
+        <span class="t vol-val" id="sp-vol-val">—</span>
+      </div>
     </div>
   </section>
 

@@ -53,6 +53,8 @@ State = {
     "title": string | null, "artist": string | null, "album": string | null,
     "artwork_url": string | null,
     "position_s": number | null, "duration_s": number | null,
+    "volume"?: number,                // 0-100 librespot volume; absent until librespot reports one
+    "controllable": boolean,          // POST /spotify/control is available (server configured)
     "updated_at": number              // unix ms of last librespot event
   } | null,
   "night": {                          // overnight deep sleep (real suspend); null/absent on older hosts
@@ -80,9 +82,18 @@ Notes:
 - `POST /api/v1/cast` `{ "url": string }` → `{ "ok": true }` — YouTube / any URL to the projector.
 - `POST /api/v1/control` `{ "action": "toggle"|"play"|"pause"|"stop"|"seek"|"seek_to"|"volume"|"volume_delta", "value"?: number }`
   → `{ "ok": true }`. `seek`/`volume_delta` are relative (s / percent points), `seek_to` absolute seconds, `volume` 0-100.
-  Controls the cast player only; Spotify is controlled from the Spotify app.
+  Controls the cast player only; for Spotify use `/spotify/control`.
   Missing `value` for a value action → 400 `missing_value`; nothing on the projector → 409 `no_active_cast`
   (`stop` and `volume*` never 409: stopping nothing succeeds, volume is remembered for the next cast).
+- `POST /api/v1/spotify/control` `{ "action": "toggle"|"play"|"pause"|"next"|"previous"|"seek"|"seek_to"|"volume"|"volume_delta", "value"?: number }`
+  → `{ "ok": true }` — drives the librespot Connect session (same value semantics as `/control`: `seek` relative s,
+  `seek_to` absolute s, `volume` 0-100, `volume_delta` percent points). `toggle` picks play/pause from `spotify.playing`.
+  `play` also asks Spotify to transfer playback to this device, so it resumes a session that went inactive (it takes
+  playback over from the phone/desktop if that is where it now plays). While Homeserver isn't the active Connect
+  device librespot ignores the other actions (still `ok`). The result shows up as normal `state` pushes (librespot
+  events). Errors: 400 `missing_value` / `bad_action`; 409 `spotify_unavailable` (not configured — see
+  `spotify.controllable`) or `spotify_error` (librespot refused, e.g. no session since it started); 502
+  `spotify_unreachable` (librespot container down).
 - `POST /api/v1/screensaver` `{ "theme": string | null }` → `{ "ok": true }` — `null` stops it.
 
 ## Power
@@ -157,7 +168,7 @@ Clients should refetch silently and compute "N new" themselves (ids not seen bef
 ## Internal
 
 - `POST /api/v1/spotify/event` (token) — librespot's `--onevent` hook posts
-  `{ "event", "track_id"?, "name"?, "artists"? (newline-separated), "album"?, "covers"? (newline-separated URLs), "duration_ms"?, "position_ms"? }`.
+  `{ "event", "track_id"?, "name"?, "artists"? (newline-separated), "album"?, "covers"? (newline-separated URLs), "duration_ms"?, "position_ms"?, "volume"? (0-65535) }`.
   Not for clients.
 
 ## Health

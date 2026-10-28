@@ -166,6 +166,14 @@ h2 { font-size: 1.05rem; margin: 0 0 .6rem; font-weight: 650; }
 .sp-meta { flex: 1; min-width: 0; }
 .sp-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sp-foot { display: flex; justify-content: space-between; gap: 8px; font-size: .78rem; flex-wrap: wrap; }
+.spotify.controllable { flex-wrap: wrap; }
+.progress.thin.seekable { height: 6px; cursor: pointer; }
+.progress.thin.seekable::before { display: block; }
+.sp-controls { flex-basis: 100%; display: flex; align-items: center; gap: 6px; }
+.sp-controls .btn { min-width: 52px; }
+.sp-controls .play { background: var(--spotify); border-color: var(--spotify); color: #06240f; font-size: 1.1rem; }
+.sp-vol { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; margin-left: 6px; }
+.sp-vol input { flex: 1; min-width: 0; height: 44px; accent-color: var(--spotify); }
 
 /* Cast form */
 .cast-form { display: flex; gap: 8px; }

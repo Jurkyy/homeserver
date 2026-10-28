@@ -58,6 +58,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 TOKEN = os.environ.get("MEDIACAST_TOKEN", "")
 HOST_URL = os.environ.get("MEDIACAST_HOST_URL", "http://host.docker.internal:8766/open")
 HOST_BASE = HOST_URL.rsplit("/", 1)[0]
+# librespot's control socket (homeserver patch, services/librespot/control.rs):
+# "host:port" reachable from this container; blank disables Spotify control.
+SPOTIFY_CONTROL_ADDR = os.environ.get("LIBRESPOT_CONTROL_ADDR", "").strip()
+SPOTIFY_CONTROL_TIMEOUT = float(os.environ.get("LIBRESPOT_CONTROL_TIMEOUT", "6.0"))
 HOST_TIMEOUT = float(os.environ.get("MEDIACAST_HOST_TIMEOUT", "5.0"))
 # Casting a YouTube URL can make the host helper resolve the stream with
 # yt-dlp before it answers; give casts their own roomy budget.
@@ -318,7 +322,7 @@ _OFFLINE_STATE = {
 def _merged_state() -> dict:
     st = dict(_host_state["state"] or _OFFLINE_STATE)
     sp = _spotify
-    st["spotify"] = dict(sp) if sp else None
+    st["spotify"] = dict(sp, controllable=bool(SPOTIFY_CONTROL_ADDR)) if sp else None
     st["updated_at"] = max(int(st.get("updated_at") or 0), int(sp["updated_at"]) if sp else 0)
     return st
 
@@ -574,6 +578,7 @@ class SpotifyEvent(BaseModel):
     covers: str | None = None
     duration_ms: int | None = None
     position_ms: int | None = None
+    volume: int | None = None      # volume_changed: librespot 0-65535
 
 
 @api.post("/spotify/event", dependencies=authed)
@@ -606,8 +611,12 @@ async def api_spotify_event(ev: SpotifyEvent) -> dict:
         sp.update(active=True, playing=True)
     elif e in ("paused", "stopped", "end_of_track", "unavailable"):
         sp["playing"] = False
+    elif e == "volume_changed":
+        if ev.volume is None:
+            return {"ok": True}
+        sp["volume"] = round(max(0, min(65535, ev.volume)) * 100 / 65535)
     elif e not in ("seeked", "position_correction", "loading", "preloading"):
-        return {"ok": True}   # volume/shuffle/repeat/…: not part of the state
+        return {"ok": True}   # shuffle/repeat/…: not part of the state
     if ev.position_ms is not None:
         sp["position_s"] = round(ev.position_ms / 1000, 1)
     sp["updated_at"] = now_ms
@@ -616,6 +625,73 @@ async def api_spotify_event(ev: SpotifyEvent) -> dict:
     # The host helper's night deep-sleep idle check needs to know whether
     # Spotify is playing (it also watches PulseAudio, this is the fallback).
     _bg(_host_spotify(sp))
+    return {"ok": True}
+
+
+class V1SpotifyControl(BaseModel):
+    action: str
+    value: float | None = None
+
+
+_SPOTIFY_VALUE_ACTIONS = {"seek", "seek_to", "volume", "volume_delta"}
+
+
+def _spotify_position_s(sp: dict) -> float:
+    """Current position, extrapolated from the last librespot event."""
+    pos = float(sp.get("position_s") or 0)
+    if sp.get("playing") and sp.get("updated_at"):
+        pos += max(0.0, time.time() - sp["updated_at"] / 1000)
+    dur = sp.get("duration_s")
+    return min(pos, float(dur)) if dur else pos
+
+
+async def _spotify_send(line: str) -> None:
+    """One request to librespot's control socket: `<token> <cmd> [arg]`."""
+    host, _, port = SPOTIFY_CONTROL_ADDR.rpartition(":")
+    try:
+        async with asyncio.timeout(SPOTIFY_CONTROL_TIMEOUT):
+            reader, writer = await asyncio.open_connection(host.strip("[]"), int(port))
+            try:
+                writer.write(f"{TOKEN} {line}\n".encode())
+                await writer.drain()
+                reply = (await reader.readline()).decode(errors="replace").strip()
+            finally:
+                writer.close()
+                with contextlib.suppress(Exception):
+                    await writer.wait_closed()
+    except (OSError, TimeoutError, ValueError) as exc:
+        raise ApiError(502, f"librespot control unreachable: {exc}", "spotify_unreachable")
+    if reply != "ok":
+        raise ApiError(409, f"librespot: {reply.removeprefix('err ').strip() or 'no reply'}", "spotify_error")
+
+
+@api.post("/spotify/control", dependencies=authed)
+async def api_spotify_control(req: V1SpotifyControl) -> dict:
+    """Play/pause/skip/seek/volume on the librespot Connect session."""
+    if not SPOTIFY_CONTROL_ADDR or not TOKEN:
+        raise ApiError(409, "Spotify control is not configured", "spotify_unavailable")
+    a, v = req.action, req.value
+    if a in _SPOTIFY_VALUE_ACTIONS and v is None:
+        raise ApiError(400, f"action {a!r} needs a numeric value", "missing_value")
+    sp = _spotify or {}
+    if a == "toggle":
+        a = "pause" if sp.get("playing") else "play"
+    if a in ("play", "pause", "next"):
+        line = a
+    elif a in ("previous", "prev"):
+        line = "prev"
+    elif a in ("seek", "seek_to"):
+        target = float(v) + (_spotify_position_s(sp) if a == "seek" else 0.0)
+        dur = sp.get("duration_s")
+        if dur:
+            target = min(target, max(0.0, float(dur) - 1))
+        line = f"seek {int(max(0.0, target) * 1000)}"
+    elif a in ("volume", "volume_delta"):
+        pct = float(v) + (float(sp.get("volume") or 0) if a == "volume_delta" else 0.0)
+        line = f"volume {round(max(0.0, min(100.0, pct)) * 65535 / 100)}"
+    else:
+        raise ApiError(400, f"unknown action {req.action!r}", "bad_action")
+    await _spotify_send(line)
     return {"ok": True}
 
 

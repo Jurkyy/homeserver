@@ -216,6 +216,22 @@
     $('sp-title').textContent = sp.title || 'Spotify';
     $('sp-sub').textContent = [sp.artist, sp.album].filter(Boolean).join(' · ');
     $('sp-state').textContent = sp.playing ? 'Playing' : (sp.active ? 'Paused' : 'Inactive');
+    const ctl = !!sp.controllable;
+    $('spotify').classList.toggle('controllable', ctl);
+    $('sp-controls').hidden = !ctl;
+    $('sp-hint').hidden = ctl;
+    $('sp-knob').hidden = !ctl;
+    const bar = $('sp-progress');
+    bar.classList.toggle('seekable', ctl);
+    if (ctl) { bar.setAttribute('role', 'slider'); bar.tabIndex = 0; } else { bar.removeAttribute('role'); bar.removeAttribute('tabindex'); }
+    const tg = $('sp-toggle');
+    tg.textContent = sp.playing ? '❚❚' : '▶';
+    tg.setAttribute('aria-label', sp.playing ? 'Pause' : 'Play');
+    if (Date.now() - spVolTouchedAt > 1500) {
+      const known = typeof sp.volume === 'number';
+      if (known) $('sp-vol').value = sp.volume;
+      $('sp-vol-val').textContent = known ? `${Math.round(sp.volume)}%` : '—';
+    }
     const img = $('sp-art');
     if (sp.artwork_url) {
       if (img.getAttribute('src') !== sp.artwork_url) img.src = sp.artwork_url;
@@ -226,14 +242,75 @@
     tickSpotify();
   }
 
-  function tickSpotify() {
+  function tickSpotify(overridePos) {
     const sp = state && state.spotify;
     if (!sp) return;
-    const pos = spotifyPosition(sp);
+    const pos = overridePos != null ? overridePos : spotifyPosition(sp);
     const dur = sp.duration_s || 0;
-    $('sp-fill').style.width = dur && pos != null ? `${Math.min(100, (pos / dur) * 100)}%` : '0%';
+    const pct = dur && pos != null ? `${Math.max(0, Math.min(100, (pos / dur) * 100))}%` : '0%';
+    $('sp-fill').style.width = pct;
+    $('sp-knob').style.left = pct;
     $('sp-time').textContent = dur ? `${fmtTime(pos)} / ${fmtTime(dur)}` : '';
+    const bar = $('sp-progress');
+    bar.setAttribute('aria-valuemax', String(Math.round(dur)));
+    bar.setAttribute('aria-valuenow', String(Math.round(pos || 0)));
   }
+
+  // Spotify (librespot) transport — only shown when state.spotify.controllable.
+  let spVolTouchedAt = 0;
+  let spSeeking = false;
+  const spControl = (action, value) =>
+    act('POST', '/spotify/control', value === undefined ? { action } : { action, value });
+  $('sp-prev').addEventListener('click', () => spControl('previous'));
+  $('sp-next').addEventListener('click', () => spControl('next'));
+  $('sp-toggle').addEventListener('click', () => spControl('toggle'));
+  (() => {
+    const bar = $('sp-progress');
+    let pendingPos = null;
+    const dur = () => (state && state.spotify && state.spotify.duration_s) || 0;
+    const posFromEvent = (e) => {
+      const r = bar.getBoundingClientRect();
+      return Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * dur();
+    };
+    bar.addEventListener('pointerdown', (e) => {
+      const sp = state && state.spotify;
+      if (!sp || !sp.controllable || !dur()) return;
+      spSeeking = true;
+      bar.setPointerCapture(e.pointerId);
+      pendingPos = posFromEvent(e);
+      tickSpotify(pendingPos);
+    });
+    bar.addEventListener('pointermove', (e) => {
+      if (!spSeeking) return;
+      pendingPos = posFromEvent(e);
+      tickSpotify(pendingPos);
+    });
+    const finish = (commit) => {
+      if (!spSeeking) return;
+      spSeeking = false;
+      if (commit && pendingPos != null) {
+        const sp = state.spotify;   // optimistic until librespot's `seeked` event
+        sp.position_s = pendingPos; sp.updated_at = Date.now();
+        spControl('seek_to', Math.round(pendingPos));
+      }
+      pendingPos = null;
+      tickSpotify();
+    };
+    bar.addEventListener('pointerup', () => finish(true));
+    bar.addEventListener('pointercancel', () => finish(false));
+    bar.addEventListener('keydown', (e) => {
+      if (!(state && state.spotify && state.spotify.controllable)) return;
+      if (e.key === 'ArrowLeft') { e.preventDefault(); spControl('seek', -10); }
+      if (e.key === 'ArrowRight') { e.preventDefault(); spControl('seek', 10); }
+    });
+    const vol = $('sp-vol');
+    const send = debounce((v) => spControl('volume', v), 250);
+    vol.addEventListener('input', () => {
+      spVolTouchedAt = Date.now();
+      $('sp-vol-val').textContent = `${vol.value}%`;
+      send(Number(vol.value));
+    });
+  })();
 
   // ---------------------------------------------------------------- night deep sleep
 
@@ -282,7 +359,7 @@
   setInterval(() => {
     if (document.hidden || !state) return;
     if (state.activity === 'playing' && !seeking) renderProgress();
-    if (state.spotify && state.spotify.playing) tickSpotify();
+    if (state.spotify && state.spotify.playing && !spSeeking) tickSpotify();
   }, 500);
 
   // ---------------------------------------------------------------- transport

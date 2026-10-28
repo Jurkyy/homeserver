@@ -4,7 +4,7 @@
 #
 # librespot (0.8 / pinned dev rev) passes the event in env vars: PLAYER_EVENT always; then
 # depending on the event TRACK_ID, NAME, ARTISTS / COVERS (newline-
-# separated), ALBUM, DURATION_MS, POSITION_MS. librespot runs on the host
+# separated), ALBUM, DURATION_MS, POSITION_MS, VOLUME (volume_changed, 0-65535). librespot runs on the host
 # network, so mediacast's published port is reachable on loopback.
 # Best-effort: never block or fail librespot over this.
 
@@ -22,9 +22,10 @@ body=$(jq -n \
     --arg covers "${COVERS:-}" \
     --argjson duration_ms "$(num "${DURATION_MS:-}")" \
     --argjson position_ms "$(num "${POSITION_MS:-}")" \
+    --argjson volume "$(num "${VOLUME:-}")" \
     '{event:$event, track_id:$track_id, name:$name, artists:$artists,
       album:$album, covers:$covers, duration_ms:$duration_ms,
-      position_ms:$position_ms}
+      position_ms:$position_ms, volume:$volume}
      | with_entries(select(.value != "" and .value != null))') || exit 0
 
 curl -fsS --max-time 3 -o /dev/null \

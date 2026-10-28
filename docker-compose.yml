@@ -135,6 +135,12 @@ services:
       # to mediacast's published port on loopback (host network).
       - MEDIACAST_TOKEN=${MEDIACAST_TOKEN}
       - MEDIACAST_EVENT_URL=http://127.0.0.1:8765/api/v1/spotify/event
+      # Control socket (homeserver patch, services/librespot/control.rs)
+      # that mediacast's /api/v1/spotify/control drives. Host network, so
+      # 0.0.0.0 is needed for mediacast to reach it via the docker bridge
+      # gateway; the token is the trust boundary (same as mediacast-host).
+      - LIBRESPOT_CONTROL_ADDR=0.0.0.0:${LIBRESPOT_CONTROL_PORT:-36422}
+      - LIBRESPOT_CONTROL_TOKEN=${MEDIACAST_TOKEN}
     volumes:
       - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
       - /run/avahi-daemon/socket:/run/avahi-daemon/socket
@@ -210,6 +216,8 @@ services:
     environment:
       - MEDIACAST_TOKEN=${MEDIACAST_TOKEN}
       - MEDIACAST_HOST_URL=http://host.docker.internal:8766/open
+      # librespot's control socket (Spotify play/pause/skip/seek/volume).
+      - LIBRESPOT_CONTROL_ADDR=host.docker.internal:${LIBRESPOT_CONTROL_PORT:-36422}
       # Base URLs offered in the portal's "Pair phone" QR code.
       - MEDIACAST_PAIR_URLS=${MEDIACAST_PAIR_URLS:-http://homeserver.local}
       # mrpflix (Jellyfin) catalog in the cast UI — optional. A blank

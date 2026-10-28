@@ -1,0 +1,54 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 241b269..beebce6 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -179,6 +179,9 @@ tokio = { version = "1", features = [
+     "signal",
+     "sync",
+     "process",
++    "net",
++    "io-util",
++    "time",
+ ] }
+ url = "2.2"
+ 
+diff --git a/src/main.rs b/src/main.rs
+index 03cd358..7bf087a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -38,6 +38,7 @@ use thiserror::Error;
+ use tokio::sync::Semaphore;
+ use url::Url;
+ 
++mod control;
+ mod player_event_handler;
+ use player_event_handler::{EventHandler, run_program_on_sink_events};
+ 
+@@ -1928,6 +1929,7 @@ async fn main() {
+     let mut discovery = None;
+     let mut connecting = false;
+     let mut _event_handler: Option<EventHandler> = None;
++    let mut control_rx = control::spawn();
+ 
+     let mut session = Session::new(setup.session_config.clone(), setup.cache.clone());
+ 
+@@ -2138,6 +2140,19 @@ async fn main() {
+                     exit(1);
+                 }
+             },
++            req = async {
++                match control_rx.as_mut() {
++                    Some(rx) => rx.recv().await,
++                    None => None,
++                }
++            }, if control_rx.is_some() => {
++                match req {
++                    Some((cmd, reply)) => {
++                        let _ = reply.send(control::apply(spirc.as_ref(), cmd));
++                    }
++                    None => control_rx = None,
++                }
++            },
+             _ = async {}, if player.is_invalid() => {
+                 error!("Player shut down unexpectedly");
+                 exit(1);
