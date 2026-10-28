@@ -1349,7 +1349,7 @@ def control_set_pause(paused: bool) -> tuple[int, str]:
     return 404, f"no active cast ({pout})"
 
 
-def stop_active_playback() -> str:
+def stop_active_playback(blank: bool = False) -> str:
     """Explicitly end whatever is currently on the projector before a new
     cast starts, so the old video never keeps playing underneath the new one.
 
@@ -1379,6 +1379,12 @@ def stop_active_playback() -> str:
     )
     closed = _cdp_close_media_tabs()
     notes.append(f"ff_paused ff_closed={closed}")
+    if blank:
+        # Going dark (sleep / screen off): a merely *paused* YouTube tab
+        # does not stay paused — the screensaver tab left that way resumed
+        # by itself after a wake and played (unmuted, as an "untracked"
+        # cast). Blank the surviving page so nothing is left to resume.
+        notes.append(f"ff_blanked={_cdp_eval(_BLANK_TAB_JS) is True}")
     return " ".join(notes)
 
 
@@ -2072,7 +2078,7 @@ def _clear_media_locked() -> None:
 def do_sleep(reason: str) -> None:
     """Soft sleep: stop playback + screensaver, DPMS off, suspend the
     idle-screensaver watchdog until something wakes us."""
-    stopped = stop_active_playback()
+    stopped = stop_active_playback(blank=True)
     with _state_lock:
         _clear_media_locked()
         _state["power"] = "sleeping"
@@ -2086,7 +2092,7 @@ def do_sleep(reason: str) -> None:
 def do_screen_off() -> None:
     """Legacy screen-off: stop playback, DPMS off. Cleared by physical
     input or any cast, like sleep — but power stays "on"."""
-    stopped = stop_active_playback()
+    stopped = stop_active_playback(blank=True)
     rc, out = _run(["xset", "dpms", "force", "off"])
     with _state_lock:
         _clear_media_locked()
@@ -2289,6 +2295,16 @@ def _discover(now: float) -> None:
     if not _pb_live(pb) or pb.get("paused"):
         return
     vid = pb.get("video_id") or ""
+    theme = _screensaver_theme_for(vid)
+    if theme:
+        # A leftover *screensaver* tab started playing again on its own
+        # (seen 2026-10-28: the woods tab, paused through a day of soft
+        # sleep, resumed ~10 s after a wake). Adopting it as a user cast
+        # made the pulse guard *unmute* it — the screensaver played with
+        # sound. It is still the screensaver: re-adopt it as one (muted),
+        # or blank it when no screensaver is allowed right now.
+        _adopt_screensaver(theme, pb)
+        return
     url = f"https://www.youtube.com/watch?v={vid}" if vid else "about:unknown"
     media = _media_meta(url, {"source": "youtube" if vid else "url"})
     media["backend"] = pb.get("backend", "")
@@ -2301,6 +2317,49 @@ def _discover(now: float) -> None:
             _pb.update(pb)
             _pb["for"] = media["started"]
             LOG.info("discovered running playback (%s)", media["backend"])
+
+
+def _screensaver_theme_for(vid: str | None) -> str | None:
+    """The screensaver theme whose video this is, or None."""
+    if not vid:
+        return None
+    for key, (_label, url) in SCREENSAVER_THEMES.items():
+        if _yt_video_id(url) == vid:
+            return key
+    return None
+
+
+def _adopt_screensaver(theme: str, pb: dict) -> None:
+    """A screensaver video found playing untracked: mark it the active
+    (silent) screensaver so every mute path — pulse guard, the in-page
+    volume lock (_mc_lock_volume_js) — applies again, and hard-mute it
+    right now instead of waiting for the next poll."""
+    with _state_lock:
+        if _state["media"] is not None or _state["screensaver"]:
+            return
+        dormant = _state["screen_off"] or _state["power"] == "sleeping"
+    if dormant or _night_blocks_screensaver():
+        out = control_stop()
+        LOG.info("discovered screensaver %r playing while not allowed — stopped (%s)",
+                 theme, out)
+        return
+    _, url = SCREENSAVER_THEMES[theme]
+    media = _media_meta(url, {"source": "screensaver"})
+    media["backend"] = pb.get("backend", "")
+    with _state_lock:
+        if _state["media"] is not None or _state["screensaver"]:
+            return
+        _state["screensaver"] = theme
+        _state["screensaver_since"] = time.time()
+        _state["ss_sound"] = False
+        _state["media"] = media
+        _pb.clear()
+        _pb.update(pb)
+        _pb["for"] = media["started"]
+    _cdp_eval("document.querySelectorAll('video,audio')"
+              ".forEach(function(m){try{m.muted=true;}catch(e){}}); true")
+    LOG.info("discovered screensaver %r playing — re-adopted it (muted)", theme)
+    _publish()
 
 
 def _poll_dormant(now: float, state: dict, xmon: _XMonitor, idle: int | None) -> None:
@@ -2764,7 +2823,7 @@ def do_deep_sleep(reason: str) -> None:
         _night["suspending"] = True
         _night["countdown_until"] = None
     wake_at = _next_end_epoch(now)
-    stopped = stop_active_playback()
+    stopped = stop_active_playback(blank=True)
     with _state_lock:
         _clear_media_locked()
         _state["power"] = "sleeping"
