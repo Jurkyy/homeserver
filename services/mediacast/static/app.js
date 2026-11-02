@@ -899,7 +899,11 @@
         $('jf').classList.add('hidden');
         return;
       }
-      if (append) toast(e.message, true); else f.error = `Couldn't load: ${e.message}`;
+      // Configured but unreachable: keep the section visible with the error
+      // instead of silently hiding it.
+      $('jf').classList.remove('hidden');
+      const msg = e.status === 502 ? 'mrpflix is unreachable right now' : e.message;
+      if (append) toast(msg, true); else f.error = `Couldn't load: ${msg}`;
     } finally {
       if (seq === jf.seq) { f.loading = false; jfRenderFrame(); }
     }
