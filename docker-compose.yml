@@ -229,7 +229,7 @@ services:
       # SSE `event: feed` when it changes. Default 5.
       - YT_FEED_REFRESH_MIN=${YT_FEED_REFRESH_MIN:-5}
     # No dns: override — Docker's embedded resolver forwards to the host
-    # resolver (the LAN router), which resolves jf.mrplink.com etc. fine.
+    # resolver (the LAN router), which resolves watch.mrpflix.com etc. fine.
     # (Used to pin Cloudflare to dodge NordVPN breaking container DNS;
     # NordVPN was dropped.)
     extra_hosts:
