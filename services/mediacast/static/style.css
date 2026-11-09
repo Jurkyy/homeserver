@@ -159,6 +159,7 @@ h2 { font-size: 1.05rem; margin: 0 0 .6rem; font-weight: 650; }
 .volume-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
 .volume-row input { flex: 1; min-width: 0; height: 44px; accent-color: var(--accent); }
 .vol-val { min-width: 2.6em; text-align: right; }
+.ms-opt { margin-top: 4px; }
 
 /* Spotify */
 .spotify { display: flex; gap: 14px; align-items: center; }

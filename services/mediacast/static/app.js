@@ -183,6 +183,7 @@
 
     renderSpotify();
     renderScreensaver();
+    syncMediaSession();
   }
 
   function renderProgress(overridePos) {
@@ -429,6 +430,155 @@
     $('vol-down').addEventListener('click', () => step(-5));
     $('vol-up').addEventListener('click', () => step(5));
   })();
+
+  // ---------------------------------------------------------------- phone media notification
+  //
+  // Media Session for what is casting on the projector (YouTube / mrpflix / link — never Spotify,
+  // whose own app already has a Connect notification). Limitations:
+  // - Chrome on Android only shows the notification while this page itself plays media of >= 5 s,
+  //   so we loop a generated 10 s WAV of digital silence at normal volume (a muted or volume-0
+  //   element doesn't count). It has to start from a tap (autoplay policy); after the first tap on
+  //   the page later starts are allowed, so it then follows the cast by itself.
+  // - Media Session isn't [SecureContext]-gated, so this works on plain http://192.168.0.22.
+  // - Such media takes full Android audio focus: starting it pauses whatever the phone itself is
+  //   playing (e.g. Spotify playing locally). We only hold it while a cast is actually playing,
+  //   release it on pause/stop, and once the system pauses it (another app took focus) we don't
+  //   take focus back until the user touches a cast control. The toggle switches it off entirely.
+  // - The page must stay open in a tab; closing it or Android killing the browser ends it.
+  // - No queue on the projector, so there are no previous/next track buttons.
+
+  const MS = 'mediaSession' in navigator;
+  let msAudio = null;
+  let msActivated = false;   // the page has had a user gesture, so play() is allowed
+  let msYielded = false;     // another app took audio focus; wait for a cast-control tap
+  let msOurPause = false;    // the element pause in flight is ours, not the system's
+  let msMetaKey = '';
+  let msHandlersOn = false;
+  let msEnabled = store.get('ms_notify', true);
+
+  function silentWavUrl() {
+    const rate = 8000, secs = 10, n = rate * secs;   // 8-bit mono PCM, 0x80 = silence
+    const buf = new ArrayBuffer(44 + n), v = new DataView(buf);
+    const str = (o, t) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
+    str(0, 'RIFF'); v.setUint32(4, 36 + n, true); str(8, 'WAVE');
+    str(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, rate, true); v.setUint32(28, rate, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true);
+    str(36, 'data'); v.setUint32(40, n, true);
+    new Uint8Array(buf, 44).fill(0x80);
+    return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+  }
+
+  function castActive() {
+    const s = state;
+    return !!(s && (s.activity === 'playing' || s.activity === 'paused') && s.source && s.source !== 'screensaver');
+  }
+
+  function msPlay() {
+    if (!msAudio) {
+      msAudio = new Audio();
+      msAudio.loop = true;
+      msAudio.preload = 'auto';
+      msAudio.addEventListener('pause', () => {
+        // Paused by the system (audio focus lost to another app) rather than by us.
+        if (!msOurPause && castActive()) msYielded = true;
+        msOurPause = false;
+      });
+    }
+    if (!msAudio.getAttribute('src')) msAudio.src = silentWavUrl();
+    if (!msAudio.paused) return;
+    msAudio.play().catch(() => { /* NotAllowedError until the next tap */ });
+  }
+
+  function msPause(release) {
+    if (!msAudio) return;
+    if (!msAudio.paused) { msOurPause = true; msAudio.pause(); }
+    if (release && msAudio.getAttribute('src')) {
+      const u = msAudio.src;
+      msAudio.removeAttribute('src');
+      msAudio.load();               // drop the player so Chrome removes the notification
+      URL.revokeObjectURL(u);
+    }
+  }
+
+  function msSetHandlers(on) {
+    if (on === msHandlersOn) return;
+    msHandlersOn = on;
+    const optimistic = (pos) => { if (state && pos != null) { state.position_s = pos; stateAt = Date.now(); } };
+    const h = {
+      play: () => { msYielded = false; msPlay(); control('play'); },
+      pause: () => { control('pause'); },
+      stop: () => { control('stop'); },
+      seekbackward: (d) => { const o = (d && d.seekOffset) || 10; optimistic(Math.max(0, (castPosition() || 0) - o)); control('seek', -o); },
+      seekforward: (d) => { const o = (d && d.seekOffset) || 10; optimistic((castPosition() || 0) + o); control('seek', o); },
+      seekto: (d) => {
+        if (!d || d.seekTime == null) return;
+        optimistic(d.seekTime);
+        control('seek_to', Math.round(d.seekTime));
+      },
+      previoustrack: null,
+      nexttrack: null,
+    };
+    Object.keys(h).forEach((k) => {
+      try { navigator.mediaSession.setActionHandler(k, on ? h[k] : null); } catch (_) { /* unsupported action */ }
+    });
+  }
+
+  function syncMediaSession() {
+    if (!MS) return;
+    const active = castActive();
+    $('ms-opt').hidden = !active;
+    const ms = navigator.mediaSession;
+    if (!active || !msEnabled) {
+      msYielded = false;
+      msPause(true);
+      msSetHandlers(false);
+      if (msMetaKey) { ms.metadata = null; msMetaKey = ''; }
+      ms.playbackState = 'none';
+      return;
+    }
+    const s = state;
+    const art = s.artwork_url ? new URL(s.artwork_url, location.href).href : new URL('/static/icon-512.png', location.href).href;
+    const key = JSON.stringify([s.title, s.subtitle, art, s.source]);
+    if (key !== msMetaKey && 'MediaMetadata' in window) {
+      msMetaKey = key;
+      ms.metadata = new MediaMetadata({
+        title: s.title || SOURCE[s.source] || 'Projector',
+        artist: s.subtitle || '',
+        album: `Projector · ${SOURCE[s.source] || s.source}`,
+        artwork: [{ src: art }],
+      });
+    }
+    msSetHandlers(true);
+    const playing = s.activity === 'playing';
+    ms.playbackState = playing ? 'playing' : 'paused';
+    if (s.duration_s > 0 && ms.setPositionState) {
+      try {
+        ms.setPositionState({ duration: s.duration_s, position: Math.max(0, Math.min(castPosition() || 0, s.duration_s)), playbackRate: 1 });
+      } catch (_) { /* inconsistent values */ }
+    }
+    if (playing && msActivated && !msYielded) msPlay();
+    else if (!playing) msPause(false);
+  }
+
+  if (MS) {
+    const tg = $('ms-toggle');
+    tg.checked = msEnabled;
+    tg.addEventListener('change', () => {
+      msEnabled = tg.checked;
+      store.set('ms_notify', msEnabled);
+      msYielded = false;
+      syncMediaSession();
+    });
+    // Gestures that may start the silent track. Touching a cast control also reclaims audio
+    // focus after another app took it; a tap elsewhere on the page doesn't.
+    const CAST_UI = '#now, #cast-form, #yt-grid, #jf-grid, #sheet';
+    const onGesture = (e) => {
+      msActivated = true;
+      if (e.target && e.target.closest && e.target.closest(CAST_UI)) msYielded = false;
+      syncMediaSession();
+    };
+    ['click', 'keydown', 'touchend'].forEach((t) => document.addEventListener(t, onGesture, true));
+  }
 
   // ---------------------------------------------------------------- power
 
