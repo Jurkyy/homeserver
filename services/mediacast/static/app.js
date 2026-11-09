@@ -457,15 +457,27 @@
   let msEnabled = store.get('ms_notify', true);
 
   function silentWavUrl() {
-    const rate = 8000, secs = 10, n = rate * secs;   // 8-bit mono PCM, 0x80 = silence
-    const buf = new ArrayBuffer(44 + n), v = new DataView(buf);
+    // 16-bit mono PCM (the most widely decodable WAV) carrying +-1 LSB of noise (~ -90 dBFS,
+    // inaudible) rather than digital zero, so no browser can treat it as a silent player.
+    const rate = 22050, secs = 10, n = rate * secs;
+    const buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
     const str = (o, t) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
-    str(0, 'RIFF'); v.setUint32(4, 36 + n, true); str(8, 'WAVE');
+    str(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); str(8, 'WAVE');
     str(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-    v.setUint32(24, rate, true); v.setUint32(28, rate, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true);
-    str(36, 'data'); v.setUint32(40, n, true);
-    new Uint8Array(buf, 44).fill(0x80);
+    v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    str(36, 'data'); v.setUint32(40, n * 2, true);
+    const pcm = new Int16Array(buf, 44, n);
+    for (let i = 0; i < n; i++) pcm[i] = (i & 1) ? 1 : -1;
     return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+  }
+
+  // Visible reason next to the toggle: browsers fail this silently, so say what happened.
+  let msStatusText = '';
+  function msStatus(t) {
+    if (t === msStatusText) return;
+    msStatusText = t;
+    const el = $('ms-status');
+    if (el) el.textContent = t ? `· ${t}` : '';
   }
 
   function castActive() {
@@ -483,10 +495,17 @@
         if (!msOurPause && castActive()) msYielded = true;
         msOurPause = false;
       });
+      msAudio.addEventListener('playing', () => msStatus('active'));
+      msAudio.addEventListener('error', () => {
+        const e = msAudio.error;
+        if (msAudio.getAttribute('src')) msStatus(`audio error ${e ? e.code : '?'}${e && e.message ? ': ' + e.message : ''}`);
+      });
     }
     if (!msAudio.getAttribute('src')) msAudio.src = silentWavUrl();
     if (!msAudio.paused) return;
-    msAudio.play().catch(() => { /* NotAllowedError until the next tap */ });
+    msAudio.play().catch((e) => {   // NotAllowedError until the next tap
+      msStatus(e && e.name === 'NotAllowedError' ? 'blocked by browser - tap the page' : `can't play: ${e && e.name}`);
+    });
   }
 
   function msPause(release) {
@@ -534,6 +553,7 @@
       msSetHandlers(false);
       if (msMetaKey) { ms.metadata = null; msMetaKey = ''; }
       ms.playbackState = 'none';
+      msStatus(msEnabled ? '' : 'off');
       return;
     }
     const s = state;
@@ -557,7 +577,9 @@
       } catch (_) { /* inconsistent values */ }
     }
     if (playing && msActivated && !msYielded) msPlay();
-    else if (!playing) msPause(false);
+    else if (!playing) { msPause(false); msStatus('paused'); }
+    if (playing && !msActivated) msStatus('tap the page to enable');
+    else if (playing && msYielded) msStatus('paused by another app - tap a cast control');
   }
 
   if (MS) {

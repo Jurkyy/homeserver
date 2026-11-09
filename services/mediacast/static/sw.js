@@ -1,5 +1,5 @@
 // mediacast portal service worker — caches the static shell only; /api/ always hits the network.
-const CACHE = 'mediacast-shell-v3';
+const CACHE = 'mediacast-shell-v4';
 const SHELL = [
   '/',
   '/static/style.css',
