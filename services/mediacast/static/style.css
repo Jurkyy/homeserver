@@ -169,10 +169,13 @@ h2 { font-size: 1.05rem; margin: 0 0 .6rem; font-weight: 650; }
 .spotify.controllable { flex-wrap: wrap; }
 .progress.thin.seekable { height: 6px; cursor: pointer; }
 .progress.thin.seekable::before { display: block; }
-.sp-controls { flex-basis: 100%; display: flex; align-items: center; gap: 6px; }
+/* min-width: 0 — as a flex item of .spotify its automatic minimum would be the range input's
+   intrinsic width, pushing the slider past the card edge on phones. The volume group wraps onto
+   its own row when fewer than ~160px are left next to the buttons. */
+.sp-controls { flex-basis: 100%; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .sp-controls .btn { min-width: 52px; }
 .sp-controls .play { background: var(--spotify); border-color: var(--spotify); color: #06240f; font-size: 1.1rem; }
-.sp-vol { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; margin-left: 6px; }
+.sp-vol { flex: 1 1 160px; min-width: 0; display: flex; align-items: center; gap: 6px; }
 .sp-vol input { flex: 1; min-width: 0; height: 44px; accent-color: var(--spotify); }
 
 /* Cast form */
