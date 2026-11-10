@@ -284,6 +284,8 @@ def open_in_mpv(
     audio_url: str | None = None,
     title: str | None = None,
     start: float | None = None,
+    aid: int | str | None = None,
+    sid: int | str | None = None,
 ) -> tuple[int, str]:
     """Spawn a detached fullscreen mpv with the given URL.
 
@@ -348,6 +350,12 @@ def open_in_mpv(
         # Jellyfin), where mpv would otherwise show the raw stream URL;
         # the ytdl_hook path sets media-title on its own from metadata.
         args.append(f"--force-media-title={title}")
+    # Initial track selection (mpv track ids or "no"/"auto"), so the
+    # right audio/subtitle is on from the first frame instead of mpv's
+    # own pick. See _mpv_track_sel.
+    for opt, val in (("aid", _mpv_track_sel(aid)), ("sid", _mpv_track_sel(sid))):
+        if val is not None:
+            args.append(f"--{opt}={val}")
     if use_ytdl:
         args += [
             # Use the pipx yt-dlp, not apt's stale one.
@@ -660,6 +668,134 @@ def _mpv_command(cmd: list) -> tuple[int, str]:
                 pass
             return 404, f"mpv gone ({exc.errno})"
         return 1, f"mpv ipc error: {exc}"
+
+
+def _mpv_track_sel(v) -> str | None:
+    """Normalise a track selector from the API: a positive mpv track id,
+    or "no" / "auto". Anything else → None (leave mpv's choice alone)."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int) and v > 0:
+        return str(v)
+    if isinstance(v, str) and (v in ("no", "auto") or v.isdigit() and int(v) > 0):
+        return v
+    return None
+
+
+def _mpv_request(cmd: list, rid: int = 70) -> tuple[bool, object]:
+    """One mpv JSON-IPC command with its reply matched by request_id (the
+    socket also carries async event lines). Returns (ok, data); ok is
+    False when mpv is unreachable or answered with an error."""
+    if not os.path.exists(MPV_IPC_SOCK):
+        return False, "mpv socket missing"
+    try:
+        s = socket.socket(socket.AF_UNIX)
+        s.settimeout(3.0)
+        s.connect(MPV_IPC_SOCK)
+    except OSError as exc:
+        return False, f"mpv unreachable: {exc}"
+    try:
+        s.sendall(json.dumps({"command": cmd, "request_id": rid}).encode() + b"\n")
+        buf = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                return False, "mpv closed the socket"
+            buf += chunk
+            *lines, buf = buf.split(b"\n")
+            for line in lines:
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("request_id") == rid:
+                    if msg.get("error") == "success":
+                        return True, msg.get("data")
+                    return False, msg.get("error")
+    except OSError as exc:
+        return False, f"mpv ipc error: {exc}"
+    finally:
+        s.close()
+
+
+def mpv_track_list() -> list[dict] | None:
+    """mpv's audio/sub tracks, trimmed to what selection needs."""
+    ok, data = _mpv_request(["get_property", "track-list"], rid=71)
+    if not ok or not isinstance(data, list):
+        return None
+    keep = ("id", "type", "lang", "title", "codec", "default", "forced",
+            "external", "external-filename", "selected", "ff-index")
+    return [{k: t.get(k) for k in keep if k in t}
+            for t in data if t.get("type") in ("audio", "sub")]
+
+
+def control_tracks(body: dict) -> tuple[int, str, list | None]:
+    """Switch audio/subtitle on the running mpv.
+
+    body: {"aid"?: id|"no"|"auto", "sid"?: id|"no"|"auto",
+           "sub_add"?: {"url", "title"?, "lang"?}}. `sub_add` loads an
+    external subtitle (e.g. a Jellyfin subtitle delivery URL) and selects
+    it, reusing the track if that URL was already added. Returns
+    (rc, detail, track-list after the change)."""
+    tracks = mpv_track_list()
+    if tracks is None:
+        return 404, "no mpv", None
+    notes = []
+
+    def missing(kind: str, sel: str | None) -> bool:
+        # mpv happily "selects" a track id that doesn't exist (→ nothing).
+        return bool(sel and sel.isdigit()) and not any(
+            t["type"] == kind and t["id"] == int(sel) for t in tracks)
+
+    aid = _mpv_track_sel(body.get("aid"))
+    sid = _mpv_track_sel(body.get("sid"))
+    for kind, sel in (("audio", aid), ("sub", sid)):
+        if missing(kind, sel):
+            return 400, f"no {kind} track {sel}", tracks
+    if aid is not None:
+        ok, err = _mpv_request(["set_property", "aid", aid], rid=72)
+        notes.append(f"aid={aid}" + ("" if ok else f" ({err})"))
+        if not ok:
+            return 502, "; ".join(notes), tracks
+    add = body.get("sub_add") if isinstance(body.get("sub_add"), dict) else None
+    if add and isinstance(add.get("url"), str) and add["url"]:
+        url = add["url"]
+        have = next((t for t in tracks if t["type"] == "sub" and t.get("external")
+                     and t.get("external-filename") == url), None)
+        if have:
+            ok, err = _mpv_request(["set_property", "sid", have["id"]], rid=73)
+            notes.append(f"sid={have['id']} (already added)" + ("" if ok else f" ({err})"))
+        else:
+            cmd = ["sub-add", url, "select", str(add.get("title") or ""), str(add.get("lang") or "")]
+            ok, err = _mpv_request(cmd, rid=74)
+            notes.append("sub-add" + ("" if ok else f" failed ({err})"))
+        if not ok:
+            return 502, "; ".join(notes), mpv_track_list()
+    elif sid is not None:
+        ok, err = _mpv_request(["set_property", "sid", sid], rid=75)
+        notes.append(f"sid={sid}" + ("" if ok else f" ({err})"))
+        if not ok:
+            return 502, "; ".join(notes), tracks
+    return 0, "; ".join(notes) or "no change", mpv_track_list()
+
+
+def _apply_tracks_when_loaded(media: dict, body: dict, timeout: float = 45.0) -> None:
+    """After a spawn: wait for mpv to load the file (track-list appears),
+    then apply what can't go on the command line (sub-add of an external
+    subtitle). Gives up if another cast replaced this one."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with _state_lock:
+            if _state["media"] is not media:
+                return
+        tracks = mpv_track_list()
+        if tracks:
+            rc, out, _ = control_tracks(body)
+            LOG.info("tracks after load: rc=%s %s", rc, out)
+            _publish()
+            return
+        time.sleep(0.4)
+    LOG.warning("tracks after load: mpv never reported a track list")
 
 
 def _firefox_key(key: str) -> tuple[int, str]:
@@ -1761,7 +1897,7 @@ def _media_meta(url: str, meta: dict | None) -> dict:
 
 
 def _cast(url: str, want_backend: str = "", want_title: str | None = None,
-          start: float = 0.0) -> tuple[int, str, str]:
+          start: float = 0.0, tracks: dict | None = None) -> tuple[int, str, str]:
     """Pick a backend for `url`, drive it, return (rc, backend, out).
 
     This is the entire "how a URL ends up on the projector" logic, shared
@@ -1789,7 +1925,9 @@ def _cast(url: str, want_backend: str = "", want_title: str | None = None,
     if want_backend == "mpv":
         # Pre-resolved direct media URL — play it as-is, no yt-dlp.
         _run(["wmctrl", "-r", "Firefox", "-b", "remove,fullscreen"])
-        rc, out = open_in_mpv(url, use_ytdl=False, title=want_title, start=start)
+        tracks = tracks or {}
+        rc, out = open_in_mpv(url, use_ytdl=False, title=want_title, start=start,
+                              aid=tracks.get("aid"), sid=tracks.get("sid"))
         backend = "mpv-direct"
     elif is_youtube_host(url) and YOUTUBE_BACKEND == "firefox":
         # Browser YouTube: play in the logged-in Firefox (its session
@@ -3081,6 +3219,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if rc == 1 and "remembered" in out:
                 rc = 0  # nothing playing: still a successful volume change
+        elif action == "tracks":
+            rc, out, tracks = control_tracks(body)
+            LOG.info("control action=tracks rc=%s detail=%s", rc, out)
+            _publish()
+            if rc == 404:
+                self._json(404, {"error": "no active cast", "detail": out})
+            elif rc == 400:
+                self._json(400, {"error": out, "tracks": tracks})
+            elif rc != 0:
+                self._json(502, {"error": "track switch failed", "detail": out, "tracks": tracks})
+            else:
+                self._json(200, {"status": "ok", "detail": out, "tracks": tracks})
+            return
         elif action == "status":
             # Legacy read-only status (pre-v1 clients): served from the
             # poller's cached snapshot, no extra CDP/IPC round-trip.
@@ -3221,8 +3372,11 @@ class Handler(BaseHTTPRequestHandler):
             _clear_media_locked()
             _state["media"] = media
         _publish()
+        # Optional track selection for mpv-direct casts: {"aid", "sid",
+        # "sub_add"} — see control_tracks.
+        tracks = body.get("tracks") if isinstance(body.get("tracks"), dict) else None
         rc, backend, out = _cast(url, want_backend=want_backend,
-                                 want_title=want_title, start=start)
+                                 want_title=want_title, start=start, tracks=tracks)
         with _state_lock:
             if _state["media"] is media:
                 if rc != 0:
@@ -3230,6 +3384,9 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     media["backend"] = backend
         _publish()
+        if rc == 0 and tracks and tracks.get("sub_add") and backend == "mpv-direct":
+            threading.Thread(target=_apply_tracks_when_loaded, args=(media, tracks),
+                             name="mpv-tracks", daemon=True).start()
         if rc != 0:
             self._json(502, {"error": f"{backend} failed", "rc": rc, "stderr": out})
             return
