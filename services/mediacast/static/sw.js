@@ -1,5 +1,5 @@
 // mediacast portal service worker — caches the static shell only; /api/ always hits the network.
-const CACHE = 'mediacast-shell-v5';
+const CACHE = 'mediacast-shell-v6';
 const SHELL = [
   '/',
   '/static/style.css',
@@ -14,7 +14,7 @@ self.addEventListener('install', (e) => {
   e.waitUntil(
     caches.open(CACHE)
       // addAll is atomic; add individually so one missing asset doesn't break install
-      .then((c) => Promise.all(SHELL.map((u) => c.add(u).catch(() => {}))))
+      .then((c) => Promise.all(SHELL.map((u) => c.add(new Request(u, { cache: 'reload' })).catch(() => {}))))
       .then(() => self.skipWaiting())
   );
 });
@@ -55,7 +55,8 @@ self.addEventListener('fetch', (e) => {
     // deploys show up on the next load without having to bump CACHE.
     e.respondWith(
       caches.open(CACHE).then((c) => c.match(req).then((hit) => {
-        const net = fetch(req).then((res) => {
+        // cache: 'no-cache' so the background refresh never returns the browser's stale HTTP copy.
+        const net = fetch(req, { cache: 'no-cache' }).then((res) => {
           if (res.ok) c.put(req, res.clone());
           return res;
         });

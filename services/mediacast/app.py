@@ -1845,5 +1845,16 @@ async def service_worker() -> FileResponse:
                         headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
 
 
+class _RevalidatedStatic(StaticFiles):
+    """Static files with `no-cache`: without it browsers heuristically keep the
+    old style.css/app.js for days (no max-age, only Last-Modified), and the
+    service worker then re-caches that stale copy. ETag revalidation is a cheap 304."""
+
+    async def get_response(self, path, scope):
+        resp = await super().get_response(path, scope)
+        resp.headers.setdefault("Cache-Control", "no-cache")
+        return resp
+
+
 if STATIC_DIR.is_dir():
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.mount("/static", _RevalidatedStatic(directory=STATIC_DIR), name="static")
