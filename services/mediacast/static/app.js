@@ -181,6 +181,7 @@
       $('vol-val').textContent = s.muted ? 'muted' : `${Math.round(s.volume)}%`;
     }
 
+    renderTracks();
     renderSpotify();
     renderScreensaver();
     syncMediaSession();
@@ -1121,8 +1122,66 @@
   $('jf-lowq').checked = jf.lowQ;
   $('jf-lowq').addEventListener('change', (e) => { jf.lowQ = e.target.checked; store.set('mc.jf.lowq', jf.lowQ); });
 
+  // ---------------------------------------------------------------- audio / subtitle tracks
+  // Shape: docs/api-v1.md JfTracks (GET /jellyfin/item/{id}/tracks, State.tracks).
+
+  // Fill one <select> with tracks; subtitles get an "Off" (-1) entry first.
+  // Returns whether there is anything to choose between.
+  function fillTrackSelect(sel, list, current, withOff) {
+    sel.replaceChildren();
+    if (withOff) sel.append(new Option('Off', '-1'));
+    for (const t of list || []) sel.append(new Option(t.label, String(t.index)));
+    const cur = current == null ? (withOff ? -1 : null) : current;
+    if (cur != null) sel.value = String(cur);
+    return (list || []).length > (withOff ? 0 : 1);
+  }
+
+  // Lay out an audio + subtitle picker pair; hidden when there is no choice.
+  function fillTracks(prefix, tr) {
+    const hasA = fillTrackSelect($(`${prefix}-audio`), tr.audio, tr.audio_index, false);
+    const hasS = fillTrackSelect($(`${prefix}-subs`), tr.subtitles, tr.subtitle_index, true);
+    $(`${prefix}-audio-f`).hidden = !hasA;
+    $(`${prefix}-subs-f`).hidden = !hasS;
+    $(`${prefix}-tracks`).hidden = !(hasA || hasS);
+  }
+
+  let nowTracksKey = '';
+  let trackBusy = false;
+
+  function renderTracks() {
+    const s = state;
+    const tr = s && s.activity !== 'idle' && s.source === 'jellyfin' ? s.tracks : null;
+    if (!tr) { $('now-tracks').hidden = true; nowTracksKey = ''; return; }
+    const key = JSON.stringify([s.item && s.item.id, tr.audio, tr.subtitles, tr.audio_index, tr.subtitle_index]);
+    // Don't rebuild under an open picker or while a switch is in flight.
+    const focused = document.activeElement === $('now-audio') || document.activeElement === $('now-subs');
+    if (key === nowTracksKey || focused || trackBusy) return;
+    nowTracksKey = key;
+    fillTracks('now', tr);
+  }
+
+  async function switchTrack(body) {
+    trackBusy = true;
+    $('now-audio').disabled = $('now-subs').disabled = true;
+    try {
+      const r = await api('POST', '/jellyfin/tracks', body);
+      toast(r.restarted ? 'Restarting the stream with the new track…' : 'Track switched');
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      trackBusy = false;
+      $('now-audio').disabled = $('now-subs').disabled = false;
+      nowTracksKey = '';   // re-sync the pickers with the server's selection
+      renderTracks();
+    }
+  }
+
+  $('now-audio').addEventListener('change', (e) => switchTrack({ audio_index: Number(e.target.value) }));
+  $('now-subs').addEventListener('change', (e) => switchTrack({ subtitle_index: Number(e.target.value) }));
+
   // Detail sheet
   let sheetItem = null;
+  let sheetTracks = null;   // { id, tracks } once loaded for the open item
 
   function fillSheet(it) {
     const title = it.type === 'Episode' && it.series_name ? `${it.series_name} — ${it.name}` : (it.name || '');
@@ -1142,7 +1201,10 @@
 
   async function openSheet(it) {
     sheetItem = it;
+    sheetTracks = null;
+    $('sheet-tracks').hidden = true;
     fillSheet(it);
+    loadSheetTracks(it.id);
     $('sheet').hidden = false;
     (it.resume_s > 0 ? $('sheet-resume') : $('sheet-start')).focus();
     try {
@@ -1151,11 +1213,24 @@
     } catch (_) { /* list data is enough */ }
   }
 
-  function closeSheet() { $('sheet').hidden = true; sheetItem = null; }
+  async function loadSheetTracks(id) {
+    try {
+      const tr = await api('GET', `/jellyfin/item/${encodeURIComponent(id)}/tracks`);
+      if (!sheetItem || sheetItem.id !== id) return;
+      sheetTracks = { id, tracks: tr };
+      fillTracks('sheet', tr);
+    } catch (_) { /* play still works with the server's defaults */ }
+  }
+
+  function closeSheet() { $('sheet').hidden = true; sheetItem = null; sheetTracks = null; }
 
   async function playSheet(resume) {
     if (!sheetItem) return;
     const body = { id: sheetItem.id, resume };
+    if (sheetTracks && sheetTracks.id === sheetItem.id) {
+      if (sheetTracks.tracks.audio.length) body.audio_index = Number($('sheet-audio').value);
+      body.subtitle_index = Number($('sheet-subs').value);
+    }
     if (jf.lowQ) body.low_quality = true;
     const name = sheetItem.name;
     closeSheet();

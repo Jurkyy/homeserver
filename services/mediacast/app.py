@@ -122,6 +122,13 @@ JF_PROGRESS_INTERVAL = 10.0
 _TICKS = 10_000_000
 
 
+_JF_EMBED_SUBS = ("srt", "subrip", "ass", "ssa", "vtt", "webvtt", "mov_text", "ttml",
+                  "pgssub", "pgs", "dvdsub", "dvbsub", "dvb_subtitle", "sub")
+_JF_EXTERNAL_SUBS = ("srt", "ass", "ssa", "vtt")
+# Remembered audio/subtitle choice per series (see _jf_prefs).
+JF_TRACK_PREFS_FILE = os.environ.get("MRPFLIX_TRACK_PREFS_FILE", "/data/jf-track-prefs.json")
+
+
 def _jf_device_profile(max_bitrate: int) -> dict:
     # We direct play H.264 (the only codec the projector's GTX 970 decodes
     # in hardware); anything else Jellyfin transcodes to H.264 HLS so mpv
@@ -147,6 +154,15 @@ def _jf_device_profile(max_bitrate: int) -> dict:
                 "MaxAudioChannels": "2",
             }
         ],
+        # mpv renders every subtitle format itself: embedded tracks stay in
+        # the direct stream (selected by sid), text tracks are fetched as
+        # separate files (sub-add) so a transcode never has to burn them in.
+        # Only image subs during a transcode end up burned (Encode). One
+        # format per profile: Jellyfin uses it as the delivery file suffix.
+        "SubtitleProfiles": (
+            [{"Format": f, "Method": "Embed"} for f in _JF_EMBED_SUBS]
+            + [{"Format": f, "Method": "External"} for f in _JF_EXTERNAL_SUBS]
+        ),
     }
 
 
@@ -287,7 +303,8 @@ async def _host_post(path: str, payload: dict, timeout: float = HOST_TIMEOUT) ->
 
 
 async def _host_open(url: str, *, backend: str | None = None, title: str | None = None,
-                     meta: dict | None = None, start: float | None = None) -> None:
+                     meta: dict | None = None, start: float | None = None,
+                     tracks: dict | None = None) -> None:
     payload: dict = {"url": url}
     if backend:
         # Force a player for an already-resolved media URL (Jellyfin → mpv).
@@ -298,6 +315,8 @@ async def _host_open(url: str, *, backend: str | None = None, title: str | None 
         payload["meta"] = meta
     if start:
         payload["start"] = start
+    if tracks:
+        payload["tracks"] = tracks
     await _host_post("/open", payload, timeout=CAST_TIMEOUT)
 
 
@@ -323,6 +342,7 @@ def _merged_state() -> dict:
     st = dict(_host_state["state"] or _OFFLINE_STATE)
     sp = _spotify
     st["spotify"] = dict(sp, controllable=bool(SPOTIFY_CONTROL_ADDR)) if sp else None
+    st["tracks"] = _jf_state_tracks(st)
     st["updated_at"] = max(int(st.get("updated_at") or 0), int(sp["updated_at"]) if sp else 0)
     return st
 
@@ -940,32 +960,45 @@ async def api_jf_image(item_id: str, type: str = "Primary", max_width: int = 600
                     headers={"Cache-Control": "public, max-age=86400"})
 
 
-async def _jf_resolve_stream(item_id: str, max_bitrate: int) -> tuple[str, dict]:
-    """Ask Jellyfin how to play an item; return (URL mpv can open, session
-    info for playback reporting).
+async def _jf_playback_info(item_id: str, max_bitrate: int, *, media_source_id: str | None = None,
+                            audio_index: int | None = None,
+                            subtitle_index: int | None = None) -> tuple[dict, str]:
+    """POST PlaybackInfo → (chosen MediaSource, PlaySessionId).
 
-    Direct-stream when the source is already H.264; otherwise Jellyfin
-    hands back an HLS TranscodingUrl (transcoded to H.264 per our device
-    profile) which mpv plays and the GTX 970 hardware-decodes.
-    """
-    token, uid = await _jf_authenticate()
-    data = await _jf_json(
-        "POST", f"/Items/{item_id}/PlaybackInfo",
-        params={"userId": uid},
-        json={"DeviceProfile": _jf_device_profile(max_bitrate)},
-    )
+    Without indices Jellyfin fills DefaultAudio/SubtitleStreamIndex from the
+    file flags and the user's language/subtitle-mode preferences. Explicit
+    indices are only honoured as query params together with mediaSourceId
+    (body fields are ignored), and then shape the TranscodingUrl."""
+    _, uid = await _jf_authenticate()
+    params: dict = {"userId": uid}
+    if media_source_id:
+        params["mediaSourceId"] = media_source_id
+        if audio_index is not None:
+            params["audioStreamIndex"] = audio_index
+        if subtitle_index is not None:
+            params["subtitleStreamIndex"] = subtitle_index
+    data = await _jf_json("POST", f"/Items/{item_id}/PlaybackInfo", params=params,
+                          json={"DeviceProfile": _jf_device_profile(max_bitrate)})
     sources = data.get("MediaSources") or []
     if not sources:
         raise ApiError(404, "no playable media source", "not_playable")
-    ms = sources[0]
-    psid = data.get("PlaySessionId", "")
-    info = {"media_source_id": ms.get("Id", item_id), "play_session_id": psid}
+    ms = next((m for m in sources if media_source_id and m.get("Id") == media_source_id), sources[0])
+    return ms, data.get("PlaySessionId", "")
+
+
+def _jf_play_method(ms: dict) -> str:
+    return "Transcode" if ms.get("TranscodingUrl") else "DirectStream"
+
+
+def _jf_stream_url(item_id: str, ms: dict, psid: str, token: str) -> str:
+    """URL mpv opens: the HLS TranscodingUrl (H.264 per our profile, which
+    the GTX 970 hardware-decodes) or the static file for H.264 sources."""
     transcode_url = ms.get("TranscodingUrl")
     if transcode_url:
         url = f"{JELLYFIN_URL}{transcode_url}"
-        if "api_key=" not in url:
+        if "api_key=" not in url.lower() and "apikey=" not in url.lower():
             url += f"&api_key={token}"
-        return url, {**info, "play_method": "Transcode"}
+        return url
     if ms.get("SupportsDirectStream") or ms.get("SupportsDirectPlay"):
         url = (
             f"{JELLYFIN_URL}/Videos/{item_id}/stream"
@@ -974,12 +1007,202 @@ async def _jf_resolve_stream(item_id: str, max_bitrate: int) -> tuple[str, dict]
         )
         if ms.get("Container"):
             url += f"&Container={ms['Container']}"
-        return url, {**info, "play_method": "DirectStream"}
+        return url
     raise ApiError(502, "jellyfin returned no usable stream", "not_playable")
 
 
-def _jf_report_body(sess: dict, position_s: float | None, paused: bool = False) -> dict:
+def _jf_streams(ms: dict, typ: str) -> list[dict]:
+    return [s for s in ms.get("MediaStreams") or [] if s.get("Type") == typ]
+
+
+def _jf_stream(ms: dict, typ: str, index: int | None) -> dict | None:
+    if index is None or index < 0:
+        return None
+    return next((s for s in _jf_streams(ms, typ) if s.get("Index") == index), None)
+
+
+def _jf_track_view(s: dict) -> dict:
+    """Jellyfin MediaStream → JfTrack (docs/api-v1.md)."""
+    out = {
+        "index": s.get("Index"),
+        # Jellyfin's DisplayTitle, minus a leading release-group tag
+        # ("[Judas] ENG Stereo …") that only pushes the useful part off a
+        # phone-width picker.
+        "label": re.sub(r"^\s*\[[^\]]*\]\s*", "",
+                        s.get("DisplayTitle") or s.get("Title") or s.get("Language") or "")
+        or f"Track {s.get('Index')}",
+        "language": s.get("Language") or None,
+        "title": s.get("Title") or None,
+        "codec": s.get("Codec") or None,
+        "default": bool(s.get("IsDefault")),
+        "forced": bool(s.get("IsForced")),
+        "external": bool(s.get("IsExternal")),
+    }
+    if s.get("Type") == "Audio":
+        out["channels"] = s.get("Channels")
+    else:
+        dm = s.get("DeliveryMethod")
+        out["delivery"] = dm.lower() if isinstance(dm, str) else None
+    return out
+
+
+def _jf_tracks_view(ms: dict, audio_index: int | None, subtitle_index: int) -> dict:
     return {
+        "audio": [_jf_track_view(s) for s in _jf_streams(ms, "Audio")],
+        "subtitles": [_jf_track_view(s) for s in _jf_streams(ms, "Subtitle")],
+        "audio_index": audio_index,
+        "subtitle_index": subtitle_index,
+        "play_method": _jf_play_method(ms),
+    }
+
+
+def _mpv_track_id(ms: dict, typ: str, index: int) -> int | None:
+    """Jellyfin stream index → mpv track id for the *direct* stream.
+
+    They differ: Jellyfin indexes every stream of the file (video, audio,
+    subs, and — on this server — external subtitle files first, shifting the
+    embedded ones up), while mpv numbers each track type from 1 in demuxer
+    order. So rank the embedded streams of that type by Jellyfin index."""
+    emb = sorted((s for s in _jf_streams(ms, typ) if not s.get("IsExternal")),
+                 key=lambda s: s.get("Index") or 0)
+    for n, s in enumerate(emb, 1):
+        if s.get("Index") == index:
+            return n
+    return None
+
+
+def _jf_sub_url(item_id: str, ms: dict, sub: dict, token: str) -> str:
+    if sub.get("DeliveryUrl"):
+        url = f"{JELLYFIN_URL}{sub['DeliveryUrl']}"
+    else:
+        codec = (sub.get("Codec") or "").lower()
+        ext = "ass" if codec in ("ass", "ssa") else "vtt" if codec in ("vtt", "webvtt") else "srt"
+        url = (f"{JELLYFIN_URL}/Videos/{item_id}/{ms.get('Id', item_id)}"
+               f"/Subtitles/{sub.get('Index')}/0/Stream.{ext}")
+    if "api_key=" not in url.lower() and "apikey=" not in url.lower():
+        url += ("&" if "?" in url else "?") + f"api_key={token}"
+    return url
+
+
+def _jf_sub_burned(ms: dict, subtitle_index: int) -> bool:
+    """Is this subtitle burned into the video by the transcode?"""
+    sub = _jf_stream(ms, "Subtitle", subtitle_index)
+    return bool(sub) and _jf_play_method(ms) == "Transcode" and sub.get("DeliveryMethod") == "Encode"
+
+
+def _jf_sub_plan(item_id: str, ms: dict, subtitle_index: int, token: str) -> dict:
+    """mpv selection for a subtitle: {"sid": id|"no"} or a sub_add."""
+    sub = _jf_stream(ms, "Subtitle", subtitle_index)
+    if sub is None or _jf_sub_burned(ms, subtitle_index):
+        return {"sid": "no"}   # off, or already in the picture
+    if _jf_play_method(ms) != "Transcode" and not sub.get("IsExternal"):
+        sid = _mpv_track_id(ms, "Subtitle", subtitle_index)
+        if sid:
+            return {"sid": sid}
+    # External file, or a text track while transcoding: load it on its own.
+    return {"sid": "no", "sub_add": {
+        "url": _jf_sub_url(item_id, ms, sub, token),
+        "title": sub.get("DisplayTitle") or sub.get("Title") or "",
+        "lang": sub.get("Language") or "",
+    }}
+
+
+def _jf_audio_plan(ms: dict, audio_index: int | None) -> dict:
+    # A transcode carries exactly the one audio track Jellyfin was asked for.
+    if audio_index is None or _jf_play_method(ms) == "Transcode":
+        return {}
+    aid = _mpv_track_id(ms, "Audio", audio_index)
+    return {"aid": aid} if aid else {}
+
+
+# Remembered track choice per series: {"series:<id>": {"audio": {lang,title},
+# "sub": {lang,title,forced} | {"off": true}}}. Episodes of a series often
+# differ in index layout, so match by language/title, not index.
+_jf_prefs: dict = {}
+_jf_prefs_loaded = False
+
+
+def _jf_prefs_key(it: dict) -> str | None:
+    return f"series:{it['SeriesId']}" if it.get("Type") == "Episode" and it.get("SeriesId") else None
+
+
+def _jf_prefs_get(key: str | None) -> dict | None:
+    global _jf_prefs, _jf_prefs_loaded
+    if not _jf_prefs_loaded:
+        _jf_prefs_loaded = True
+        try:
+            with open(JF_TRACK_PREFS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                _jf_prefs = data
+        except (OSError, ValueError):
+            pass
+    return _jf_prefs.get(key) if key else None
+
+
+def _jf_prefs_save(it: dict, ms: dict, audio_index: int | None, subtitle_index: int) -> None:
+    key = _jf_prefs_key(it)
+    if not key:
+        return
+    _jf_prefs_get(key)   # make sure the file is loaded before overwriting it
+    pref: dict = {}
+    a = _jf_stream(ms, "Audio", audio_index)
+    if a:
+        pref["audio"] = {"lang": a.get("Language"), "title": a.get("Title")}
+    sub = _jf_stream(ms, "Subtitle", subtitle_index)
+    pref["sub"] = ({"lang": sub.get("Language"), "title": sub.get("Title"),
+                    "forced": bool(sub.get("IsForced"))} if sub else {"off": True})
+    if _jf_prefs.get(key) == pref:
+        return
+    _jf_prefs[key] = pref
+    try:
+        tmp = JF_TRACK_PREFS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_jf_prefs, f)
+        os.replace(tmp, JF_TRACK_PREFS_FILE)
+    except OSError as exc:
+        logger.warning("jellyfin: can't save track prefs: %s", exc)
+
+
+def _jf_match(streams: list[dict], want: dict) -> int | None:
+    lang = want.get("lang")
+    if not lang:
+        return None
+    same = [s for s in streams if s.get("Language") == lang]
+    for ok in (lambda s: s.get("Title") == want.get("title"),
+               lambda s: bool(s.get("IsForced")) == bool(want.get("forced")),
+               lambda s: True):
+        hit = next((s for s in same if ok(s)), None)
+        if hit:
+            return hit.get("Index")
+    return None
+
+
+def _jf_default_indices(it: dict, ms: dict) -> tuple[int | None, int, bool]:
+    """(audio_index, subtitle_index, remembered): Jellyfin's defaults (file
+    flags + the user's Jellyfin language / subtitle-mode settings), then the
+    choice remembered for this series on top. subtitle_index -1 = off."""
+    audio = ms.get("DefaultAudioStreamIndex")
+    sub = ms.get("DefaultSubtitleStreamIndex")
+    sub = -1 if sub is None else sub
+    pref = _jf_prefs_get(_jf_prefs_key(it))
+    used = False
+    if pref:
+        a = _jf_match(_jf_streams(ms, "Audio"), pref.get("audio") or {})
+        if a is not None:
+            audio, used = a, True
+        sp = pref.get("sub") or {}
+        if sp.get("off"):
+            sub, used = -1, True
+        else:
+            m = _jf_match(_jf_streams(ms, "Subtitle"), sp)
+            if m is not None:
+                sub, used = m, True
+    return audio, sub, used
+
+
+def _jf_report_body(sess: dict, position_s: float | None, paused: bool = False) -> dict:
+    body = {
         "ItemId": sess["item_id"],
         "MediaSourceId": sess["media_source_id"],
         "PlaySessionId": sess["play_session_id"],
@@ -987,7 +1210,13 @@ def _jf_report_body(sess: dict, position_s: float | None, paused: bool = False) 
         "PositionTicks": int((position_s or 0) * _TICKS),
         "IsPaused": paused,
         "CanSeek": True,
+        # Jellyfin keeps these with the user's resume data / "remember
+        # audio & subtitle selections".
+        "SubtitleStreamIndex": sess.get("subtitle_index", -1),
     }
+    if sess.get("audio_index") is not None:
+        body["AudioStreamIndex"] = sess["audio_index"]
+    return body
 
 
 async def _jf_report(path: str, body: dict) -> None:
@@ -1023,32 +1252,45 @@ async def _jf_on_state(st: dict) -> None:
             sess["last_report"], sess["paused"] = now, paused
             _spawn(_jf_report("/Sessions/Playing/Progress",
                               _jf_report_body(sess, sess["last_pos"], paused)))
-    elif now - sess["started"] > 15:
+    elif now - sess["started"] > 15 and not sess.get("restarting"):
         # Something else is on the projector (or nothing): playback is over.
         await _jf_stop_session()
 
 
-class V1JellyfinPlay(BaseModel):
-    id: str
-    resume: bool = False
-    low_quality: bool = False
+def _jf_state_tracks(st: dict) -> dict | None:
+    """State.tracks: the Jellyfin item's tracks + current selection while it
+    is the thing on the projector."""
+    sess = _jf_session
+    item = st.get("item") or {}
+    if not sess or st.get("source") != "jellyfin" or item.get("id") != sess["item_id"]:
+        return None
+    view = _jf_tracks_view(sess["ms"], sess["audio_index"], sess["subtitle_index"])
+    view["switchable"] = True
+    return view
 
 
-@api.post("/jellyfin/play", dependencies=authed)
-async def api_jf_play(req: V1JellyfinPlay, request: Request) -> dict:
+async def _jf_start(it: dict, start: float, *, audio_index: int | None,
+                    subtitle_index: int | None, low_quality: bool) -> None:
+    """Resolve + cast one Jellyfin item with the given (or default) tracks
+    and start the playback-report session."""
     global _jf_session
-    _require_jellyfin()
-    client = request.client.host if request.client else "?"
-    logger.info("jellyfin play from=%s item=%s resume=%s low=%s",
-                client, req.id, req.resume, req.low_quality)
-    it = await _jf_get_item(req.id)
-    if it.get("Type") not in ("Movie", "Episode", "Video", "MusicVideo"):
-        raise ApiError(400, f"{it.get('Type')} is not playable", "not_playable")
-    start = 0.0
-    if req.resume:
-        start = ((it.get("UserData") or {}).get("PlaybackPositionTicks") or 0) / _TICKS
-    max_bitrate = _JF_LOW_BITRATE if req.low_quality else _JF_MAX_BITRATE
-    stream_url, info = await _jf_resolve_stream(req.id, max_bitrate)
+    item_id = it["Id"]
+    token, _ = await _jf_authenticate()
+    max_bitrate = _JF_LOW_BITRATE if low_quality else _JF_MAX_BITRATE
+    ms, psid = await _jf_playback_info(item_id, max_bitrate)
+    d_audio, d_sub, _ = _jf_default_indices(it, ms)
+    a = audio_index if _jf_stream(ms, "Audio", audio_index) else d_audio
+    sub = subtitle_index if subtitle_index is not None else d_sub
+    if sub >= 0 and not _jf_stream(ms, "Subtitle", sub):
+        sub = d_sub
+    jf_sub = ms.get("DefaultSubtitleStreamIndex")
+    if (a, sub) != (ms.get("DefaultAudioStreamIndex"), -1 if jf_sub is None else jf_sub):
+        # Ask again with the explicit choice so a transcode carries that
+        # audio (and burns that subtitle, if it has to).
+        ms, psid = await _jf_playback_info(item_id, max_bitrate, media_source_id=ms.get("Id", item_id),
+                                           audio_index=a, subtitle_index=sub)
+    stream_url = _jf_stream_url(item_id, ms, psid, token)
+    tracks = {**_jf_audio_plan(ms, a), **_jf_sub_plan(item_id, ms, sub, token)}
     card = _jf_item(it)
     if it.get("Type") == "Episode":
         s, e = it.get("ParentIndexNumber"), it.get("IndexNumber")
@@ -1056,16 +1298,133 @@ async def api_jf_play(req: V1JellyfinPlay, request: Request) -> dict:
         subtitle = " · ".join(x for x in (it.get("SeriesName"), tag) if x) or None
     else:
         subtitle = str(it["ProductionYear"]) if it.get("ProductionYear") else None
-    meta = {"source": "jellyfin", "item": {"kind": "jellyfin", "id": req.id},
+    meta = {"source": "jellyfin", "item": {"kind": "jellyfin", "id": item_id},
             "title": it.get("Name"), "subtitle": subtitle,
             "artwork_url": card.get("backdrop_url") or card["image_url"]}
+    play_method = _jf_play_method(ms)
+    logger.info("jellyfin: %s item=%s audio=%s sub=%s mpv=%s", play_method, item_id, a, sub,
+                {k: v for k, v in tracks.items() if k != "sub_add"} | ({"sub_add": True} if "sub_add" in tracks else {}))
     await _jf_stop_session()
-    await _host_open(stream_url, backend="mpv", title=it.get("Name"), meta=meta, start=start)
-    sess = {"item_id": req.id, **info, "last_pos": start, "paused": False,
+    await _host_open(stream_url, backend="mpv", title=it.get("Name"), meta=meta, start=start,
+                     tracks=tracks)
+    sess = {"item_id": item_id, "media_source_id": ms.get("Id", item_id), "play_session_id": psid,
+            "play_method": play_method, "ms": ms, "item": it, "audio_index": a,
+            "subtitle_index": sub, "low_quality": low_quality,
+            "last_pos": start, "paused": False,
             "started": time.monotonic(), "last_report": time.monotonic()}
     _jf_session = sess
+    _jf_prefs_save(it, ms, a, sub)
     _spawn(_jf_report("/Sessions/Playing", _jf_report_body(sess, start)))
+
+
+class V1JellyfinPlay(BaseModel):
+    id: str
+    resume: bool = False
+    low_quality: bool = False
+    # Jellyfin MediaStream indices (GET /jellyfin/item/{id}/tracks);
+    # omitted → defaults. subtitle_index -1 = subtitles off.
+    audio_index: int | None = None
+    subtitle_index: int | None = None
+
+
+_PLAYABLE = ("Movie", "Episode", "Video", "MusicVideo")
+
+
+@api.get("/jellyfin/item/{item_id}/tracks", dependencies=authed)
+async def api_jf_item_tracks(item_id: str, low_quality: bool = False) -> dict:
+    """Audio/subtitle tracks of a playable item with the selection a play
+    would default to (Jellyfin defaults + remembered series choice)."""
+    _require_jellyfin()
+    it = await _jf_get_item(item_id)
+    if it.get("Type") not in _PLAYABLE:
+        raise ApiError(400, f"{it.get('Type')} is not playable", "not_playable")
+    ms, _ = await _jf_playback_info(item_id, _JF_LOW_BITRATE if low_quality else _JF_MAX_BITRATE)
+    a, sub, remembered = _jf_default_indices(it, ms)
+    return {**_jf_tracks_view(ms, a, sub), "remembered": remembered}
+
+
+@api.post("/jellyfin/play", dependencies=authed)
+async def api_jf_play(req: V1JellyfinPlay, request: Request) -> dict:
+    _require_jellyfin()
+    client = request.client.host if request.client else "?"
+    logger.info("jellyfin play from=%s item=%s resume=%s low=%s audio=%s sub=%s",
+                client, req.id, req.resume, req.low_quality, req.audio_index, req.subtitle_index)
+    it = await _jf_get_item(req.id)
+    if it.get("Type") not in _PLAYABLE:
+        raise ApiError(400, f"{it.get('Type')} is not playable", "not_playable")
+    start = 0.0
+    if req.resume:
+        start = ((it.get("UserData") or {}).get("PlaybackPositionTicks") or 0) / _TICKS
+    await _jf_start(it, start, audio_index=req.audio_index, subtitle_index=req.subtitle_index,
+                    low_quality=req.low_quality)
     return {"ok": True}
+
+
+class V1JellyfinTracks(BaseModel):
+    audio_index: int | None = None
+    subtitle_index: int | None = None   # -1 = off
+
+
+@api.post("/jellyfin/tracks", dependencies=authed)
+async def api_jf_tracks(req: V1JellyfinTracks) -> dict:
+    """Switch audio/subtitles of the Jellyfin item that is playing.
+
+    Direct stream: mpv switches in place (aid/sid, or sub-add for external
+    subtitle files). Transcode: subtitles still switch in place (fetched as
+    files), but a new audio track — or leaving/entering a burned-in
+    subtitle — needs a new transcode, so the stream restarts at the current
+    position. Response `restarted` says which happened."""
+    _require_jellyfin()
+    sess = _jf_session
+    st = _host_state["state"] or {}
+    if not sess or _jf_state_tracks(st) is None:
+        raise ApiError(409, "no mrpflix playback to switch", "no_active_cast")
+    ms = sess["ms"]
+    a = sess["audio_index"] if req.audio_index is None else req.audio_index
+    sub = sess["subtitle_index"] if req.subtitle_index is None else req.subtitle_index
+    if a is not None and not _jf_stream(ms, "Audio", a):
+        raise ApiError(400, f"no audio stream {a}", "bad_track")
+    if sub < -1 or (sub >= 0 and not _jf_stream(ms, "Subtitle", sub)):
+        raise ApiError(400, f"no subtitle stream {sub}", "bad_track")
+    audio_changed = a != sess["audio_index"]
+    sub_changed = sub != sess["subtitle_index"]
+    if not (audio_changed or sub_changed):
+        return {"ok": True, "restarted": False}
+    transcode = sess["play_method"] == "Transcode"
+    a_stream = _jf_stream(ms, "Audio", a)
+    restart = (
+        (audio_changed and (transcode or bool(a_stream and a_stream.get("IsExternal"))
+                            or _mpv_track_id(ms, "Audio", a) is None))
+        or (sub_changed and (_jf_sub_burned(ms, sess["subtitle_index"]) or _jf_sub_burned(ms, sub)))
+    )
+    it = sess["item"]
+    if restart:
+        pos = st.get("position_s") if st.get("position_s") is not None else sess["last_pos"]
+        pos = max(0.0, float(pos or 0) - 2.0)   # a beat of overlap after the gap
+        logger.info("jellyfin tracks: restarting item=%s at %.0fs audio=%s sub=%s",
+                    sess["item_id"], pos, a, sub)
+        sess["restarting"] = True
+        try:
+            await _jf_start(it, pos, audio_index=a, subtitle_index=sub,
+                            low_quality=sess["low_quality"])
+        finally:
+            sess["restarting"] = False
+        return {"ok": True, "restarted": True}
+    token, _ = await _jf_authenticate()
+    body: dict = {"action": "tracks"}
+    if audio_changed:
+        body.update(_jf_audio_plan(ms, a))
+    if sub_changed:
+        body.update(_jf_sub_plan(sess["item_id"], ms, sub, token))
+    await _host_post("/control", body)
+    sess["audio_index"], sess["subtitle_index"] = a, sub
+    logger.info("jellyfin tracks: item=%s audio=%s sub=%s (in place)", sess["item_id"], a, sub)
+    _jf_prefs_save(it, ms, a, sub)
+    _broadcast()
+    sess["last_report"] = time.monotonic()
+    _spawn(_jf_report("/Sessions/Playing/Progress",
+                      _jf_report_body(sess, sess["last_pos"], sess["paused"])))
+    return {"ok": True, "restarted": False}
 
 
 # ---------------------------------------------------------------------------

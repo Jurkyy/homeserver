@@ -62,6 +62,10 @@
         <button type="button" class="btn icon" data-seek="30" aria-label="Forward 30 seconds">+30</button>
         <button type="button" class="btn icon" id="stop-btn" aria-label="Stop">■</button>
       </div>
+      <div class="tracks" id="now-tracks" hidden>
+        <label class="field" id="now-audio-f">Audio <select id="now-audio"></select></label>
+        <label class="field" id="now-subs-f">Subtitles <select id="now-subs"></select></label>
+      </div>
     </div>
     <div class="volume-row">
       <button type="button" class="btn icon small" id="vol-down" aria-label="Volume down">−</button>
@@ -197,6 +201,10 @@
       </div>
     </div>
     <p class="sheet-overview" id="sheet-overview"></p>
+    <div class="tracks" id="sheet-tracks" hidden>
+      <label class="field" id="sheet-audio-f">Audio <select id="sheet-audio"></select></label>
+      <label class="field" id="sheet-subs-f">Subtitles <select id="sheet-subs"></select></label>
+    </div>
     <div class="btn-col">
       <button type="button" class="btn primary" id="sheet-resume" hidden></button>
       <button type="button" class="btn" id="sheet-start">Play from start</button>

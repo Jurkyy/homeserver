@@ -41,6 +41,8 @@ State = {
   "volume": number,                   // 0-100, cast volume (not Spotify)
   "muted": boolean,
   "item": { "kind": "youtube" | "jellyfin" | "url", "id": string } | null,
+  "tracks": JfTracks & { "switchable": true } | null,  // audio/subtitle tracks of what is playing (mrpflix only
+                                      // today); switch with POST /jellyfin/tracks. null for other sources
   "screensaver": {
     "active": boolean,
     "theme": string | null,
@@ -161,9 +163,42 @@ Clients should refetch silently and compute "N new" themselves (ids not seen bef
 - `GET /api/v1/jellyfin/nextup` → `{ "items": JfItem[] }`
 - `GET /api/v1/jellyfin/item/{id}` → `JfItem & { "children"?: JfItem[] }` (series → seasons, season → episodes)
 - `GET /api/v1/jellyfin/image/{id}?type=Primary|Backdrop&max_width=600` → image bytes
-- `POST /api/v1/jellyfin/play` `{ "id": string, "resume": boolean, "low_quality"?: boolean }` → `{ "ok": true }`.
+- `GET /api/v1/jellyfin/item/{id}/tracks?low_quality=0` → `JfTracks & { "remembered": boolean }` for a playable item
+  (Movie/Episode/Video): its audio and subtitle tracks plus the selection a play would default to. Defaults are
+  Jellyfin's (file flags + the user's Jellyfin audio-language / subtitle-mode settings); on top of that the last
+  choice made for the same **series** is re-applied by language + title (`remembered: true` when it did).
+- `POST /api/v1/jellyfin/play` `{ "id": string, "resume": boolean, "low_quality"?: boolean, "audio_index"?: number,
+  "subtitle_index"?: number }` → `{ "ok": true }`.
   `resume` starts at the item's saved position; `low_quality` caps the stream bitrate (~1.2 Mbps) for a starved link.
-  Backend reports playback start/progress/stop to Jellyfin so resume and "next up" stay correct.
+  `audio_index` / `subtitle_index` are `JfTrack.index` values (`subtitle_index: -1` = off); omitted → the defaults
+  above. Backend reports playback start/progress/stop to Jellyfin, including the stream indices, so resume,
+  "next up" and Jellyfin's own remembered selections stay correct.
+- `POST /api/v1/jellyfin/tracks` `{ "audio_index"?: number, "subtitle_index"?: number }` → `{ "ok": true,
+  "restarted": boolean }` — switch tracks of the mrpflix item that is playing (409 `no_active_cast` otherwise,
+  400 `bad_track` for an unknown index). A direct stream switches in place (mpv track switch; external subtitle
+  files are loaded on demand). A transcode switches subtitles in place too (text subtitles are fetched as files),
+  but a new audio track, or entering/leaving a subtitle that must be burned in (image subs while transcoding),
+  restarts the stream at the current position (`restarted: true`, a ~2-5 s gap; the cast starts unpaused).
+  The new selection shows up in `State.tracks`.
+
+```jsonc
+JfTracks = {
+  "audio": JfTrack[],
+  "subtitles": JfTrack[],
+  "audio_index": number | null,       // selected / default audio JfTrack.index
+  "subtitle_index": number,           // selected / default subtitle JfTrack.index, -1 = off
+  "play_method": "DirectStream" | "Transcode"
+}
+JfTrack = {
+  "index": number,                    // Jellyfin MediaStream index (not an mpv/ExoPlayer track id)
+  "label": string,                    // display text (Jellyfin DisplayTitle, release-group tag stripped)
+  "language": string | null,          // ISO 639-2, e.g. "eng", "jpn"
+  "title": string | null, "codec": string | null,
+  "default": boolean, "forced": boolean, "external": boolean,   // external = separate subtitle/audio file
+  "channels"?: number | null,         // audio only
+  "delivery"?: "embed" | "external" | "encode" | null  // subtitles only: in the stream / separate file / burned in
+}
+```
 
 ## Internal
 
