@@ -1438,6 +1438,11 @@ _feed_cache: dict = {"ts": 0.0, "items": [], "changed_at": 0}
 _feed_lock = asyncio.Lock()
 # Per-channel RSS copies: cid -> {"items", "expires"} (in-memory only).
 _rss_cache: dict[str, dict] = {}
+# channel_id -> time of the first 4xx in the current unbroken run of 4xx.
+# YouTube's RSS endpoint 404s *every* channel for hours at a time (seen
+# 2026-11-14; recurring upstream), so a 4xx alone can't mean "deleted".
+_rss_gone_since: dict[str, float] = {}
+YT_RSS_GONE_AFTER_S = float(os.environ.get("YT_RSS_GONE_AFTER_DAYS", "7")) * 86400
 _yt_backoff: dict = {"level": 0, "until": 0.0}
 _subs_cache: dict = {"ts": 0.0, "ids": [], "refreshing": False}
 
@@ -1645,12 +1650,18 @@ async def _build_feed() -> list[dict]:
         if r.status_code in (429, 503):
             stats["throttled"] = stats["throttled"] or r.status_code
             return old
-        if r.status_code >= 400:   # e.g. 404 for a deleted channel
+        if r.status_code >= 400:
             stats["errors"] += 1
             if r.status_code < 500:
-                _rss_cache[cid] = {"items": [], "expires": time.time() + 3600}
-                return []
+                # Keep the channel's last videos through YouTube's RSS
+                # outages; only a 4xx run lasting days means it's gone.
+                since = _rss_gone_since.setdefault(cid, time.time())
+                if time.time() - since > YT_RSS_GONE_AFTER_S:
+                    _rss_cache[cid] = {"items": [], "expires": time.time() + 3600}
+                    return []
+                _rss_cache[cid] = {"items": old, "expires": time.time() + 900}
             return old
+        _rss_gone_since.pop(cid, None)
         items = _parse_channel_rss(r.text)
         # Jittered expiry spreads the channels over the cycles instead of
         # all 560 coming due in the same one every 15 min.
